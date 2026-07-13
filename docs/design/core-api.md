@@ -286,6 +286,9 @@ WIRE_VERSION = 1
 type Wire = None | bool | int | float | str | bytes | list[Wire] | tuple[Wire, ...] | dict[str, Wire]
 
 class WireError(Exception): ...  # NOT AthomeError — wire.py must import without athome
+# Vendoring contract: sidecar dists copy wire.py into their own tree (file copy,
+# stdlib-only). `import athome.wire` from a bare interpreter is NOT a supported
+# path — the package __init__ eagerly re-exports Cache and pulls the core deps.
 
 def validate(obj: object) -> Wire: ...      # structural walk; raises WireError on anything else
 def encode(obj: Wire) -> bytes: ...          # validate + pickle protocol 5, 4-byte BE length prefix
