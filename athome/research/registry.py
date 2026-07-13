@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
+from uuid import uuid4
 
 import anyio
 
@@ -14,13 +18,15 @@ from athome.config import SectionSettings, load
 from athome.research.errors import ResearchError
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import AsyncIterator, Mapping
 
 METADATA_NAME = "metadata.json"
 CURRENT_LINK = "current"
-STAGING_LINK = f".{CURRENT_LINK}.tmp"
+STAGING_PREFIX = f".{CURRENT_LINK}.tmp."
 VERSION_PATTERN = re.compile(r"^v(\d{3,})-(\d{8})-([0-9a-f]{12})$")
 DIGEST_CHARS = 12
+LOCK_SUFFIX = ".lock"
+LOCK_POLL_SECONDS = 0.01
 
 
 class RegistryError(ResearchError):
@@ -101,32 +107,55 @@ async def register(
     """
     if not files:
         raise RegistryError(f"refusing to register an empty {name} version")
-    existing = await versions(name, root=root)
-    number = existing[-1].number + 1 if existing else 1
-    now = datetime.now(UTC)
-    version = f"v{number:03d}-{now:%Y%m%d}-{await _digest(files)}"
-    path = anyio.Path(registry_root(root)) / name / version
-    await path.mkdir(parents=True)
-    for filename, content in files.items():
-        payload = content if isinstance(content, bytes) else await anyio.Path(content).read_bytes()
-        await (path / filename).write_bytes(payload)
-    stamped = dict(metadata) | {"name": name, "version": version, "created_at": now.isoformat()}
-    await (path / METADATA_NAME).write_text(json.dumps(stamped, indent=2, sort_keys=True, default=str) + "\n")
+    snapshot = {
+        filename: content if isinstance(content, bytes) else await anyio.Path(content).read_bytes()
+        for filename, content in files.items()
+    }
+    family = anyio.Path(registry_root(root)) / name
+    async with _family_lock(family):
+        number = existing[-1].number + 1 if (existing := await versions(name, root=root)) else 1
+        now = datetime.now(UTC)
+        version = f"v{number:03d}-{now:%Y%m%d}-{_digest(snapshot)}"
+        path = family / version
+        await path.mkdir(parents=True)
+        for filename, payload in snapshot.items():
+            await (path / filename).write_bytes(payload)
+        stamped = dict(metadata) | {"name": name, "version": version, "created_at": now.isoformat()}
+        await (path / METADATA_NAME).write_text(json.dumps(stamped, indent=2, sort_keys=True, default=str) + "\n")
     return VersionInfo(name=name, version=version, path=Path(path), metadata=stamped)
 
 
 async def promote(name: str, version: str, *, root: Path | None = None) -> None:
     """Atomically flips ``current`` to the named version (full name or ``v<NNN>`` prefix).
 
-    The flip writes a staging symlink and renames it over ``current``, so a
-    reader never sees a missing or half-written link.
+    The flip writes a staging symlink under a unique per-promotion name and renames
+    it over ``current``, so a reader never sees a missing or half-written link and
+    two concurrent promotions never clobber one another's staging.
     """
     info = await _resolve(name, version, root=root)
     family = anyio.Path(info.path).parent
-    staging = family / STAGING_LINK
-    await staging.unlink(missing_ok=True)
+    staging = family / f"{STAGING_PREFIX}{uuid4().hex}"
     await staging.symlink_to(info.version)
     await staging.replace(family / CURRENT_LINK)
+
+
+@asynccontextmanager
+async def _family_lock(family: anyio.Path) -> AsyncIterator[None]:
+    await family.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(Path(family.parent) / f"{family.name}{LOCK_SUFFIX}", os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                await anyio.sleep(LOCK_POLL_SECONDS)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 async def _info(name: str, path: anyio.Path) -> VersionInfo:
@@ -143,12 +172,11 @@ async def _resolve(name: str, version: str, *, root: Path | None) -> VersionInfo
     return matches[-1]
 
 
-async def _digest(files: Mapping[str, bytes | Path]) -> str:
+def _digest(files: Mapping[str, bytes]) -> str:
     hasher = hashlib.sha256()
     for filename in sorted(files):
-        content = files[filename]
         hasher.update(filename.encode())
         hasher.update(b"\0")
-        hasher.update(content if isinstance(content, bytes) else await anyio.Path(content).read_bytes())
+        hasher.update(files[filename])
         hasher.update(b"\0")
     return hasher.hexdigest()[:DIGEST_CHARS]

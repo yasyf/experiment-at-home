@@ -5,10 +5,22 @@ from typing import TYPE_CHECKING
 import pytest
 
 from athome.research.errors import ResearchError
-from athome.research.gate import PromotionVerdict, blocking_invariants, bootstrap_ci_gate, monotone_gate
+from athome.research.gate import (
+    PromotionVerdict,
+    TreeChange,
+    blocking_invariants,
+    bootstrap_ci_gate,
+    immutable_violations,
+    is_autoloader,
+    monotone_gate,
+    parse_diff_tree,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+MUTABLE = ("train.py", "src/**")
+IMMUTABLE = ("score.py", "eval/**")
 
 
 class ConstantBatch(ResearchError):
@@ -94,3 +106,54 @@ def test_blocking_invariants_passes_when_all_checks_pass() -> None:
 
     blocking_invariants([1, 2, 3], [record, record])
     assert calls == ["ran", "ran"]
+
+
+@pytest.mark.parametrize(
+    "change, expected",
+    [
+        pytest.param(TreeChange("train.py", "100644"), False, id="mutable-top-level-allowed"),
+        pytest.param(TreeChange("src/a/b.py", "100644"), False, id="mutable-nested-allowed"),
+        pytest.param(TreeChange("score.py", "100644"), True, id="immutable-edit-rejected"),
+        pytest.param(TreeChange("eval/a/b.py", "100644"), True, id="immutable-nested-rejected"),
+        pytest.param(TreeChange("score.py", "000000"), True, id="immutable-delete-rejected"),
+        pytest.param(TreeChange("json.py", "100644"), True, id="undeclared-file-rejected-by-allowlist"),
+        pytest.param(TreeChange("train.py", "120000"), True, id="symlink-rejected-even-in-allowlist"),
+        pytest.param(TreeChange("src/__init__.py", "100644"), True, id="autoloader-init-in-allowlist-rejected"),
+        pytest.param(TreeChange("src/conftest.py", "100644"), True, id="autoloader-conftest-in-allowlist-rejected"),
+        pytest.param(TreeChange("src/sitecustomize.py", "100644"), True, id="autoloader-sitecustomize-rejected"),
+        pytest.param(TreeChange("src/usercustomize.py", "100644"), True, id="autoloader-usercustomize-rejected"),
+        pytest.param(TreeChange("src/hook.pth", "100644"), True, id="autoloader-pth-rejected"),
+        pytest.param(TreeChange("src/__init__.py", "000000"), True, id="autoloader-init-deletion-rejected"),
+    ],
+)
+def test_immutable_violations(change: TreeChange, expected: bool) -> None:
+    assert bool(immutable_violations([change], mutable=MUTABLE, immutable=IMMUTABLE)) is expected
+
+
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        pytest.param("__init__.py", True, id="top-level-init"),
+        pytest.param("pkg/sub/__init__.py", True, id="nested-init"),
+        pytest.param("conftest.py", True, id="conftest"),
+        pytest.param("sitecustomize.py", True, id="sitecustomize"),
+        pytest.param("usercustomize.py", True, id="usercustomize"),
+        pytest.param("a/b/hook.pth", True, id="pth-file"),
+        pytest.param("train.py", False, id="leaf-module"),
+        pytest.param("src/model.py", False, id="nested-leaf-module"),
+        pytest.param("init.py", False, id="init-not-dunder"),
+        pytest.param("conftest_helpers.py", False, id="conftest-prefix-only"),
+    ],
+)
+def test_is_autoloader(path: str, expected: bool) -> None:
+    assert is_autoloader(path) is expected
+
+
+def test_immutable_violations_reports_every_offending_path() -> None:
+    changes = [TreeChange("train.py", "100644"), TreeChange("score.py", "100644"), TreeChange("new.py", "100644")]
+    assert immutable_violations(changes, mutable=MUTABLE, immutable=IMMUTABLE) == ["score.py", "new.py"]
+
+
+def test_parse_diff_tree_recovers_paths_and_modes() -> None:
+    raw = ":100644 000000 aaaa bbbb D\0eval/a/b.py\0:000000 120000 cccc dddd A\0link.py\0"
+    assert parse_diff_tree(raw) == [TreeChange("eval/a/b.py", "000000"), TreeChange("link.py", "120000")]

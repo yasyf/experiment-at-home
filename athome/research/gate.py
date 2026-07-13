@@ -1,10 +1,65 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+
+SYMLINK_MODE = "120000"
+AUTOLOADERS = frozenset({"sitecustomize.py", "usercustomize.py", "conftest.py", "__init__.py"})
+
+
+@dataclass(frozen=True, slots=True)
+class TreeChange:
+    """One changed path between two commit trees, with its destination file mode.
+
+    Attributes:
+        path: The repository-relative path that changed.
+        dst_mode: The git mode of the path in the candidate tree (``000000`` for a
+            deletion, ``120000`` for a symlink).
+    """
+
+    path: str
+    dst_mode: str
+
+
+def parse_diff_tree(raw: str) -> list[TreeChange]:
+    parts = [part for part in raw.split("\0") if part]
+    return [TreeChange(path=parts[i + 1], dst_mode=parts[i][1:].split(" ")[1]) for i in range(0, len(parts), 2)]
+
+
+def matches(path: str, patterns: tuple[str, ...]) -> bool:
+    return any(PurePosixPath(path).full_match(pattern) for pattern in patterns)
+
+
+def is_autoloader(path: str) -> bool:
+    return PurePosixPath(path).name in AUTOLOADERS or PurePosixPath(path).match("*.pth")
+
+
+def immutable_violations(
+    changes: Sequence[TreeChange], *, mutable: tuple[str, ...], immutable: tuple[str, ...]
+) -> list[str]:
+    """Returns the changed paths that break the scoring boundary.
+
+    A path violates the boundary when it is a symlink, when it matches an
+    ``immutable`` pattern, when it falls outside the ``mutable`` allowlist, or
+    when it is a Python auto-loader (``__init__.py``, ``conftest.py``,
+    ``sitecustomize.py``, ``usercustomize.py``, a ``*.pth`` file) that would run
+    code merely by existing on ``sys.path`` at scoring time — so a rename or
+    deletion of an immutable file, an undeclared new file, and an added or
+    modified auto-loader are all caught. ``full_match`` gives recursive ``**``
+    semantics, so ``eval/**`` matches ``eval/a/b.py``.
+    """
+    return [
+        change.path
+        for change in changes
+        if change.dst_mode == SYMLINK_MODE
+        or matches(change.path, immutable)
+        or not matches(change.path, mutable)
+        or is_autoloader(change.path)
+    ]
 
 
 def monotone_gate(

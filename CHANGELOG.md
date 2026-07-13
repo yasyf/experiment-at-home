@@ -9,13 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - 2026-07-13
 
 ### Added
-- `athome.research` — the overnight autoresearch harness: a greedy keep/discard loop (`athome research run`) that drives an agent to edit a repo and scores each proposal by a metric, with the karpathy-loop bites fixed by design.
-  - Structural anti-reward-hack boundary: a candidate touching an `immutable_paths` glob is rejected by a git-diff gate and never scored (not prose-enforced).
-  - A structured metric channel: the metric is read only from the JSON file the immutable metric command writes, never grepped from stdout; run logs are captured but treated as untrusted.
-  - Worktree isolation per experiment, work-unit-first budgets (wall-clock + hard-kill as backstops), resumable journals, and a morning report.
-  - `ExperimentSpec` (TOML), typed append-only `Journal` on `RunSink`, monotone + bootstrap-CI promotion gates, blocking pre-flight invariants, order-invariant `dataset_digest`/`StratifiedSplitter`/`ConfusionMatrix`, a content-addressed `registry` with atomic `current`-symlink promotion, and a sqlite cell index.
-  - Evaluation kit: `Judge` (position-debiased pairwise, sha256 vote cache, judge-health controls, cross-family enforcement), blind `golden` labeling packets with a panel-vs-human agreement gate that blocks LLM spend until green, `calibrate` (saturation refusals), and topic-leakage `probes`.
-  - `ClaudeCodeDriver` (launches the `claude` CLI detached, reading only the metric file and git diff — closing the prompt-injection surface) and a nightly launchd Calendar agent.
+- `athome.research` — the overnight autoresearch harness: a greedy keep/discard loop (`athome research run`) that drives a coding agent against a git-isolated checkout and keeps each proposal only when a trusted metric improves.
+  - A structured metric channel: the score is read only from the JSON file the metric command writes, never grepped from stdout; run logs are captured but withheld from the agent's next contract, closing the prompt-injection surface.
+  - `ExperimentSpec` (TOML) with blocking pre-flight invariants, a typed append-only resumable journal, monotone + bootstrap-CI promotion gates, and a content-addressed registry with atomic promotion.
+  - An evaluation kit: position-debiased pairwise spawnllm judges with cross-family enforcement, blind golden-labeling packets whose panel-vs-human agreement gate blocks LLM spend until green, saturation-aware calibration, and topic-leakage probes.
+  - A morning report (`athome research report`), a nightly launchd agent, and the `athome research` CLI.
+
+### Security
+- The research harness enforces its anti-reward-hacking boundary structurally, not by prompt: immutability is checked by diffing the staged index against the incumbent over a tight `mutable_paths` allowlist — symlinks and Python auto-loaders rejected — so a violating candidate is discarded before a commit object exists, and scoring runs from a clean checkout containing no `.git`, which closes the git-config RCE class.
+- Per-experiment single-writer locks, work-unit/wall-clock/dollar budgets with journal cost validation, and cross-family judging plus the golden gate as LLM spend controls.
+- [docs/design/research-security-model.md](docs/design/research-security-model.md) documents the threat model and the limitations only an OS sandbox closes: metric authorship, process-group escape, and cost forgery via the shared log.
 
 ## [0.2.0] - 2026-07-13
 

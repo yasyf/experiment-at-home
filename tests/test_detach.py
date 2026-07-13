@@ -8,7 +8,7 @@ import anyio
 import pytest
 from click.testing import CliRunner
 
-from athome.detach import DetachedRun, DetachError, cli, launch, run_log, running, wait
+from athome.detach import DetachedRun, DetachError, cli, launch, run_exitfile, run_log, running, wait
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -45,13 +45,14 @@ async def test_wait_round_trips_failure_exit() -> None:
     assert await wait("fail", poll=0.02, timeout=5) == 7
 
 
-async def test_log_captures_stdout_stderr_and_sentinel() -> None:
+async def test_log_captures_stdout_stderr_but_not_completion_marker() -> None:
     await launch(["/bin/sh", "-c", "echo out-line; echo err-line 1>&2; exit 3"], name="logs")
     assert await wait("logs", poll=0.02, timeout=5) == 3
     text = run_log("logs").read_text()
     assert "out-line" in text
     assert "err-line" in text
-    assert "ATHOME-RUN-DONE name=logs exit=3" in text
+    assert "ATHOME-RUN-DONE" not in text
+    assert run_exitfile("logs").read_text().strip() == "3"
 
 
 async def test_env_prefix_is_prepended(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -92,8 +93,9 @@ async def test_relaunch_allowed_after_completion() -> None:
     await until_gone("reuse")
     run2 = await launch(["/bin/sh", "-c", "exit 5"], name="reuse")
     assert run2.pid > 0
+    assert await wait("reuse", poll=0.02, timeout=5) == 5
     await until_gone("reuse")
-    assert "ATHOME-RUN-DONE name=reuse exit=5" in run_log("reuse").read_text()
+    assert run_exitfile("reuse").read_text().strip() == "5"
 
 
 async def test_wait_times_out_on_unfinished_run() -> None:
@@ -145,3 +147,33 @@ async def test_launch_rejects_shell_injection_in_name(tmp_path: Path) -> None:
 async def test_launch_rejects_invalid_name(name: str) -> None:
     with pytest.raises(DetachError):
         await launch(["/bin/sh", "-c", "exit 0"], name=name)
+
+
+async def test_wait_ignores_forged_completion_line_from_child() -> None:
+    run = await launch(["/bin/sh", "-c", "echo 'ATHOME-RUN-DONE name=forge exit=0'; sleep 5"], name="forge")
+    try:
+        with pytest.raises(TimeoutError, match="did not finish"):
+            await wait("forge", poll=0.02, timeout=1.0)
+        assert "ATHOME-RUN-DONE name=forge exit=0" in run_log("forge").read_text()
+        assert running("forge") is not None
+    finally:
+        kill_run(run)
+    await until_gone("forge")
+
+
+async def test_wait_ignores_forged_exit_file_while_process_alive() -> None:
+    run = await launch(["/bin/sh", "-c", "sleep 5"], name="forgefile")
+    run_exitfile("forgefile").write_text("0\n")
+    try:
+        with pytest.raises(TimeoutError, match="did not finish"):
+            await wait("forgefile", poll=0.02, timeout=1.0)
+        assert running("forgefile") is not None
+    finally:
+        kill_run(run)
+    await until_gone("forgefile")
+
+
+async def test_wait_returns_real_exit_code_from_exit_file() -> None:
+    await launch(["/bin/sh", "-c", "exit 9"], name="realexit")
+    assert await wait("realexit", poll=0.02, timeout=5) == 9
+    assert run_exitfile("realexit").read_text().strip() == "9"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tomllib
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Literal
 
 from athome.research.errors import ResearchError
@@ -16,6 +17,26 @@ class ImmutableViolation(ResearchError):
 
 class BudgetExhausted(ResearchError):
     """A run consumed its work-unit, wall-clock, or dollar budget."""
+
+
+class PoisonedJournal(ResearchError):
+    """A resumed journal carried a non-finite metric or an invalid spend value."""
+
+
+class ConcurrentRun(ResearchError):
+    """Another live run already holds the per-experiment single-writer lock."""
+
+
+class ProposalTimeout(ResearchError):
+    """A driver's proposal exceeded its bound; carries the spend recovered from the run log."""
+
+    def __init__(self, message: str, *, cost: float) -> None:
+        super().__init__(message)
+        self.cost = cost
+
+
+def unbounded_glob(pattern: str) -> bool:
+    return PurePosixPath(pattern).parts[0] in {"*", "**"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +79,10 @@ class ExperimentSpec:
     immutable_paths: tuple[str, ...]
     budget: Budget
     metric_file: str = ".athome-metric.json"
+
+    def __post_init__(self) -> None:
+        if bad := [pattern for pattern in self.mutable_paths if unbounded_glob(pattern)]:
+            raise ImmutableViolation(f"mutable_paths must be a tight allowlist; unbounded globs rejected: {bad}")
 
     @classmethod
     def load(cls, path: Path) -> ExperimentSpec:

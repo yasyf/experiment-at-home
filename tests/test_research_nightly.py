@@ -98,9 +98,9 @@ async def test_report_summarizes_the_journal(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path)
     spec = await drive(
         repo,
-        StubProposal({"train.py": "LOSS = 0.5\n"}, "half"),
-        StubProposal({"train.py": "LOSS = 0.6\n"}, "worse"),
-        StubProposal({"train.py": "LOSS = undefined_symbol\n"}, "broken"),
+        StubProposal({"train.py": "LOSS = 0.5\n"}),
+        StubProposal({"train.py": "LOSS = 0.6\n"}),
+        StubProposal({"train.py": "LOSS = undefined_symbol\n"}),
     )
 
     report = await nightly.report(spec, repo=repo)
@@ -178,8 +178,8 @@ def test_cli_status_and_report_read_the_journal(tmp_path: Path) -> None:
     anyio.run(
         drive,
         repo,
-        StubProposal({"train.py": "LOSS = 0.5\n"}, "half"),
-        StubProposal({"train.py": "LOSS = 0.6\n"}, "worse"),
+        StubProposal({"train.py": "LOSS = 0.5\n"}),
+        StubProposal({"train.py": "LOSS = 0.6\n"}),
     )
     runner = CliRunner()
 

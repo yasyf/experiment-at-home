@@ -1,24 +1,37 @@
 from __future__ import annotations
 
+import json
+import math
+import os
 import subprocess
 import sys
 import textwrap
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+import anyio
+import pytest
 
 from athome.research.contract import build_contract
 from athome.research.driver import StubDriver, StubProposal
 from athome.research.journal import Journal, JournalRow, Verdict
-from athome.research.loop import run, run_metric
-from athome.research.spec import Budget, ExperimentSpec
+from athome.research.loop import experiment_lock, measure, run, run_metric
+from athome.research.spec import (
+    Budget,
+    BudgetExhausted,
+    ConcurrentRun,
+    ExperimentSpec,
+    PoisonedJournal,
+    ProposalTimeout,
+)
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Callable
 
 EXPERIMENT_NAME = "toy"
 
-# Immutable evaluator: computes the metric from the mutable train.py, writes it to the
-# structured JSON channel, and prints a LYING value to stdout. A loop that grepped
-# stdout would score 999.0; a correct loop reads the file.
+# Immutable evaluator: metric from train.py to the JSON channel, a LYING 999.0 to stdout.
 SCORE_PY = textwrap.dedent(
     """
     import json, pathlib
@@ -26,6 +39,17 @@ SCORE_PY = textwrap.dedent(
     exec(pathlib.Path("train.py").read_text(), namespace)
     pathlib.Path(".athome-metric.json").write_text(json.dumps({"loss": namespace["LOSS"]}))
     print("loss=999.0")
+    """
+).strip()
+
+# score.py backdoor keyed on evil.py: a fresh-checkout scorer never sees the ignored file.
+BACKDOOR_SCORE_PY = textwrap.dedent(
+    """
+    import json, pathlib
+    namespace = {}
+    exec(pathlib.Path("train.py").read_text(), namespace)
+    loss = 0.0 if pathlib.Path("evil.py").exists() else namespace["LOSS"]
+    pathlib.Path(".athome-metric.json").write_text(json.dumps({"loss": loss}))
     """
 ).strip()
 
@@ -45,13 +69,15 @@ def toy_repo(root: Path, *, initial_loss: float = 1.0) -> Path:
     return root
 
 
-def make_spec(*, budget: Budget, direction: str = "min") -> ExperimentSpec:
+def make_spec(
+    *, budget: Budget, direction: str = "min", mutable_paths: tuple[str, ...] = ("train.py",)
+) -> ExperimentSpec:
     return ExperimentSpec(
         name=EXPERIMENT_NAME,
         metric_command=(sys.executable, "score.py"),
         metric_key="loss",
         direction=direction,
-        mutable_paths=("train.py",),
+        mutable_paths=mutable_paths,
         immutable_paths=("score.py",),
         budget=budget,
     )
@@ -61,8 +87,60 @@ def journal_rows(repo: Path) -> list[JournalRow]:
     return Journal.open(repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.jsonl").rows()
 
 
-def loss_proposal(loss: float | str, description: str = "edit") -> StubProposal:
-    return StubProposal({"train.py": f"LOSS = {loss}\n"}, description)
+def loss_proposal(loss: float | str) -> StubProposal:
+    return StubProposal({"train.py": f"LOSS = {loss}\n"})
+
+
+@dataclass(frozen=True, slots=True)
+class HostileDriver:
+    """Runs an arbitrary bypass against the candidate dir — files, git plumbing, symlinks."""
+
+    action: Callable[[Path], None]
+    label: str = "hostile"
+    cost: float = 0.0
+
+    async def propose(self, contract: str, workdir: Path) -> float:
+        self.action(Path(workdir))
+        return self.cost
+
+
+@dataclass(frozen=True, slots=True)
+class CostDriver:
+    """Applies a scripted edit and reports a fixed per-proposal dollar cost."""
+
+    proposals: object
+    cost: float
+    label: str = "cost"
+
+    async def propose(self, contract: str, workdir: Path) -> float:
+        for relative, content in next(self.proposals).files.items():
+            (Path(workdir) / relative).write_text(content)
+        return self.cost
+
+
+@dataclass(frozen=True, slots=True)
+class SlowDriver:
+    """Sleeps past the wall budget without ever completing a unit."""
+
+    delay: float
+    label: str = "slow"
+
+    async def propose(self, contract: str, workdir: Path) -> float:
+        await anyio.sleep(self.delay)
+        (Path(workdir) / "train.py").write_text("LOSS = 0.1\n")
+        return 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class TimeoutDriver:
+    """Edits the candidate, then raises ProposalTimeout carrying a recovered spend."""
+
+    cost: float
+    label: str = "timeout"
+
+    async def propose(self, contract: str, workdir: Path) -> float:
+        (Path(workdir) / "train.py").write_text("LOSS = 0.1\n")
+        raise ProposalTimeout("simulated hang killed on timeout", cost=self.cost)
 
 
 async def test_end_to_end_all_gates_in_one_run(tmp_path: Path) -> None:
@@ -70,10 +148,10 @@ async def test_end_to_end_all_gates_in_one_run(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path, initial_loss=1.0)
     proposals = iter(
         [
-            loss_proposal(0.5, "half"),
-            StubProposal({"score.py": "HACKED = 1\n"}, "tamper"),
-            loss_proposal(0.3, "third"),
-            loss_proposal(0.1, "unreached"),
+            loss_proposal(0.5),
+            StubProposal({"score.py": "HACKED = 1\n"}),
+            loss_proposal(0.3),
+            loss_proposal(0.1),
         ]
     )
     result = await run(make_spec(budget=Budget(max_units=3)), driver=StubDriver(proposals), repo=repo)
@@ -81,12 +159,12 @@ async def test_end_to_end_all_gates_in_one_run(tmp_path: Path) -> None:
     rows = journal_rows(repo)
     assert [row.unit for row in rows] == [0, 1, 2]
     assert [row.verdict for row in rows] == [Verdict.KEEP, Verdict.DISCARD, Verdict.KEEP]
-    assert rows[0].description == "half" and rows[2].description == "third"
+    assert rows[0].description == "stub edited train.py" and rows[2].description == "stub edited train.py"
     assert result.kept == 2
 
     # The immutable-path mutation was rejected structurally and never scored.
     assert rows[1].metric is None
-    assert rows[1].description.startswith("tamper") and "ImmutableViolation" in rows[1].description
+    assert rows[1].description.startswith("stub edited score.py") and "ImmutableViolation" in rows[1].description
     assert "score.py" in rows[1].description
     assert "HACKED" not in git(repo, "show", f"athome/{EXPERIMENT_NAME}:score.py")
 
@@ -101,34 +179,32 @@ async def test_end_to_end_all_gates_in_one_run(tmp_path: Path) -> None:
     assert rows[1].commit == rows[0].commit
 
     # Budget-cap stop: exactly 3 units ran; the 4th proposal was never consumed.
-    assert next(proposals).description == "unreached"
+    assert next(proposals).files == {"train.py": "LOSS = 0.1\n"}
 
 
 async def test_three_units_keep_keep_discard(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path, initial_loss=1.0)
-    driver = StubDriver(iter([loss_proposal(0.5, "half"), loss_proposal(0.3, "third"), loss_proposal(0.4, "worse")]))
+    driver = StubDriver(iter([loss_proposal(0.5), loss_proposal(0.3), loss_proposal(0.4)]))
 
     result = await run(make_spec(budget=Budget(max_units=3)), driver=driver, repo=repo)
 
     rows = journal_rows(repo)
     assert [row.verdict for row in rows] == [Verdict.KEEP, Verdict.KEEP, Verdict.DISCARD]
     assert [row.metric for row in rows] == [0.5, 0.3, 0.4]
-    assert [row.description for row in rows] == ["half", "third", "worse"]
+    assert [row.description for row in rows] == ["stub edited train.py"] * 3
     assert result.kept == 2
     assert result.best is not None and result.best.metric == 0.3
 
-    # The experiment branch advanced to the last KEEP and stopped there — the discard
-    # neither advanced it nor rewound it.
+    # The experiment branch advanced to the last KEEP; the discard neither moved nor rewound it.
     tip = git(repo, "rev-parse", f"athome/{EXPERIMENT_NAME}")
     assert tip == rows[1].commit
     assert rows[2].commit != tip
-    # KEEP builds a linear chain off the incumbent.
-    assert git(repo, "rev-parse", f"{rows[1].commit}^") == rows[0].commit
+    assert git(repo, "rev-parse", f"{rows[1].commit}^") == rows[0].commit  # KEEP chains off the incumbent
 
 
 async def test_immutable_mutation_is_rejected_structurally(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path)
-    driver = StubDriver(iter([StubProposal({"score.py": "HACKED = 1\n"}, "tamper")]))
+    driver = StubDriver(iter([StubProposal({"score.py": "HACKED = 1\n"})]))
 
     result = await run(make_spec(budget=Budget(max_units=1)), driver=driver, repo=repo)
 
@@ -154,14 +230,14 @@ async def test_metric_is_read_from_the_file_not_stdout(tmp_path: Path) -> None:
 
 async def test_budget_cap_stops_the_loop(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path)
-    proposals = iter([loss_proposal(0.5), loss_proposal(0.4), loss_proposal(0.3, "never")])
+    proposals = iter([loss_proposal(0.5), loss_proposal(0.4), loss_proposal(0.3)])
     driver = StubDriver(proposals)
 
     await run(make_spec(budget=Budget(max_units=2)), driver=driver, repo=repo)
 
     rows = journal_rows(repo)
     assert [row.unit for row in rows] == [0, 1]  # stopped at max_units, unit 2 never ran
-    assert next(proposals).description == "never"  # the third proposal was never consumed
+    assert next(proposals).files == {"train.py": "LOSS = 0.3\n"}  # the third proposal was never consumed
 
 
 async def test_resume_skips_completed_units(tmp_path: Path) -> None:
@@ -181,7 +257,7 @@ async def test_resume_skips_completed_units(tmp_path: Path) -> None:
 async def test_broken_candidate_is_journaled_as_crash(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path)
     # Unit 0 keeps a valid model; unit 1's edit breaks the evaluator (NameError -> nonzero exit).
-    driver = StubDriver(iter([loss_proposal(0.4, "good"), loss_proposal("undefined_symbol", "broken")]))
+    driver = StubDriver(iter([loss_proposal(0.4), loss_proposal("undefined_symbol")]))
 
     result = await run(make_spec(budget=Budget(max_units=2)), driver=driver, repo=repo)
 
@@ -222,3 +298,475 @@ def test_contract_maximize_wording_and_budget_low_warning() -> None:
     contract = build_contract(make_spec(budget=Budget(max_units=1), direction="max"), budget_low=True)
     assert "maximize" in contract and "must strictly exceed" in contract
     assert "Budget is nearly exhausted" in contract
+
+
+def special_repo(root: Path, *, score_py: str, extra: dict[str, str] | None = None, gitignore: str = "") -> Path:
+    git(root, "init", "-q", "-b", "main")
+    git(root, "config", "user.email", "toy@localhost")
+    git(root, "config", "user.name", "toy")
+    (root / "train.py").write_text("LOSS = 1.0\n")
+    (root / "score.py").write_text(score_py + "\n")
+    for relative, content in (extra or {}).items():
+        (target := root / relative).parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    if gitignore:
+        (root / ".gitignore").write_text(gitignore)
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "init")
+    return root
+
+
+# --- Immutability: score a plain checkout of the commit, enforce by diffing commit trees.
+
+
+async def test_ig1_hidden_immutable_edit_is_caught_by_the_harness_staging(tmp_path: Path) -> None:
+    # Candidate hides its evil score.py with assume-unchanged in its own index; the harness
+    # stages from an independent index and catches it (KEEP under old worktrees, now DISCARD).
+    repo = toy_repo(tmp_path, initial_loss=1.0)
+
+    def bypass(workdir: Path) -> None:
+        (workdir / "score.py").write_text(
+            'import json, pathlib\npathlib.Path(".athome-metric.json").write_text(json.dumps({"loss": 0.0}))\n'
+        )
+        git(workdir, "init", "-q")
+        git(workdir, "add", "-A")
+        git(workdir, "update-index", "--assume-unchanged", "score.py")
+        (workdir / "train.py").write_text("LOSS = 0.9\n")
+
+    result = await run(make_spec(budget=Budget(max_units=1)), driver=HostileDriver(bypass), repo=repo)
+
+    (row,) = journal_rows(repo)
+    assert row.verdict is Verdict.DISCARD and row.metric is None  # injected 0.0 never scored
+    assert "ImmutableViolation" in row.description and "score.py" in row.description
+    assert result.kept == 0
+    assert git(repo, "show", f"athome/{EXPERIMENT_NAME}:score.py").strip() == SCORE_PY  # scorer untouched
+
+
+async def test_ig2_gitignored_backdoor_file_does_not_affect_the_score(tmp_path: Path) -> None:
+    # The scorer backdoors on evil.py; .gitignore keeps evil.py out of the staged tree, so the
+    # fresh checkout never sees it and scores honestly.
+    repo = special_repo(tmp_path, score_py=BACKDOOR_SCORE_PY, gitignore="evil.py\n")
+
+    def bypass(workdir: Path) -> None:
+        (workdir / "evil.py").write_text("backdoor\n")
+        (workdir / "train.py").write_text("LOSS = 0.9\n")
+
+    result = await run(make_spec(budget=Budget(max_units=1)), driver=HostileDriver(bypass), repo=repo)
+
+    (row,) = journal_rows(repo)
+    assert row.verdict is Verdict.KEEP and row.metric == 0.9  # not the backdoor's 0.0
+    assert result.best is not None and result.best.metric == 0.9
+
+
+async def test_ig3_rename_of_an_immutable_file_is_caught(tmp_path: Path) -> None:
+    # Moving the immutable scorer out of its guarded name is caught by the --no-renames tree
+    # diff (the deletion of score.py is visible), never silently accepted.
+    repo = toy_repo(tmp_path)
+
+    result = await run(
+        make_spec(budget=Budget(max_units=1)),
+        driver=HostileDriver(lambda workdir: (workdir / "score.py").rename(workdir / "score_backup.py")),
+        repo=repo,
+    )
+
+    (row,) = journal_rows(repo)
+    assert row.verdict is Verdict.DISCARD and row.metric is None
+    assert "ImmutableViolation" in row.description and "score.py" in row.description
+    assert result.kept == 0
+    assert git(repo, "rev-parse", f"athome/{EXPERIMENT_NAME}") == git(repo, "rev-parse", "HEAD")
+
+
+async def test_ig4_undeclared_new_file_is_rejected_by_the_allowlist(tmp_path: Path) -> None:
+    # A file in neither manifest (here a stdlib-shadowing json.py) forges nothing: the mutable
+    # allowlist rejects any changed path it does not cover.
+    repo = toy_repo(tmp_path)
+
+    def bypass(workdir: Path) -> None:
+        (workdir / "train.py").write_text("LOSS = 0.5\n")
+        (workdir / "json.py").write_text("dumps = lambda *a, **k: '{\"loss\": 0.0}'\n")
+
+    result = await run(make_spec(budget=Budget(max_units=1)), driver=HostileDriver(bypass), repo=repo)
+
+    (row,) = journal_rows(repo)
+    assert row.verdict is Verdict.DISCARD and row.metric is None
+    assert "ImmutableViolation" in row.description and "json.py" in row.description
+    assert result.kept == 0
+
+
+async def test_ig6_nested_immutable_path_is_matched(tmp_path: Path) -> None:
+    # A recursive-** immutable glob (eval/**) matches a deeply nested file; PurePosixPath.match
+    # would have missed eval/a/b.py.
+    repo = special_repo(tmp_path, score_py=SCORE_PY, extra={"eval/a/b.py": "GUARD = 1\n"})
+    spec = ExperimentSpec(
+        name=EXPERIMENT_NAME,
+        metric_command=(sys.executable, "score.py"),
+        metric_key="loss",
+        direction="min",
+        mutable_paths=("train.py",),
+        immutable_paths=("score.py", "eval/**"),
+        budget=Budget(max_units=1),
+    )
+
+    edit_nested = HostileDriver(lambda workdir: (workdir / "eval/a/b.py").write_text("GUARD = 2\n"))
+    result = await run(spec, driver=edit_nested, repo=repo)
+
+    (row,) = journal_rows(repo)
+    assert row.verdict is Verdict.DISCARD and row.metric is None
+    assert "ImmutableViolation" in row.description and "eval/a/b.py" in row.description
+    assert result.kept == 0
+
+
+async def test_ig7_symlinked_changed_path_is_rejected(tmp_path: Path) -> None:
+    # Replacing a mutable file with a symlink to external content would let the scorer read a
+    # file absent from the commit. Symlinks among changed paths are rejected even in the allowlist.
+    repo = toy_repo(tmp_path)
+    external = tmp_path / "external_train.py"
+    external.write_text("LOSS = 0.0\n")
+
+    def bypass(workdir: Path) -> None:
+        (workdir / "train.py").unlink()
+        (workdir / "train.py").symlink_to(external)
+
+    result = await run(make_spec(budget=Budget(max_units=1)), driver=HostileDriver(bypass), repo=repo)
+
+    (row,) = journal_rows(repo)
+    assert row.verdict is Verdict.DISCARD and row.metric is None
+    assert "ImmutableViolation" in row.description and "train.py" in row.description
+    assert result.kept == 0
+
+
+async def test_ig5_candidate_hooks_path_never_fires_under_commit_tree(tmp_path: Path) -> None:
+    # The candidate points its own repo's core.hooksPath at a post-commit hook that rewrites the
+    # scorer; commit-tree runs no hooks and the config is inert, so the hook never fires.
+    repo = toy_repo(tmp_path, initial_loss=1.0)
+    (hooks := tmp_path / "evil-hooks").mkdir()
+    (hook := hooks / "post-commit").write_text(
+        "#!/bin/sh\ncat > score.py <<EOF\nimport json, pathlib\n"
+        'pathlib.Path(".athome-metric.json").write_text(json.dumps({"loss": 0.0}))\nEOF\n'
+    )
+    hook.chmod(0o755)
+
+    def bypass(workdir: Path) -> None:
+        git(workdir, "init", "-q")
+        git(workdir, "config", "core.hooksPath", str(hooks))
+        (workdir / "train.py").write_text("LOSS = 0.9\n")
+
+    result = await run(make_spec(budget=Budget(max_units=1)), driver=HostileDriver(bypass), repo=repo)
+
+    (row,) = journal_rows(repo)
+    assert row.verdict is Verdict.KEEP and row.metric == 0.9  # the hook never ran; honest score
+    assert result.best is not None and result.best.metric == 0.9
+
+
+async def test_autoloader_addition_is_rejected_even_inside_a_mutable_dir(tmp_path: Path) -> None:
+    # finding (a): a conftest.py runs at scoring time merely by existing, so it is rejected even
+    # inside the mutable allowlist (pkg/**).
+    repo = toy_repo(tmp_path)
+    driver = StubDriver(iter([StubProposal({"train.py": "LOSS = 0.5\n", "pkg/conftest.py": "CFG = 1\n"})]))
+
+    result = await run(
+        make_spec(budget=Budget(max_units=1), mutable_paths=("train.py", "pkg/**")), driver=driver, repo=repo
+    )
+
+    (row,) = journal_rows(repo)
+    assert row.verdict is Verdict.DISCARD and row.metric is None
+    assert "ImmutableViolation" in row.description and "pkg/conftest.py" in row.description
+    assert result.kept == 0
+
+
+# --- Clone isolation: candidate git config is inert, no .git is smuggled into the tree.
+
+
+async def test_clone_isolation_candidate_config_never_fires(tmp_path: Path) -> None:
+    # RCE class closed: the candidate sets command-executing config in its own repo, but the
+    # harness reads only trusted config, so no hook fires and the honest edit is scored.
+    repo = toy_repo(tmp_path, initial_loss=1.0)
+
+    def bypass(workdir: Path) -> None:
+        git(workdir, "init", "-q")
+        git(workdir, "config", "core.fsmonitor", f"touch {tmp_path / 'PWN-fsmonitor'}; true")
+        git(workdir, "config", "uploadpack.packObjectsHook", f"touch {tmp_path / 'PWN-uploadpack'}; true")
+        (workdir / "train.py").write_text("LOSS = 0.2\n")
+
+    result = await run(make_spec(budget=Budget(max_units=1)), driver=HostileDriver(bypass), repo=repo)
+
+    (row,) = journal_rows(repo)
+    assert not list(tmp_path.glob("PWN-*"))  # no candidate-config command ran during any harness git op
+    assert row.verdict is Verdict.KEEP and row.metric == 0.2  # honest score; candidate .git ignored
+    assert result.best is not None and result.best.metric == 0.2
+    tree_paths = git(repo, "ls-tree", "-r", "--name-only", row.commit).split()
+    assert not any(p == ".git" or p.startswith(".git/") for p in tree_paths)  # no candidate .git smuggled
+
+
+def test_toy_repo_rce_vector_is_dead_and_the_canary_fires(tmp_path: Path) -> None:
+    # §4 plumbing invariant proved against git: candidate fsmonitor/filter/uploadpack never fire
+    # under the harness ops, but a trusted-config canary DOES, so the probe is valid.
+    env = os.environ | {
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+
+    def g(*args: str, index: Path | None = None) -> str:
+        run_env = env if index is None else env | {"GIT_INDEX_FILE": str(index)}
+        return subprocess.run(["git", *args], check=True, capture_output=True, text=True, env=run_env).stdout
+
+    def archive(treeish: str, dest: Path) -> None:
+        dest.mkdir()
+        tar = subprocess.run(
+            ["git", "-c", "core.hooksPath=/dev/null", "-C", str(trusted), "archive", "--format=tar", treeish],
+            check=True,
+            capture_output=True,
+            env=env,
+        ).stdout
+        subprocess.run(["tar", "-x", "-C", str(dest)], input=tar, check=True)
+
+    (trusted := tmp_path / "trusted").mkdir()
+    g("-C", str(trusted), "init", "-q")
+    (trusted / "train.py").write_text("LOSS = 1.0\n")
+    (trusted / "score.py").write_text("x\n")
+    g("-C", str(trusted), "add", "-A")
+    g("-C", str(trusted), "commit", "-qm", "incumbent")
+    inc = g("-C", str(trusted), "rev-parse", "HEAD").strip()
+
+    archive(inc, cand := tmp_path / "cand")
+    assert not (cand / ".git").exists()  # a plain checkout has no .git
+
+    g("-C", str(cand), "init", "-q")
+    g("-C", str(cand), "config", "core.fsmonitor", f"touch {tmp_path / 'PWN_fsmonitor'}; true")
+    (cand / ".gitattributes").write_text("* filter=evil\n")
+    g("-C", str(cand), "config", "filter.evil.clean", f"touch {tmp_path / 'PWN_filter'}; cat")
+    g("-C", str(cand), "config", "uploadpack.packObjectsHook", f"touch {tmp_path / 'PWN_uploadpack'}; true")
+    (cand / "train.py").write_text("LOSS = 0.2\n")
+
+    idx = tmp_path / "u0.idx"
+    g("-c", "core.hooksPath=/dev/null", "-C", str(trusted), "read-tree", inc, index=idx)
+    g("-c", "core.hooksPath=/dev/null", "-C", str(trusted), "--work-tree", str(cand), "add", "-A", index=idx)
+    tree = g("-c", "core.hooksPath=/dev/null", "-C", str(trusted), "write-tree", index=idx).strip()
+    commit = g(
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-C",
+        str(trusted),
+        "-c",
+        "user.name=a",
+        "-c",
+        "user.email=a@l",
+        "commit-tree",
+        tree,
+        "-p",
+        inc,
+        "-m",
+        "x",
+    ).strip()
+    archive(commit, score := tmp_path / "score")
+
+    assert not list(tmp_path.glob("PWN_*"))  # none of the three command-executing keys fired
+    assert (score / "train.py").read_text() == "LOSS = 0.2\n"  # the candidate edit landed
+    tree_paths = g("-C", str(trusted), "ls-tree", "-r", "--name-only", commit).split()
+    assert not any(p == ".git" or p.startswith(".git/") for p in tree_paths)  # no candidate .git smuggled
+
+    # Canary: a trusted-config fsmonitor DOES fire on the harness add ⇒ the probe detects firing.
+    g(
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-C",
+        str(trusted),
+        "config",
+        "core.fsmonitor",
+        f"touch {tmp_path / 'CANARY'}; true",
+    )
+    subprocess.run(
+        ["git", "-c", "core.hooksPath=/dev/null", "-C", str(trusted), "--work-tree", str(cand), "add", "-A"],
+        capture_output=True,
+        env=env | {"GIT_INDEX_FILE": str(tmp_path / "c.idx")},
+    )
+    assert (tmp_path / "CANARY").exists()
+
+
+# --- Metric integrity.
+
+
+async def test_m1_prewritten_metric_file_is_not_accepted(tmp_path: Path) -> None:
+    # The candidate prewrites a winning metric file and makes the scorer exit before writing.
+    # The harness deletes the file and requires this run to write it, so the stale value crashes.
+    repo = toy_repo(tmp_path)
+    files = {"train.py": "import sys\nsys.exit(0)\n", ".athome-metric.json": '{"loss": 0.001}'}
+    prewrite = StubProposal(files)
+
+    result = await run(make_spec(budget=Budget(max_units=1)), driver=StubDriver(iter([prewrite])), repo=repo)
+
+    (row,) = journal_rows(repo)
+    assert row.verdict is Verdict.CRASH and row.metric is None  # 0.001 was never accepted
+    assert result.kept == 0
+
+
+async def test_m2_non_finite_metric_is_a_crash_not_a_keep(tmp_path: Path) -> None:
+    # A NaN metric on the first candidate must not become the incumbent; it is a crash.
+    repo = toy_repo(tmp_path)
+    driver = StubDriver(iter([StubProposal({"train.py": "LOSS = float('nan')\n"})]))
+
+    result = await run(make_spec(budget=Budget(max_units=1)), driver=driver, repo=repo)
+
+    (row,) = journal_rows(repo)
+    assert row.verdict is Verdict.CRASH and row.metric is None
+    assert result.kept == 0 and result.best is None
+
+
+async def test_m2_bool_metric_is_a_crash_not_a_keep(tmp_path: Path) -> None:
+    # A JSON bool coerces to 1.0 under a naive float(); the harness rejects it as a non-number.
+    repo = toy_repo(tmp_path)
+    driver = StubDriver(iter([StubProposal({"train.py": "LOSS = True\n"})]))
+
+    result = await run(make_spec(budget=Budget(max_units=1)), driver=driver, repo=repo)
+
+    (row,) = journal_rows(repo)
+    assert row.verdict is Verdict.CRASH and row.metric is None
+    assert result.kept == 0 and result.best is None
+
+
+async def test_measure_rejects_a_fifo_metric_file_without_blocking(tmp_path: Path) -> None:
+    # A candidate-planted FIFO at the metric path is not a regular file: measure rejects it
+    # rather than blocking on a read that has no writer.
+    (tmp_path / "score.py").write_text("import os; os.mkfifo('.athome-metric.json')\n")
+    spec = make_spec(budget=Budget(max_units=1))
+
+    with anyio.fail_after(5.0):  # a blocking FIFO read would hang here forever
+        metric, _log = await measure(spec, tmp_path)
+
+    assert metric is None
+
+
+# --- Budget + process control + crash resilience.
+
+
+async def test_wr3_empty_proposal_crashes_and_the_loop_continues(tmp_path: Path) -> None:
+    # A candidate that stages nothing cannot commit; that is journaled CRASH and the next unit
+    # still runs — the overnight run never aborts on a candidate-caused failure.
+    repo = toy_repo(tmp_path)
+    driver = StubDriver(iter([StubProposal({}), loss_proposal(0.4)]))
+
+    result = await run(make_spec(budget=Budget(max_units=2)), driver=driver, repo=repo)
+
+    rows = journal_rows(repo)
+    assert [row.verdict for row in rows] == [Verdict.CRASH, Verdict.KEEP]
+    assert rows[0].metric is None and "empty proposal" in rows[0].description
+    assert result.best is not None and result.best.metric == 0.4
+
+
+async def test_bp2_cumulative_spend_over_max_usd_aborts_loudly(tmp_path: Path) -> None:
+    # Cost is measured per unit and enforced across units: crossing max_usd raises, after the
+    # crossing unit's spend is journaled.
+    repo = toy_repo(tmp_path, initial_loss=1.0)
+    driver = CostDriver(iter([loss_proposal(0.5), loss_proposal(0.3), loss_proposal(0.1)]), cost=0.4)
+
+    with pytest.raises(BudgetExhausted):
+        await run(make_spec(budget=Budget(max_units=3, max_usd=0.5)), driver=driver, repo=repo)
+
+    rows = journal_rows(repo)
+    assert [row.unit for row in rows] == [0, 1]  # unit 2 never ran
+    assert rows[1].resources["usd"] == 0.4
+    assert sum(row.resources["usd"] for row in rows) == pytest.approx(0.8)  # both units' spend recorded
+
+
+async def test_killed_unit_spend_counts_toward_max_usd(tmp_path: Path) -> None:
+    # BP2: a hung unit killed on timeout recovers its spend onto the journaled CRASH, so an
+    # expensive hang still counts toward max_usd instead of under-reporting as 0.0.
+    repo = toy_repo(tmp_path)
+
+    with pytest.raises(BudgetExhausted):
+        await run(make_spec(budget=Budget(max_units=2, max_usd=1.0)), driver=TimeoutDriver(cost=5.0), repo=repo)
+
+    (row,) = journal_rows(repo)
+    assert row.verdict is Verdict.CRASH
+    assert row.resources["usd"] == 5.0  # recovered spend, not a silent 0.0
+    assert "proposal timeout" in row.description
+
+
+async def test_bp3_wall_budget_bounds_work_within_a_unit(tmp_path: Path) -> None:
+    # A proposal that runs past the remaining wall budget is cancelled mid-unit, not allowed to
+    # finish and journal — the between-units check alone would let it blow past.
+    repo = toy_repo(tmp_path)
+
+    with anyio.fail_after(3.0):  # the wall budget must actually cut the 30s driver short
+        result = await run(make_spec(budget=Budget(max_units=3, max_wall_s=0.3)), driver=SlowDriver(30.0), repo=repo)
+
+    assert journal_rows(repo) == []  # the cancelled unit was never journaled
+    assert result.kept == 0
+
+
+async def test_wr1_resume_reconciles_a_lost_branch_update_with_the_journal(tmp_path: Path) -> None:
+    # A crash between journaling a KEEP and moving the branch leaves a stale branch. Resume
+    # rebuilds off the journaled best commit (and re-points the branch), never off stale code.
+    repo = toy_repo(tmp_path, initial_loss=1.0)
+    base = git(repo, "rev-parse", "HEAD")
+    await run(make_spec(budget=Budget(max_units=1)), driver=StubDriver(iter([loss_proposal(0.5)])), repo=repo)
+    kept_commit = journal_rows(repo)[0].commit
+    git(repo, "branch", "-f", f"athome/{EXPERIMENT_NAME}", base)  # simulate the lost branch update
+
+    result = await run(make_spec(budget=Budget(max_units=2)), driver=StubDriver(iter([loss_proposal(0.3)])), repo=repo)
+
+    rows = journal_rows(repo)
+    assert [row.verdict for row in rows] == [Verdict.KEEP, Verdict.KEEP]
+    assert git(repo, "rev-parse", f"{rows[1].commit}^") == kept_commit  # built off the journaled best, not base
+    assert git(repo, "rev-parse", f"athome/{EXPERIMENT_NAME}") == rows[1].commit  # branch reconciled
+    assert result.best is not None and result.best.metric == 0.3
+
+
+# --- Poisoned-resume validation.
+
+
+def poison_journal(repo: Path, *, metric: object, usd: object) -> None:
+    (athome := repo / ".git" / "athome").mkdir(parents=True, exist_ok=True)
+    row = {
+        "unit": 0,
+        "commit": git(repo, "rev-parse", "HEAD"),
+        "metric": metric,
+        "verdict": "keep",
+        "resources": {"wall_s": 1.0, "usd": usd},
+        "description": "poison",
+    }
+    (athome / f"{EXPERIMENT_NAME}.jsonl").write_text(json.dumps(row) + "\n")
+
+
+@pytest.mark.parametrize(
+    "metric, usd",
+    [
+        pytest.param(math.nan, 0.0, id="nan-metric"),
+        pytest.param(math.inf, 0.0, id="inf-metric"),
+        pytest.param(0.5, math.nan, id="nan-usd"),
+        pytest.param(0.5, -5.0, id="negative-usd"),
+        pytest.param(0.5, "abc", id="non-number-usd"),
+    ],
+)
+async def test_poisoned_journal_is_rejected_on_resume(tmp_path: Path, metric: object, usd: object) -> None:
+    # A legacy non-finite metric must not be reinstated as the incumbent, and a bad usd must not
+    # corrupt the spend total: a poisoned journal fails the run loudly on resume.
+    repo = toy_repo(tmp_path)
+    poison_journal(repo, metric=metric, usd=usd)
+
+    with pytest.raises(PoisonedJournal):
+        await run(make_spec(budget=Budget(max_units=2)), driver=StubDriver(iter([loss_proposal(0.3)])), repo=repo)
+
+
+# --- WR2: per-experiment single-writer lock.
+
+
+async def test_experiment_lock_is_a_single_writer(tmp_path: Path) -> None:
+    lock = tmp_path / "toy.lock"
+    async with experiment_lock(lock):
+        with pytest.raises(ConcurrentRun):
+            async with experiment_lock(lock):
+                pass
+
+
+async def test_run_refuses_a_concurrent_writer(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    (athome := repo / ".git" / "athome").mkdir(parents=True, exist_ok=True)
+
+    async with experiment_lock(athome / f"{EXPERIMENT_NAME}.lock"):
+        with pytest.raises(ConcurrentRun):
+            await run(make_spec(budget=Budget(max_units=1)), driver=StubDriver(iter([loss_proposal(0.5)])), repo=repo)

@@ -18,7 +18,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
-SENTINEL = "ATHOME-RUN-DONE"
 NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 
@@ -28,6 +27,10 @@ def run_log(name: str) -> Path:
 
 def run_pidfile(name: str) -> Path:
     return load(AthomeSettings).logs_root / "runs" / f"{name}.pid"
+
+
+def run_exitfile(name: str) -> Path:
+    return load(AthomeSettings).logs_root / "runs" / f"{name}.exit"
 
 
 class DetachError(AthomeError):
@@ -66,13 +69,14 @@ async def launch(command: Sequence[str], *, name: str) -> DetachedRun:
     """Launch ``command`` as a detached, session-leader subprocess that outlives the caller.
 
     The command runs under ``/bin/sh -c`` with stdout and stderr appended to
-    ``logs_root/runs/<name>.log``; once it exits an ``ATHOME-RUN-DONE name=<name> exit=<code>``
-    sentinel line is written so :func:`wait` can recover the exit code. The configured
-    ``env_prefix_cmd`` is prepended like a launchd agent.
+    ``logs_root/runs/<name>.log``; once it exits the wrapper writes the real exit code to
+    ``logs_root/runs/<name>.exit`` — a file separate from the shared log, so the detached
+    child's stdout cannot forge it — and :func:`wait` recovers the code from there. The
+    configured ``env_prefix_cmd`` is prepended like a launchd agent.
 
     Args:
         command: The argv of the program to run.
-        name: A unique name for the run; also names its log and pid files.
+        name: A unique name for the run; also names its log, pid, and exit files.
 
     Returns:
         The launched run's name, pid, and log path.
@@ -84,13 +88,11 @@ async def launch(command: Sequence[str], *, name: str) -> DetachedRun:
         raise DetachError(f"invalid run name {name!r}: must match [A-Za-z0-9._-]+")
     if (pid := running(name)) is not None:
         raise DetachError(f"a run named {name!r} is already live (pid {pid})")
-    log_path, pid_path = run_log(name), run_pidfile(name)
+    log_path, pid_path, exit_path = run_log(name), run_pidfile(name), run_exitfile(name)
     await anyio.Path(log_path.parent).mkdir(parents=True, exist_ok=True)
+    await anyio.Path(exit_path).unlink(missing_ok=True)
     prefix = f"{env}; " if (env := load(AthomeSettings).env_prefix_cmd) else ""
-    inner = (
-        f"{prefix}{shlex.join(command)}; rc=$?; "
-        f'echo "{SENTINEL} name="{shlex.quote(name)}" exit=$rc" >> {shlex.quote(str(log_path))}'
-    )
+    inner = f"{prefix}{shlex.join(command)}; rc=$?; echo $rc > {shlex.quote(str(exit_path))}"
     with log_path.open("ab") as log_file:
         process = await anyio.open_process(
             ["/bin/sh", "-c", inner],
@@ -104,25 +106,30 @@ async def launch(command: Sequence[str], *, name: str) -> DetachedRun:
 
 
 async def wait(name: str, *, poll: float = 5.0, timeout: float | None = None) -> int:
-    """Poll the run's log until its sentinel appears, then return the recorded exit code.
+    """Poll until the run's process has exited and its ``.exit`` file appears, then return that code.
+
+    Completion is proven by the process's real exit — its pid is gone, per
+    :func:`running` — together with the wrapper-written ``<name>.exit`` file, never by a
+    line the detached child could print to the shared log. A child that forges an
+    ``ATHOME-RUN-DONE`` line on stdout, or writes its own ``.exit`` file while still alive,
+    cannot make this return early.
 
     Args:
         name: The run to wait on.
-        poll: Seconds to sleep between log reads.
+        poll: Seconds to sleep between polls.
         timeout: Give up after this many seconds; ``None`` waits indefinitely.
 
     Returns:
         The command's exit code.
 
     Raises:
-        TimeoutError: ``timeout`` elapsed before the sentinel appeared.
+        TimeoutError: ``timeout`` elapsed before the run finished.
     """
-    log_path = anyio.Path(run_log(name))
-    pattern = re.compile(rf"{SENTINEL} name={re.escape(name)} exit=(\d+)".encode())
+    exit_path = anyio.Path(run_exitfile(name))
     deadline = None if timeout is None else anyio.current_time() + timeout
     while True:
-        if codes := pattern.findall(await log_path.read_bytes()):
-            return int(codes[-1])
+        if running(name) is None and await exit_path.exists():
+            return int((await exit_path.read_text()).strip())
         if deadline is None:
             await anyio.sleep(poll)
             continue

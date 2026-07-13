@@ -1,4 +1,7 @@
-"""The autoresearch harness: karpathy's greedy keep/discard loop primitives, athome-styled."""
+"""The autoresearch harness: karpathy's greedy keep/discard loop primitives, athome-styled.
+
+Isolation boundary and threat model: ``docs/design/research-security-model.md``.
+"""
 
 from __future__ import annotations
 

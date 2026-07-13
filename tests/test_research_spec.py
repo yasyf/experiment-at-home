@@ -3,7 +3,9 @@ from __future__ import annotations
 from textwrap import dedent
 from typing import TYPE_CHECKING
 
-from athome.research.spec import Budget, ExperimentSpec
+import pytest
+
+from athome.research.spec import Budget, ExperimentSpec, ImmutableViolation, unbounded_glob
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -69,3 +71,44 @@ def test_lists_become_tuples(tmp_path: Path) -> None:
     assert isinstance(spec.metric_command, tuple)
     assert isinstance(spec.mutable_paths, tuple)
     assert isinstance(spec.immutable_paths, tuple)
+
+
+@pytest.mark.parametrize(
+    "pattern, expected",
+    [
+        pytest.param("*", True, id="bare-star"),
+        pytest.param("**", True, id="bare-doublestar"),
+        pytest.param("*/train.py", True, id="star-prefixed"),
+        pytest.param("**/x.py", True, id="doublestar-prefixed"),
+        pytest.param("train.py", False, id="anchored-file"),
+        pytest.param("src/*.py", False, id="anchored-dir-glob"),
+        pytest.param("eval/**", False, id="anchored-recursive"),
+    ],
+)
+def test_unbounded_glob(pattern: str, expected: bool) -> None:
+    assert unbounded_glob(pattern) is expected
+
+
+def make_spec(*, mutable_paths: tuple[str, ...]) -> ExperimentSpec:
+    return ExperimentSpec(
+        name="toy",
+        metric_command=("python", "score.py"),
+        metric_key="loss",
+        direction="min",
+        mutable_paths=mutable_paths,
+        immutable_paths=("score.py",),
+        budget=Budget(max_units=1),
+    )
+
+
+@pytest.mark.parametrize(
+    "pattern", ["*", "**", "*/train.py", "**/x.py"], ids=["star", "doublestar", "star-x", "dstar-x"]
+)
+def test_post_init_rejects_unbounded_mutable_globs(pattern: str) -> None:
+    with pytest.raises(ImmutableViolation, match="tight allowlist"):
+        make_spec(mutable_paths=("train.py", pattern))
+
+
+def test_post_init_accepts_anchored_mutable_globs() -> None:
+    spec = make_spec(mutable_paths=("train.py", "src/*.py", "eval/**"))
+    assert spec.mutable_paths == ("train.py", "src/*.py", "eval/**")
