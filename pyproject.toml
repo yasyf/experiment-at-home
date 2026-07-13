@@ -33,6 +33,7 @@ ocr = ["ocrmac>=1.0"]
 modal = ["modal>=0.66"]
 hf = ["huggingface-hub>=0.26"]
 embed = ["numpy>=2", "sentence-transformers>=3"]
+research = ["numpy>=2"]
 dev = [
     "pytest>=8.0",
     "ruff>=0.8",
