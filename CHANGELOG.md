@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-13
+
+### Added
+- `athome.research` — the overnight autoresearch harness: a greedy keep/discard loop (`athome research run`) that drives an agent to edit a repo and scores each proposal by a metric, with the karpathy-loop bites fixed by design.
+  - Structural anti-reward-hack boundary: a candidate touching an `immutable_paths` glob is rejected by a git-diff gate and never scored (not prose-enforced).
+  - A structured metric channel: the metric is read only from the JSON file the immutable metric command writes, never grepped from stdout; run logs are captured but treated as untrusted.
+  - Worktree isolation per experiment, work-unit-first budgets (wall-clock + hard-kill as backstops), resumable journals, and a morning report.
+  - `ExperimentSpec` (TOML), typed append-only `Journal` on `RunSink`, monotone + bootstrap-CI promotion gates, blocking pre-flight invariants, order-invariant `dataset_digest`/`StratifiedSplitter`/`ConfusionMatrix`, a content-addressed `registry` with atomic `current`-symlink promotion, and a sqlite cell index.
+  - Evaluation kit: `Judge` (position-debiased pairwise, sha256 vote cache, judge-health controls, cross-family enforcement), blind `golden` labeling packets with a panel-vs-human agreement gate that blocks LLM spend until green, `calibrate` (saturation refusals), and topic-leakage `probes`.
+  - `ClaudeCodeDriver` (launches the `claude` CLI detached, reading only the metric file and git diff — closing the prompt-injection surface) and a nightly launchd Calendar agent.
+
 ## [0.2.0] - 2026-07-13
 
 ### Added
@@ -38,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI gate asserting the core imports on Python 3.14 free-threaded with the GIL still disabled.
 - The in-repo `athome` Claude Code plugin (marketplace + `cache`/`overnight` skills).
 
-[Unreleased]: https://github.com/yasyf/experiment-at-home/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/yasyf/experiment-at-home/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/yasyf/experiment-at-home/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/yasyf/experiment-at-home/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/yasyf/experiment-at-home/releases/tag/v0.1.0
