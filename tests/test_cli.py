@@ -56,12 +56,13 @@ def test_main_lists_subcommands_without_import() -> None:
         "athome.ocr.profiles",
         "athome.bakeoff",
         "athome.hf",
+        "athome.research.cli",
     )
     saved = {name: sys.modules.pop(name, None) for name in modules}
     try:
         result = CliRunner().invoke(main, ["--help"])
         assert result.exit_code == 0
-        for name in ("cache", "launchd", "run", "sync", "serve", "status", "batch", "ocr", "bakeoff", "hf"):
+        for name in ("cache", "launchd", "run", "sync", "serve", "status", "batch", "ocr", "bakeoff", "hf", "research"):
             assert name in result.output
         for module in modules:
             assert module not in sys.modules
@@ -77,6 +78,7 @@ def test_main_list_commands_sorted() -> None:
         "hf",
         "launchd",
         "ocr",
+        "research",
         "run",
         "serve",
         "status",
