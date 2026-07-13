@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
+import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -12,7 +14,7 @@ from click.testing import CliRunner
 
 from athome.config import load
 from athome.ocr import vlm
-from athome.ocr.apple import AppleVision, to_box
+from athome.ocr.apple import APPLE_SPEC, AppleVision, to_box
 from athome.ocr.ensemble import DISAGREEMENT_PENALTY, EnsembleTokenOcr, cross_validate, near
 from athome.ocr.merge import LlmMerger, merge_prompt
 from athome.ocr.paddle import PaddleOcr, box_to_wire, digest_hex
@@ -117,6 +119,14 @@ def test_cross_validate_adds_uncovered_supplement() -> None:
     assert [t.text for t in cross_validate(base, supplement)] == ["a", "b"]
 
 
+def test_cross_validate_penalizes_contradiction_beside_agreement() -> None:
+    base = (token("100", 0, 0.9),)
+    supplement = (token("100", 3, 0.95, y=1), token("700", 5, 0.8, y=1))
+    (only,) = cross_validate(base, supplement)
+    assert only.text == "100"
+    assert only.confidence == pytest.approx(min(0.9, 0.95, 0.8) * DISAGREEMENT_PENALTY)
+
+
 def test_near_is_center_proximity() -> None:
     assert near((10.0, 10.0), (20.0, 15.0))
     assert not near((10.0, 10.0), (40.0, 10.0))
@@ -137,6 +147,22 @@ def test_to_box_descales_and_offsets(
     bbox: tuple[float, float, float, float], upscale: float, offset: tuple[int, int], expected: Box
 ) -> None:
     assert to_box(bbox, upscale, offset) == expected
+
+
+async def test_apple_routes_tokens_through_worker() -> None:
+    worker = FakeTransport([{"text": "HELLO", "box": {"x": 1, "y": 2, "width": 3, "height": 4}, "confidence": 0.9}])
+    result = await AppleVision(worker=worker).tokens(b"png", region=Box(5, 6, 7, 8), upscale=2.0)  # type: ignore[arg-type]
+    assert result == (OcrToken(text="HELLO", box=Box(1, 2, 3, 4), confidence=0.9),)
+    assert worker.calls == [
+        ("tokens", {"image": b"png", "region": {"x": 5, "y": 6, "width": 7, "height": 8}, "upscale": 2.0})
+    ]
+
+
+def test_apple_runs_out_of_process_without_importing_ocrmac() -> None:
+    assert APPLE_SPEC.command[:2] == (sys.executable, "-c")
+    assert "athome.ocr.apple" in APPLE_SPEC.command[2]
+    assert "serve_apple" in APPLE_SPEC.command[2]
+    assert "ocrmac" not in sys.modules
 
 
 # ----- paddle -----
@@ -179,6 +205,8 @@ async def test_vlm_read_posts_image_and_parses_markdown(monkeypatch: pytest.Monk
         captured.append(json.loads(request.content))
         return httpx.Response(200, json={"choices": [{"message": {"content": "# Heading\n\ntext"}}]})
 
+    monkeypatch.setenv("ATHOME_SERVE_MLX_VLM_VERSION", "0.3.4")
+    load.cache_clear()
     monkeypatch.setattr(vlm.ManagedServer, "ensure", fake_ensure)
     monkeypatch.setattr(vlm, "endpoint_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     document = await vlm.VlmOcr().read(b"\x89PNG\r\n\x1a\nbody")
@@ -209,19 +237,24 @@ def test_vlm_model_rejects_non_vision_recipe(monkeypatch: pytest.MonkeyPatch) ->
 # ----- merge -----
 
 
-async def test_merge_reconciles_via_llm_local(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[str, str]] = []
+async def test_merge_feeds_image_to_vision_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[tuple[str, list[dict[str, object]]]] = []
 
-    async def fake_local(prompt: str, *, recipe: str = "rapid-mlx", schema: object = None) -> str:
-        calls.append((prompt, recipe))
+    async def fake_complete(recipe: str, messages: list[dict[str, object]]) -> str:
+        captured.append((recipe, messages))
         return "MERGED"
 
-    monkeypatch.setattr("athome.llm.local", fake_local, raising=False)
-    document = await LlmMerger().merge(b"img", (Document("aaa"), Document("bbb")))
+    monkeypatch.setattr("athome.ocr.vlm.complete", fake_complete)
+    image = b"\x89PNG\r\n\x1a\nPIXELS"
+    document = await LlmMerger().merge(image, (Document("aaa"), Document("bbb")))
     assert document.markdown == "MERGED"
-    prompt, recipe = calls[0]
-    assert "aaa" in prompt and "bbb" in prompt
+    recipe, messages = captured[0]
     assert recipe == "mlx-vlm"
+    content = messages[0]["content"]
+    text = next(part["text"] for part in content if part["type"] == "text")
+    assert "aaa" in text and "bbb" in text
+    image_uri = next(part["image_url"]["url"] for part in content if part["type"] == "image_url")
+    assert base64.b64encode(image).decode() in image_uri
 
 
 def test_merge_prompt_numbers_candidates() -> None:
@@ -246,9 +279,11 @@ def test_layout_markdown_reading_order() -> None:
     [
         ("hello world foo", "hello world foo", True),
         ("hello world foo bar", "zzz qqq", False),
-        ("", "anything", True),
+        ("", "anything", False),
+        ("anything", "", False),
+        ("", "", True),
     ],
-    ids=["identical", "divergent", "empty"],
+    ids=["identical", "divergent", "reference-empty", "candidate-empty", "both-empty"],
 )
 def test_documents_agree(reference: str, candidate: str, expected: bool) -> None:
     assert documents_agree(Document(reference), Document(candidate)) is expected
@@ -277,6 +312,8 @@ def install_quality_engines(
         ) -> tuple[OcrToken, ...]:
             return words_tokens(apple_text)
 
+        async def aclose(self) -> None: ...
+
     class FakeMerger:
         async def merge(self, image: bytes, candidates: tuple[Document, ...]) -> Document:
             merges.append((image, candidates))
@@ -298,6 +335,13 @@ async def test_quality_returns_vlm_on_agreement(monkeypatch: pytest.MonkeyPatch)
 async def test_quality_merges_on_disagreement(monkeypatch: pytest.MonkeyPatch) -> None:
     merges = install_quality_engines(monkeypatch, vlm_markdown="hello world foo", apple_text="zzz qqq nnn")
     document = await read(b"\x89PNG\r\n\x1a\ny", profile="quality")
+    assert document.markdown == "MERGED"
+    assert len(merges) == 1
+
+
+async def test_quality_merges_when_vlm_is_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    merges = install_quality_engines(monkeypatch, vlm_markdown="", apple_text="hello world foo")
+    document = await read(b"\x89PNG\r\n\x1a\nz", profile="quality")
     assert document.markdown == "MERGED"
     assert len(merges) == 1
 

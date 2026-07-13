@@ -51,22 +51,23 @@ def test_prices_are_price_instances() -> None:
     assert PRICES["claude-opus-4-8"] == Price(5.0, 25.0)
 
 
-def test_spend_guard_allows_under_cap() -> None:
-    SpendGuard(max_usd=1.0).check(0.99)
+async def test_spend_guard_allows_under_cap() -> None:
+    await SpendGuard(max_usd=1.0).check(0.99)
 
 
-def test_spend_guard_raises_over_cap() -> None:
+async def test_spend_guard_raises_over_cap() -> None:
     with pytest.raises(SpendExceeded, match=r"exceeds cap"):
-        SpendGuard(max_usd=1.0).check(1.01)
+        await SpendGuard(max_usd=1.0).check(1.01)
 
 
-def test_spend_guard_accumulates_and_then_blocks() -> None:
+async def test_spend_guard_accumulates_and_then_blocks() -> None:
     guard = SpendGuard(max_usd=1.0)
-    guard.check(0.6)
-    guard.record(0.6)
+    await guard.check(0.6)
+    await guard.record(0.6, 0.6)
     assert guard.spent == pytest.approx(0.6)
+    assert guard.reserved == pytest.approx(0.0)
     with pytest.raises(SpendExceeded):
-        guard.check(0.5)
+        await guard.check(0.5)
 
 
 def test_calllog_total_usd_sums_records() -> None:

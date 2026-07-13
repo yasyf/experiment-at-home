@@ -24,7 +24,13 @@ class ParityMismatch(ModalError):
 
 
 class ModalSettings(SectionSettings):
-    """The ``[modal]`` config section: how remote Modal apps are named."""
+    """The ``[modal]`` config section: how remote Modal apps are named.
+
+    Modal authenticates with the SDK's ambient credentials (``modal token``
+    / ``MODAL_TOKEN_*``); athome routes no token through settings. ``app_prefix``
+    names a workspace-scoped app, so aiming at the wrong workspace fails loud on
+    ``modal.Cls.from_name`` rather than silently serving a stranger's app.
+    """
 
     section = ("modal",)
     app_prefix: str = "athome"
@@ -95,15 +101,22 @@ class ModalWorkerTransport:
 
 
 def fingerprint_for(spec: ServiceSpec) -> dict[str, Wire]:
-    """Compute a service's parity fingerprint: installed package versions folded with its params."""
-    return {pkg: importlib.metadata.version(pkg) for pkg in spec.version_packages} | spec.params
+    """Compute a service's parity fingerprint: installed package versions folded with its params.
+
+    Packages and params live in disjoint namespaces (``pkg:`` / ``param:``) so a param
+    named like a package cannot overwrite its pinned version.
+    """
+    return {f"pkg:{pkg}": importlib.metadata.version(pkg) for pkg in spec.version_packages} | {
+        f"param:{key}": value for key, value in spec.params.items()
+    }
 
 
 def parity_mismatches(spec: ServiceSpec, remote: dict[str, Wire]) -> list[str]:
+    local = fingerprint_for(spec)
     return [
-        f"{key}: local {value!r} != remote {remote.get(key)!r}"
-        for key, value in fingerprint_for(spec).items()
-        if remote.get(key) != value
+        f"{key}: local {local.get(key)!r} != remote {remote.get(key)!r}"
+        for key in sorted(local.keys() | remote.keys())
+        if (key in local) != (key in remote) or local.get(key) != remote.get(key)
     ]
 
 

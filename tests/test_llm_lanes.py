@@ -6,12 +6,13 @@ from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
+import anyio
 import pytest
 from pydantic import BaseModel
 
 from athome import llm
 from athome.config import load
-from athome.llm import TIER_PRICE_MODEL, extract, local, small
+from athome.llm import TIER_PRICE_MODEL, extract, local, metered, small
 from athome.llm.pricing import cost
 from athome.llm.spend import SpendExceeded
 from athome.serve import ServerHandle
@@ -126,6 +127,57 @@ async def test_spend_guard_blocks_before_call(fake_spawn: ModuleType, monkeypatc
     fake_spawn.call.assert_not_called()
     assert llm.default_log().records == []
     assert llm.default_guard().spent == 0.0
+
+
+async def test_metered_reserves_projected_across_concurrent_calls(
+    fake_spawn: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prompt = "some prompt text here"
+    price_model = "claude-haiku-4-5"
+    input_tokens = len(prompt) // 4
+    projected = cost(price_model, input_tokens=input_tokens, output_tokens=llm.OUTPUT_ALLOWANCE_TOKENS)
+    monkeypatch.setenv("ATHOME_LLM_MAX_USD", str(projected * 1.5))  # admits one reservation, not two
+    load.cache_clear()
+
+    gate = anyio.Event()
+    reserved = anyio.Event()
+    winner: list[str] = []
+
+    async def slow_invoke() -> str:
+        reserved.set()  # the first call has reserved and is parked here, reservation outstanding
+        await gate.wait()
+        return "won"
+
+    async def run_first() -> None:
+        winner.append(await metered(price_model, prompt, slow_invoke, lambda result: result))
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(run_first)
+        await reserved.wait()
+        with pytest.raises(SpendExceeded):
+            await metered(price_model, prompt, lambda: fake_spawn.call(prompt), lambda result: result)
+        gate.set()
+
+    assert winner == ["won"]
+    guard = llm.default_guard()
+    assert guard.reserved == pytest.approx(0.0)
+    assert guard.spent == pytest.approx(cost(price_model, input_tokens=input_tokens, output_tokens=len("won") // 4))
+
+
+async def test_metered_records_spend_before_fallible_sink(
+    fake_spawn: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_spawn.call.return_value = "ok"
+
+    def exploding_add(self: object, record: object) -> None:
+        raise RuntimeError("sink write failed")
+
+    monkeypatch.setattr(llm.CallLog, "add", exploding_add)
+    prompt = "some prompt text here"
+    with pytest.raises(RuntimeError, match="sink write failed"):
+        await small(prompt)
+    expected = cost("claude-haiku-4-5", input_tokens=len(prompt) // 4, output_tokens=len("ok") // 4)
+    assert llm.default_guard().spent == pytest.approx(expected)
 
 
 async def test_local_text_wraps_transport_and_records(local_env: SimpleNamespace) -> None:

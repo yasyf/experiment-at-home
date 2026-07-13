@@ -41,7 +41,7 @@ async def gather_pair[A, B](first: Awaitable[A], second: Awaitable[B]) -> tuple[
 
 def reconcile(token: OcrToken, supplement: tuple[OcrToken, ...]) -> OcrToken:
     matches = [other for other in supplement if near(center(token), center(other))]
-    if not matches or any(normalized(other.text) == normalized(token.text) for other in matches):
+    if not matches or all(normalized(other.text) == normalized(token.text) for other in matches):
         return token
     lowest = min(token.confidence, *(other.confidence for other in matches))
     return replace(token, confidence=lowest * DISAGREEMENT_PENALTY)

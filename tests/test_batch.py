@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 from typing import TYPE_CHECKING
 
 import httpx
@@ -11,11 +13,11 @@ from pydantic import ValidationError
 
 from athome.config import AthomeSettings, load
 from athome.llm import batch
-from athome.llm.batch import BatchJob, BatchRequest, BatchStatus, BudgetExceeded
+from athome.llm.batch import BatchError, BatchJob, BatchRequest, BatchStatus, BudgetExceeded
 from athome.llm.batch.anthropic import ANTHROPIC_VERSION, AnthropicBatchSettings
 from athome.llm.batch.state import estimate_batch_usd, request_tokens
 from athome.llm.pricing import UnpricedModel, cost
-from athome.progress import load_journal
+from athome.progress import RunSink, load_journal
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -140,7 +142,8 @@ async def test_submit_writes_state_and_collect_maps_by_custom_id(monkeypatch: py
     job = await batch.submit(reqs("a", "b"), provider="anthropic", max_usd=100.0)
     assert job.provider == "anthropic"
     assert job.provider_batch_id == "msgbatch_1"
-    assert job.state_path.name == "anthropic-msgbatch_1.jsonl"
+    assert job.state_path.name.startswith("anthropic-") and job.state_path.name.endswith(".jsonl")
+    assert job.state_path.exists()
     assert [entry["custom_id"] for entry in submits[0]["requests"]] == ["a", "b"]
     assert submits[0]["requests"][0]["params"] == MODEL_BODY
 
@@ -228,6 +231,124 @@ async def test_recollect_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(submits) == 2
 
 
+# --- review-findings regressions (B1-B5) -------------------------------------
+
+
+async def test_crash_after_provider_submit_before_batch_id_reconciles(monkeypatch: pytest.MonkeyPatch) -> None:
+    set_keys(monkeypatch)
+    handler, submits = anthropic_router([])
+    patch_http(monkeypatch, batch.anthropic, handler)
+
+    appends = {"n": 0}
+    original_append = RunSink.append
+
+    async def flaky_append(self: RunSink, record: dict) -> None:
+        appends["n"] += 1
+        if appends["n"] == 2:
+            raise RuntimeError("crash after provider submit, before batch_id journal")
+        await original_append(self, record)
+
+    monkeypatch.setattr(RunSink, "append", flaky_append)
+    with pytest.raises(RuntimeError, match="crash after provider submit"):
+        await batch.submit(reqs("a", "b"), provider="anthropic", max_usd=100.0)
+    monkeypatch.setattr(RunSink, "append", original_append)
+
+    assert len(submits) == 1  # the provider was billed exactly once
+    (state_path,) = list((load(AthomeSettings).batches_root).glob("*.jsonl"))
+    records = load_journal(state_path)
+    assert [r.get("event") for r in records] == ["intent"]  # a reconcilable marker, no batch_id
+
+    with pytest.raises(BatchError, match="dangling submit attempt"):
+        BatchJob.open(state_path)  # resume reconciles instead of blind-resubmitting
+    assert len(submits) == 1  # still one: no double-bill
+
+
+async def test_state_lock_is_exclusive(tmp_path) -> None:
+    from athome.llm.batch.state import lock_path, state_lock
+
+    state_path = tmp_path / "anthropic-x.jsonl"
+    async with state_lock(state_path):
+        fd = os.open(lock_path(state_path), os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+
+
+async def test_retry_batch_is_polled_and_collected_on_next_collect(monkeypatch: pytest.MonkeyPatch) -> None:
+    set_keys(monkeypatch)
+    polled: list[str] = []
+    submits: list[dict] = []
+    ids = iter(["msgbatch_1", "msgbatch_2"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path, method = request.url.path, request.method
+        if method == "POST" and path == "/v1/messages/batches":
+            submits.append(json.loads(request.content))
+            return httpx.Response(200, json={"id": next(ids), "processing_status": "in_progress"})
+        if method == "GET" and path.endswith("/results"):
+            if path.split("/")[-2] == "msgbatch_1":
+                lines = [
+                    {"custom_id": "ok", "result": {"type": "succeeded", "message": {"id": "m"}}},
+                    {"custom_id": "gone", "result": {"type": "expired"}},
+                ]
+            else:
+                fresh_id = submits[1]["requests"][0]["custom_id"]
+                lines = [{"custom_id": fresh_id, "result": {"type": "succeeded", "message": {"id": "m2"}}}]
+            return httpx.Response(200, text="\n".join(json.dumps(line) for line in lines))
+        if method == "GET" and path.startswith("/v1/messages/batches/"):
+            polled.append(path.rsplit("/", 1)[-1])
+            return httpx.Response(200, json={"processing_status": "ended"})
+        raise AssertionError(f"unexpected {method} {path}")
+
+    patch_http(monkeypatch, batch.anthropic, handler)
+    job = await batch.submit(reqs("ok", "gone"), provider="anthropic", max_usd=100.0)
+
+    first = {r.custom_id: r.status for r in await batch.collect(job)}
+    assert first == {"ok": BatchStatus.COMPLETED, "gone": BatchStatus.EXPIRED}
+    assert len(submits) == 2  # the expired item was resubmitted as msgbatch_2
+    assert "msgbatch_2" not in polled  # created, not yet polled in this call
+    fresh = submits[1]["requests"][0]["custom_id"]
+
+    resumed = BatchJob.open(job.state_path)
+    second = {r.custom_id: r.status for r in await batch.collect(resumed)}
+    assert "msgbatch_2" in polled  # the retry chain is followed and the new batch is polled
+    assert second[fresh] == BatchStatus.COMPLETED
+    results = {r["custom_id"]: r["status"] for r in load_journal(job.state_path) if r.get("event") == "result"}
+    assert results[fresh] == "completed"
+    assert len(submits) == 2  # no spurious resubmits
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [float("nan"), float("inf"), float("-inf"), 0.0, -1.0],
+    ids=["nan", "inf", "-inf", "zero", "negative"],
+)
+async def test_submit_rejects_non_finite_or_nonpositive_max_usd(monkeypatch: pytest.MonkeyPatch, bad: float) -> None:
+    set_keys(monkeypatch)
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("an invalid max_usd must be rejected before any network call")
+
+    patch_http(monkeypatch, batch.anthropic, boom)
+    with pytest.raises(BatchError, match="finite and > 0"):
+        await batch.submit(reqs("a"), provider="anthropic", max_usd=bad)
+    assert list((load(AthomeSettings).batches_root).glob("*.jsonl")) == []
+
+
+async def test_submit_rejects_duplicate_custom_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    set_keys(monkeypatch)
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("a duplicate custom_id must be rejected before any network call")
+
+    patch_http(monkeypatch, batch.anthropic, boom)
+    with pytest.raises(BatchError, match="duplicate custom_id"):
+        await batch.submit(reqs("dup", "dup"), provider="anthropic", max_usd=100.0)
+    assert list((load(AthomeSettings).batches_root).glob("*.jsonl")) == []
+
+
 # --- openai flow -------------------------------------------------------------
 
 
@@ -259,7 +380,7 @@ async def test_openai_submit_uploads_file_and_collects(monkeypatch: pytest.Monke
     patch_http(monkeypatch, batch.openai, handler)
     job = await batch.submit(reqs("ok", "bad"), provider="openai", max_usd=100.0)
     assert job.provider_batch_id == "batch_1"
-    assert job.state_path.name == "openai-batch_1.jsonl"
+    assert job.state_path.name.startswith("openai-") and job.state_path.name.endswith(".jsonl")
     assert captured["input_file_id"] == "file-in"
     assert b'"custom_id": "ok"' in captured["upload"] and b'"custom_id": "bad"' in captured["upload"]
 
@@ -333,7 +454,7 @@ async def test_gemini_submit_and_collect_maps_by_key(monkeypatch: pytest.MonkeyP
     patch_http(monkeypatch, batch.gemini, handler)
     job = await batch.submit(reqs("a", "b"), provider="gemini", max_usd=100.0)
     assert job.provider_batch_id == "batches/one"
-    assert job.state_path.name == "gemini-batches_one.jsonl"
+    assert job.state_path.name.startswith("gemini-") and job.state_path.name.endswith(".jsonl")
     keys = [entry["metadata"]["key"] for entry in submits[0]["batch"]["input_config"]["requests"]["requests"]]
     assert keys == ["a", "b"]
 

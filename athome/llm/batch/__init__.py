@@ -21,10 +21,16 @@ from athome.llm.batch.state import (
     BatchStatus,
     BudgetExceeded,
     Provider,
+    check_max_usd,
+    check_unique_custom_ids,
     collected_ids,
     fresh_custom_id,
+    new_attempt_id,
     now_iso,
     retried_ids,
+    retry_records,
+    root_custom_id,
+    state_lock,
     state_path_for,
     submitted_bodies,
 )
@@ -49,10 +55,15 @@ def provider_for(provider: Provider) -> BatchProvider:
 async def submit(reqs: Sequence[BatchRequest], *, provider: Provider, max_usd: float) -> BatchJob:
     """Submit ``reqs`` to ``provider``, refusing to spend more than ``max_usd``.
 
-    The pre-submit estimate is checked before any network call: an over-budget batch
-    raises :class:`BudgetExceeded` and never reaches the provider. On success the
-    request bodies and remote batch id are journaled to a JSONL state file — the sole
-    idempotency and resume layer — and the resulting :class:`BatchJob` is returned.
+    ``max_usd`` must be finite and positive and every ``custom_id`` must be unique —
+    both are checked before the pre-submit estimate, which itself precedes any network
+    call: an over-budget batch raises :class:`BudgetExceeded` and never reaches the
+    provider. The submit *intent* (the request bodies under their ``custom_id`` keys) is
+    journaled to a JSONL state file — the sole idempotency and resume layer — *before*
+    the provider call, and the returned ``batch_id`` is journaled *after* it, all under
+    an exclusive lock on the state file. A crash between the two leaves a dangling
+    attempt with no ``batch_id``; :meth:`BatchJob.open` reconciles it (raises rather than
+    blind-resubmitting) so a lost response never double-bills.
 
     Args:
         reqs: The requests to batch, each with its own ``custom_id`` correlation key.
@@ -63,23 +74,28 @@ async def submit(reqs: Sequence[BatchRequest], *, provider: Provider, max_usd: f
         The submitted job, backed by its state file under ``batches_root``.
 
     Raises:
+        BatchError: ``max_usd`` is not finite and positive, or a ``custom_id`` repeats.
         BudgetExceeded: The estimated cost exceeds ``max_usd``.
     """
+    check_max_usd(max_usd)
+    check_unique_custom_ids(reqs)
     adapter = provider_for(provider)
     if (estimate := adapter.estimate_usd(reqs)) > max_usd:
         raise BudgetExceeded(f"estimated ${estimate:.4f} exceeds max ${max_usd:.4f}")
-    batch_id = await adapter.submit(reqs)
-    path = state_path_for(provider, batch_id)
-    await RunSink.open(path).append(
-        {
-            "event": "submitted",
-            "schema_version": SCHEMA_VERSION,
-            "provider": provider,
-            "batch_id": batch_id,
-            "submitted_at": now_iso(),
-            "requests": [{"custom_id": req.custom_id, "body": req.body} for req in reqs],
-        }
-    )
+    path = state_path_for(provider, new_attempt_id())
+    sink = RunSink.open(path)
+    async with state_lock(path):
+        await sink.append(
+            {
+                "event": "intent",
+                "schema_version": SCHEMA_VERSION,
+                "provider": provider,
+                "submitted_at": now_iso(),
+                "requests": [{"custom_id": req.custom_id, "body": req.body} for req in reqs],
+            }
+        )
+        batch_id = await adapter.submit(reqs)
+        await sink.append({"event": "submitted", "batch_id": batch_id})
     return BatchJob(provider=provider, provider_batch_id=batch_id, state_path=path)
 
 
@@ -91,34 +107,54 @@ async def status(job: BatchJob) -> BatchStatus:
 async def collect(job: BatchJob) -> list[BatchResult]:
     """Collect ``job``'s results, resubmitting any expired items under fresh ids.
 
-    Returns an empty list until the batch has completed or expired. Completed and
-    failed items are journaled to the state file keyed by ``custom_id``; a batch-level
-    expiry synthesizes an ``EXPIRED`` result for every item the provider did not
-    return. Every expired item is resubmitted as a fresh single-item batch under a new
-    ``custom_id`` (logged as a retry, recorded in state, and never counted as a
-    failure). Re-collecting is idempotent: already-journaled items are not rewritten
-    and already-retried items are not resubmitted.
+    Polls every batch the state file knows — the original batch plus any retry batch a
+    prior collect journaled — under an exclusive lock, so the daily collector and a
+    manual collector never resubmit the same item twice. A batch not yet completed or
+    expired is skipped. Completed and failed items are journaled keyed by ``custom_id``;
+    a batch-level expiry synthesizes an ``EXPIRED`` result for every item that batch did
+    not return. Every expired item is resubmitted as a fresh single-item batch under a
+    new ``custom_id`` (logged as a retry, recorded in state, never counted as a failure);
+    that retry batch is registered in state, so the next ``collect`` follows the retry
+    chain and drains it. Re-collecting is idempotent: already-journaled items are not
+    rewritten and already-retried items are not resubmitted.
     """
     adapter = provider_for(job.provider)
-    batch_state = await adapter.poll(job.provider_batch_id)
-    if batch_state not in (BatchStatus.COMPLETED, BatchStatus.EXPIRED):
-        return []
-    results = await adapter.collect(job.provider_batch_id)
-    bodies = submitted_bodies(job.state_path)
-    if batch_state is BatchStatus.EXPIRED:
-        returned = {result.custom_id for result in results}
-        results = results + [
-            BatchResult(custom_id, None, BatchStatus.EXPIRED) for custom_id in bodies if custom_id not in returned
-        ]
-    sink = RunSink.open(job.state_path)
-    already = collected_ids(job.state_path)
+    async with state_lock(job.state_path):
+        sink = RunSink.open(job.state_path)
+        bodies = submitted_bodies(job.state_path)
+        collected: list[BatchResult] = []
+        for batch_id, expected in batch_members(job).items():
+            batch_state = await adapter.poll(batch_id)
+            if batch_state not in (BatchStatus.COMPLETED, BatchStatus.EXPIRED):
+                continue
+            results = await adapter.collect(batch_id)
+            if batch_state is BatchStatus.EXPIRED:
+                returned = {result.custom_id for result in results}
+                results = results + [
+                    BatchResult(custom_id, None, BatchStatus.EXPIRED)
+                    for custom_id in expected
+                    if custom_id not in returned
+                ]
+            await journal_results(sink, job.state_path, results)
+            await resubmit_expired(adapter, job, results, sink, bodies)
+            collected += results
+        return collected
+
+
+def batch_members(job: BatchJob) -> dict[str, set[str]]:
+    members: dict[str, set[str]] = {job.provider_batch_id: set(submitted_bodies(job.state_path))}
+    for record in retry_records(job.state_path):
+        members.setdefault(str(record["batch_id"]), set()).add(str(record["new_custom_id"]))
+    return members
+
+
+async def journal_results(sink: RunSink, state_path: Path, results: Sequence[BatchResult]) -> None:
+    already = collected_ids(state_path)
     for result in results:
         if result.custom_id not in already:
             await sink.append(
                 {"event": "result", "custom_id": result.custom_id, "status": result.status, "body": result.body}
             )
-    await resubmit_expired(adapter, job, results, sink, bodies)
-    return results
 
 
 async def resubmit_expired(
@@ -132,7 +168,9 @@ async def resubmit_expired(
     expired = [r for r in results if r.status is BatchStatus.EXPIRED and r.custom_id not in retried]
     if not expired:
         return
-    fresh = [BatchRequest(custom_id=fresh_custom_id(r.custom_id), body=bodies[r.custom_id]) for r in expired]
+    fresh = [
+        BatchRequest(custom_id=fresh_custom_id(r.custom_id), body=bodies[root_custom_id(r.custom_id)]) for r in expired
+    ]
     batch_id = await adapter.submit(fresh)
     for old, new in zip(expired, fresh, strict=True):
         logger.info(

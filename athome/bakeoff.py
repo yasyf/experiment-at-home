@@ -127,14 +127,14 @@ async def run_arm(arm: Arm, spec: BakeoffSpec, *, concurrency: int) -> tuple[dic
 
 def mean_by_field(outputs: Sequence[Mapping[str, object]]) -> dict[str, float]:
     fields = {k for output in outputs for k, value in output.items() if isinstance(value, bool | int | float)}
-    return {metric: statistics.fmean([float(o[metric]) for o in outputs if metric in o]) for metric in fields}
+    return {metric: sum(float(o[metric]) for o in outputs if metric in o) / len(outputs) for metric in fields}
 
 
 def cell_agreement(left: Sequence[Mapping[str, object]], right: Sequence[Mapping[str, object]]) -> float:
     cells = [
-        left_item[k] == right_item[k]
+        k in left_item and k in right_item and left_item[k] == right_item[k]
         for left_item, right_item in zip(left, right, strict=True)
-        for k in left_item.keys() & right_item.keys()
+        for k in left_item.keys() | right_item.keys()
     ]
     return statistics.fmean(cells) if cells else 1.0
 
@@ -149,8 +149,10 @@ def field_disagreement(
 ) -> dict[str, float]:
     pairs = list(zip(outputs, baseline, strict=True))
     return {
-        field: statistics.fmean([out[field] != base[field] for out, base in pairs if field in out and field in base])
-        for field in {k for out, base in pairs for k in out.keys() & base.keys()}
+        field: statistics.fmean(
+            [(field in out) != (field in base) or (field in out and out[field] != base[field]) for out, base in pairs]
+        )
+        for field in {k for out, base in pairs for k in out.keys() | base.keys()}
     }
 
 
@@ -168,8 +170,12 @@ class WinnerPicker:
 
     @classmethod
     def pick(cls, results: Sequence[ArmResult], spec: BakeoffSpec) -> ArmResult | None:
-        viable = [result for result in results if result.metrics.get(VIABLE_METRIC, 1.0) >= 1.0]
+        viable = [result for result in results if cls.is_viable(result)]
         return max(viable, key=lambda result: cls.sort_key(result, spec)) if viable else None
+
+    @staticmethod
+    def is_viable(result: ArmResult) -> bool:
+        return result.metrics.get(VIABLE_METRIC, 1.0) >= 1.0
 
     @staticmethod
     def sort_key(result: ArmResult, spec: BakeoffSpec) -> tuple[float, float]:
@@ -177,6 +183,10 @@ class WinnerPicker:
             result.metrics[spec.primary_metric],
             result.metrics[spec.tiebreak] if spec.tiebreak else 0.0,
         )
+
+    @classmethod
+    def rank_key(cls, result: ArmResult, spec: BakeoffSpec) -> tuple[bool, float, float]:
+        return (cls.is_viable(result), *cls.sort_key(result, spec))
 
 
 def passed_gate(
@@ -192,8 +202,9 @@ def passed_gate(
         float(win[spec.primary_metric]) - float(base[spec.primary_metric])
         for win, base in zip(outputs[winner.arm], outputs[baseline], strict=True)
     ]
+    alpha = settings.alpha / (len(spec.arms) - 1)
     return statistics.fmean(diffs) >= settings.min_lift and (
-        gate_pvalue(diffs, permutations=settings.permutations, rng=random.Random(settings.seed)) < settings.alpha
+        gate_pvalue(diffs, permutations=settings.permutations, rng=random.Random(settings.seed)) < alpha
     )
 
 
@@ -224,7 +235,7 @@ async def run(spec: BakeoffSpec) -> Leaderboard:
                 )
                 for arm in spec.arms
             ),
-            key=lambda result: result.metrics[spec.primary_metric],
+            key=lambda result: WinnerPicker.rank_key(result, spec),
             reverse=True,
         )
     )

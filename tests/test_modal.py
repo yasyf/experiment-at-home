@@ -22,9 +22,9 @@ from athome.modal import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-VERSIONS = {"onnxruntime": "1.19.0", "rapidocr": "1.4.0"}
+VERSIONS = {"onnxruntime": "1.19.0", "rapidocr": "1.4.0", "numpy": "2.1.0"}
 SPEC = ServiceSpec("ocr-paddle", ("onnxruntime", "rapidocr"), {"upscale": 2})
-MATCHING_FINGERPRINT = {"onnxruntime": "1.19.0", "rapidocr": "1.4.0", "upscale": 2}
+MATCHING_FINGERPRINT = {"pkg:onnxruntime": "1.19.0", "pkg:rapidocr": "1.4.0", "param:upscale": 2}
 CLASS_NAME = "PaddleRemote"
 
 
@@ -89,13 +89,19 @@ def test_fingerprint_for_folds_versions_and_params(pinned_versions: None) -> Non
     assert fingerprint_for(SPEC) == MATCHING_FINGERPRINT
 
 
+def test_fingerprint_namespaces_package_param_collision(pinned_versions: None) -> None:
+    collide = ServiceSpec("collide", ("numpy",), {"numpy": "mode"})
+    assert fingerprint_for(collide) == {"pkg:numpy": "2.1.0", "param:numpy": "mode"}
+
+
 @pytest.mark.parametrize(
     ("remote", "expected_substrings"),
     [
         pytest.param(MATCHING_FINGERPRINT, [], id="exact-match"),
-        pytest.param({**MATCHING_FINGERPRINT, "rapidocr": "1.3.0"}, ["rapidocr"], id="version-skew"),
-        pytest.param({"onnxruntime": "1.19.0", "rapidocr": "1.4.0"}, ["upscale"], id="param-missing"),
-        pytest.param({**MATCHING_FINGERPRINT, "upscale": 4}, ["upscale"], id="param-skew"),
+        pytest.param({**MATCHING_FINGERPRINT, "pkg:rapidocr": "1.3.0"}, ["rapidocr"], id="version-skew"),
+        pytest.param({"pkg:onnxruntime": "1.19.0", "pkg:rapidocr": "1.4.0"}, ["upscale"], id="param-missing"),
+        pytest.param({**MATCHING_FINGERPRINT, "param:upscale": 4}, ["upscale"], id="param-skew"),
+        pytest.param({**MATCHING_FINGERPRINT, "pkg:pillow": "10.0.0"}, ["pillow"], id="extra-remote-key"),
     ],
 )
 def test_parity_mismatches(pinned_versions: None, remote: dict[str, object], expected_substrings: list[str]) -> None:
@@ -122,7 +128,7 @@ async def test_first_call_asserts_parity_before_ready(pinned_versions: None, mon
 
 async def test_parity_mismatch_raises_and_stays_unready(pinned_versions: None, monkeypatch: pytest.MonkeyPatch) -> None:
     instance = FakeInstance(
-        fingerprint={**MATCHING_FINGERPRINT, "rapidocr": "1.3.0"},
+        fingerprint={**MATCHING_FINGERPRINT, "pkg:rapidocr": "1.3.0"},
         methods={"tokens": lambda payload: payload},
     )
     install_fake_modal(monkeypatch, instance, {})
@@ -133,6 +139,27 @@ async def test_parity_mismatch_raises_and_stays_unready(pinned_versions: None, m
 
     assert "rapidocr" in str(excinfo.value)
     assert "athome-ocr-paddle" in str(excinfo.value)
+    assert transport.remote is None
+    assert instance.calls == []
+
+
+@pytest.mark.parametrize(
+    "remote",
+    [
+        pytest.param({**MATCHING_FINGERPRINT, "pkg:pillow": "10.0.0"}, id="extra-remote-key"),
+        pytest.param({**MATCHING_FINGERPRINT, "pkg:onnxruntime": "1.18.0"}, id="changed-value"),
+    ],
+)
+async def test_extra_or_changed_remote_key_raises_before_ready(
+    pinned_versions: None, monkeypatch: pytest.MonkeyPatch, remote: dict[str, object]
+) -> None:
+    instance = FakeInstance(fingerprint=remote, methods={"tokens": lambda payload: payload})
+    install_fake_modal(monkeypatch, instance, {})
+    transport = ModalWorkerTransport(SPEC, CLASS_NAME)
+
+    with pytest.raises(ParityMismatch):
+        await transport.call("tokens", b"img")
+
     assert transport.remote is None
     assert instance.calls == []
 

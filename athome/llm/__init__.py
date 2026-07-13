@@ -53,13 +53,25 @@ async def metered[R](
     invoke: Callable[[], Awaitable[R]],
     render: Callable[[R], str],
 ) -> R:
+    """Reserve spend, invoke, then reconcile spend and log the call, priced as ``price_model``.
+
+    Lane calls surface no served model (spawnllm returns only the completion), so every
+    :class:`~athome.llm.telemetry.CallRecord` carries ``served_model=None`` and
+    ``system_fingerprint=None`` — telemetry's drift detector is inert for lane calls.
+    """
     guard = default_guard()
     input_tokens = len(prompt) // 4
-    guard.check(cost(price_model, input_tokens=input_tokens, output_tokens=OUTPUT_ALLOWANCE_TOKENS))
+    projected = cost(price_model, input_tokens=input_tokens, output_tokens=OUTPUT_ALLOWANCE_TOKENS)
+    await guard.check(projected)
     started = perf_counter()
-    result = await invoke()
+    try:
+        result = await invoke()
+    except BaseException:
+        await guard.record(projected, 0.0)
+        raise
     output_tokens = len(render(result)) // 4
     spent = cost(price_model, input_tokens=input_tokens, output_tokens=output_tokens)
+    await guard.record(projected, spent)
     default_log().add(
         CallRecord(
             model=price_model,
@@ -71,7 +83,6 @@ async def metered[R](
             system_fingerprint=None,
         )
     )
-    guard.record(spent)
     return result
 
 

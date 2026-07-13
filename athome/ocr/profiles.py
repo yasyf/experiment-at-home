@@ -71,9 +71,9 @@ def words(text: str) -> set[str]:
 
 def documents_agree(reference: Document, candidate: Document) -> bool:
     reference_words, candidate_words = words(reference.text), words(candidate.text)
-    if not reference_words or not candidate_words:
+    if not (union := reference_words | candidate_words):
         return True
-    return len(reference_words & candidate_words) / len(reference_words | candidate_words) >= AGREEMENT_FLOOR
+    return len(reference_words & candidate_words) / len(union) >= AGREEMENT_FLOOR
 
 
 def document_to_bytes(document: Document) -> bytes:
@@ -93,16 +93,22 @@ def document_from_bytes(data: bytes) -> Document:
 
 async def read_realtime(image: bytes) -> Document:
     pool = WorkerPool(PADDLE_SPEC, size=PADDLE_POOL_SIZE)
+    apple = AppleVision()
     try:
-        tokens = await EnsembleTokenOcr(PaddleOcr(pool), AppleVision()).tokens(image)
+        tokens = await EnsembleTokenOcr(PaddleOcr(pool), apple).tokens(image)
     finally:
         await pool.aclose()
+        await apple.aclose()
     return Document(markdown=layout_markdown(tokens), tokens=tokens)
 
 
 async def read_quality(image: bytes) -> Document:
-    vlm_document = await VlmOcr().read(image)
-    apple_tokens = await AppleVision().tokens(image)
+    apple = AppleVision()
+    try:
+        vlm_document = await VlmOcr().read(image)
+        apple_tokens = await apple.tokens(image)
+    finally:
+        await apple.aclose()
     apple_document = Document(markdown=layout_markdown(apple_tokens), tokens=apple_tokens)
     if documents_agree(vlm_document, apple_document):
         return vlm_document

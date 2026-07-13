@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+import anyio
 import httpx
 import numpy as np
 import pytest
@@ -21,6 +22,15 @@ class FakeBackend:
 
     async def embed(self, texts: Sequence[str]) -> np.ndarray:
         self.calls.append(list(texts))
+        return np.array([self.vectors[text] for text in texts], dtype=np.float32)
+
+
+class SlowBackend:
+    def __init__(self, vectors: dict[str, list[float]]) -> None:
+        self.vectors = vectors
+
+    async def embed(self, texts: Sequence[str]) -> np.ndarray:
+        await anyio.sleep(0.05)
         return np.array([self.vectors[text] for text in texts], dtype=np.float32)
 
 
@@ -47,6 +57,15 @@ async def test_upsert_new_id_appends_and_embeds_only_it() -> None:
     await index.upsert({"x": "foo", "y": "bar", "z": "qux"})
     assert backend.calls == [["foo", "bar"], ["qux"]]
     assert (await index.matrix()).shape == (3, 2)
+
+
+async def test_concurrent_upserts_to_one_namespace_both_survive() -> None:
+    backend = SlowBackend({"foo": [1.0, 0.0], "bar": [0.0, 1.0]})
+    async with anyio.create_task_group() as group:
+        group.start_soon(EmbedIndex("shared", backend).upsert, {"a": "foo"})
+        group.start_soon(EmbedIndex("shared", backend).upsert, {"b": "bar"})
+    matrix = await EmbedIndex("shared", FakeBackend({})).matrix()
+    assert matrix.shape == (2, 2)
 
 
 async def test_matrix_persists_across_instances_without_reembedding() -> None:

@@ -138,6 +138,55 @@ async def test_hard_constraint_disqualifies_non_viable_winner(monkeypatch: pytes
     assert next(r for r in board.results if r.arm == "rapid").metrics["viable"] == 0.875
 
 
+async def test_arm_omitting_viable_field_on_an_item_is_not_viable(monkeypatch: pytest.MonkeyPatch) -> None:
+    use_fake_clients(monkeypatch)
+
+    async def task(client: FakeClient, item: object) -> dict[str, object]:
+        if client.base_url == RAPID.base_url:
+            return {"exact": 1.0} if item == "q3" else {"exact": 1.0, "viable": 1.0}
+        return {"exact": 0.5, "viable": 1.0}
+
+    board = await run(BakeoffSpec(task=task, corpus=CORPUS, arms=(LLAMA, RAPID), primary_metric="exact"))
+    rapid = next(result for result in board.results if result.arm == "rapid")
+    assert rapid.metrics["viable"] == pytest.approx(7 / 8)
+    assert board.winner == "llama"
+    assert board.passed_gate is False
+
+
+async def test_gate_applies_multiple_comparison_correction(monkeypatch: pytest.MonkeyPatch) -> None:
+    use_fake_clients(monkeypatch)
+    baseline = Arm(name="base", base_url="http://base/v1", model="m")
+    lucky = Arm(name="lucky", base_url="http://lucky/v1", model="m")
+    others = tuple(Arm(name=f"c{i}", base_url=f"http://c{i}/v1", model="m") for i in range(3))
+    beats = {"q1", "q2", "q3", "q4", "q5"}
+
+    async def task(client: FakeClient, item: object) -> dict[str, object]:
+        if client.base_url == lucky.base_url:
+            return {"exact": 1.0 if item in beats else 0.0, "viable": 1.0}
+        if client.base_url == baseline.base_url:
+            return {"exact": 0.0, "viable": 1.0}
+        return {"exact": -1.0, "viable": 1.0}
+
+    board = await run(BakeoffSpec(task=task, corpus=CORPUS, arms=(baseline, lucky, *others), primary_metric="exact"))
+    assert board.winner == "lucky"
+    assert board.passed_gate is False
+
+
+async def test_leaderboard_sorts_by_tiebreak_like_winner_picker(monkeypatch: pytest.MonkeyPatch) -> None:
+    use_fake_clients(monkeypatch)
+    board = await run(
+        spec_from(
+            {
+                LLAMA.base_url: {"exact": 0.5, "score": 0.1, "viable": 1.0},
+                RAPID.base_url: {"exact": 0.5, "score": 0.9, "viable": 1.0},
+            },
+            tiebreak="score",
+        )
+    )
+    assert tuple(result.arm for result in board.results) == ("rapid", "llama")
+    assert board.winner == "rapid"
+
+
 async def test_tiebreak_breaks_equal_primary(monkeypatch: pytest.MonkeyPatch) -> None:
     use_fake_clients(monkeypatch)
     board = await run(

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import httpx
-from anyio import to_thread
+from anyio import Lock, to_thread
 
 from athome.cache import Cache
 from athome.config import SectionSettings, load
@@ -22,6 +22,13 @@ if TYPE_CHECKING:
 INDEX_VERSION = 1
 INDEX_KEY = "index"
 EMBED_TIMEOUT_S = 60.0
+NAMESPACE_LOCKS: dict[str, Lock] = {}
+
+
+def namespace_lock(namespace: str) -> Lock:
+    if namespace not in NAMESPACE_LOCKS:
+        NAMESPACE_LOCKS[namespace] = Lock()
+    return NAMESPACE_LOCKS[namespace]
 
 
 class EmbedError(AthomeError):
@@ -164,23 +171,29 @@ class EmbedIndex:
     _loaded: list[LoadedIndex] = field(default_factory=list, init=False, repr=False, compare=False)
 
     async def upsert(self, items: Mapping[str, str]) -> None:
-        """Insert or update ``id -> text`` entries, re-embedding only the changed digests."""
+        """Insert or update ``id -> text`` entries, re-embedding only the changed digests.
+
+        The read-modify-write is serialised per namespace by an in-process :class:`anyio.Lock`,
+        so concurrent upserts within one process never lose updates. The lock does not span
+        processes: keep a single writer per namespace across processes.
+        """
         import numpy as np
 
-        cache = Cache.open(self.namespace, version=INDEX_VERSION)
-        entries = await read_index(cache)
-        digests = {entry_id: text_digest(text) for entry_id, text in items.items()}
-        pending = {
-            entry_id: text
-            for entry_id, text in items.items()
-            if (prior := entries.get(entry_id)) is None or prior[0] != digests[entry_id]
-        }
-        if pending:
-            vectors = await self.backend.embed(list(pending.values()))
-            for entry_id, vector in zip(pending, vectors, strict=True):
-                entries[entry_id] = (digests[entry_id], np.asarray(vector, dtype=np.float32))
-        await write_index(cache, entries)
-        self._loaded[:] = [snapshot(entries)]
+        async with namespace_lock(self.namespace):
+            cache = Cache.open(self.namespace, version=INDEX_VERSION)
+            entries = await read_index(cache)
+            digests = {entry_id: text_digest(text) for entry_id, text in items.items()}
+            pending = {
+                entry_id: text
+                for entry_id, text in items.items()
+                if (prior := entries.get(entry_id)) is None or prior[0] != digests[entry_id]
+            }
+            if pending:
+                vectors = await self.backend.embed(list(pending.values()))
+                for entry_id, vector in zip(pending, vectors, strict=True):
+                    entries[entry_id] = (digests[entry_id], np.asarray(vector, dtype=np.float32))
+            await write_index(cache, entries)
+            self._loaded[:] = [snapshot(entries)]
 
     async def matrix(self) -> np.ndarray:
         """Load and return the full ``(n, dim)`` float32 embedding matrix."""

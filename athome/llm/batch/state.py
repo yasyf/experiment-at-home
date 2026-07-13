@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import fcntl
+import math
+import os
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -93,12 +98,17 @@ class BatchJob:
 
     @classmethod
     def open(cls, state_path: Path) -> BatchJob:
-        record = submitted_record(state_path)
+        intent = intent_record(state_path)
+        if (batch_id := submitted_batch_id(state_path)) is None:
+            raise BatchError(
+                f"dangling submit attempt in {state_path}: intent journaled but no batch_id. "
+                "A batch may already be running at the provider — reconcile it there before resubmitting."
+            )
         return cls(
-            provider=record["provider"],
-            provider_batch_id=record["batch_id"],
+            provider=intent["provider"],
+            provider_batch_id=batch_id,
             state_path=state_path,
-            schema_version=int(record["schema_version"]),
+            schema_version=int(intent["schema_version"]),
         )
 
 
@@ -113,8 +123,29 @@ def batches_root() -> Path:
     return load(AthomeSettings).batches_root
 
 
-def state_path_for(provider: Provider, batch_id: str) -> Path:
-    return batches_root() / f"{provider}-{batch_id.replace('/', '_')}.jsonl"
+def new_attempt_id() -> str:
+    return uuid.uuid4().hex
+
+
+def state_path_for(provider: Provider, attempt_id: str) -> Path:
+    return batches_root() / f"{provider}-{attempt_id}.jsonl"
+
+
+def lock_path(state_path: Path) -> Path:
+    return state_path.with_name(f"{state_path.name}.lock")
+
+
+@asynccontextmanager
+async def state_lock(state_path: Path) -> AsyncIterator[None]:
+    fd = os.open(lock_path(state_path), os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def now_iso() -> str:
@@ -123,6 +154,21 @@ def now_iso() -> str:
 
 def fresh_custom_id(custom_id: str) -> str:
     return f"{custom_id}::retry::{uuid.uuid4().hex[:8]}"
+
+
+def root_custom_id(custom_id: str) -> str:
+    return custom_id.split("::retry::")[0]
+
+
+def check_max_usd(max_usd: float) -> None:
+    if not (math.isfinite(max_usd) and max_usd > 0):
+        raise BatchError(f"max_usd must be finite and > 0, got {max_usd!r}")
+
+
+def check_unique_custom_ids(reqs: Sequence[BatchRequest]) -> None:
+    ids = [req.custom_id for req in reqs]
+    if len(ids) != len(set(ids)):
+        raise BatchError(f"duplicate custom_id(s): {sorted({cid for cid in ids if ids.count(cid) > 1})}")
 
 
 def collect_text(value: object) -> Iterator[str]:
@@ -153,12 +199,19 @@ def estimate_batch_usd(reqs: Sequence[BatchRequest]) -> float:
     return sum(estimate_request_usd(req) for req in reqs)
 
 
-def submitted_record(state_path: Path) -> dict[str, object]:
-    return next(record for record in load_journal(state_path) if record.get("event") == "submitted")
+def intent_record(state_path: Path) -> dict[str, object]:
+    return next(record for record in load_journal(state_path) if record.get("event") == "intent")
+
+
+def submitted_batch_id(state_path: Path) -> str | None:
+    return next(
+        (str(record["batch_id"]) for record in load_journal(state_path) if record.get("event") == "submitted"),
+        None,
+    )
 
 
 def submitted_bodies(state_path: Path) -> dict[str, dict[str, Wire]]:
-    return {entry["custom_id"]: entry["body"] for entry in submitted_record(state_path)["requests"]}
+    return {entry["custom_id"]: entry["body"] for entry in intent_record(state_path)["requests"]}
 
 
 def collected_ids(state_path: Path) -> set[str]:
@@ -167,3 +220,7 @@ def collected_ids(state_path: Path) -> set[str]:
 
 def retried_ids(state_path: Path) -> set[str]:
     return {record["old_custom_id"] for record in load_journal(state_path) if record.get("event") == "retry"}
+
+
+def retry_records(state_path: Path) -> list[dict[str, object]]:
+    return [record for record in load_journal(state_path) if record.get("event") == "retry"]

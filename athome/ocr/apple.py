@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
-import anyio
-
+from athome.ocr.paddle import box_to_wire, token_from_wire
 from athome.ocr.types import Box, OcrToken
+from athome.workers import PipeWorker, WorkerSpec, serve
+
+if TYPE_CHECKING:
+    from athome.wire import Wire
+    from athome.workers import WorkerTransport
 
 APPLE_RECOGNITION_LEVEL = "accurate"
+APPLE_METHOD = "tokens"
+APPLE_BOOTSTRAP = "from athome.ocr.apple import serve_apple; serve_apple()"
+APPLE_SPEC = WorkerSpec((sys.executable, "-c", APPLE_BOOTSTRAP))
 
 
 def to_box(bbox: tuple[float, float, float, float], upscale: float, offset: tuple[int, int]) -> Box:
@@ -37,19 +46,42 @@ def recognize_tokens(image: bytes, region: Box | None, upscale: float) -> tuple[
     )
 
 
+def token_to_wire(token: OcrToken) -> Wire:
+    return {"text": token.text, "box": box_to_wire(token.box), "confidence": token.confidence}
+
+
+@dataclass(frozen=True, slots=True)
+class AppleHandler:
+    def tokens(self, payload: Wire) -> Wire:
+        region = None if payload["region"] is None else Box(**payload["region"])
+        return [token_to_wire(token) for token in recognize_tokens(payload["image"], region, payload["upscale"])]
+
+
+def serve_apple() -> None:
+    serve(AppleHandler())
+
+
 @dataclass(frozen=True, slots=True)
 class AppleVision:
     """Token OCR via the macOS Vision framework (``ocrmac``, the ``ocr`` extra).
 
-    The accurate recognizer runs in a worker thread — ``ocrmac`` is a blocking
-    Objective-C bridge with no async API — and returns line-level tokens with pixel
-    boxes in full-frame, top-left-origin coordinates even when a ``region`` restricts
-    recognition. ``upscale`` Lanczos-magnifies the crop to recover text too small for
-    native-resolution OCR, then divides recovered coordinates back down.
+    ``ocrmac`` is a GIL-bound Objective-C bridge, so it never runs in the free-threaded
+    parent: each read is dispatched over ``worker`` — a :class:`~athome.workers.PipeWorker`
+    subprocess that imports ``ocrmac`` in its own process — and the reply is decoded into
+    line-level tokens with pixel boxes in full-frame, top-left-origin coordinates even when a
+    ``region`` restricts recognition. ``upscale`` Lanczos-magnifies the crop to recover text too
+    small for native-resolution OCR, then divides recovered coordinates back down.
 
     Example:
         >>> await AppleVision().tokens(jpeg, region=Box(0, 0, 200, 996))
     """
 
+    worker: WorkerTransport = field(default_factory=lambda: PipeWorker(APPLE_SPEC))
+
     async def tokens(self, image: bytes, *, region: Box | None = None, upscale: float = 1.0) -> tuple[OcrToken, ...]:
-        return await anyio.to_thread.run_sync(recognize_tokens, image, region, upscale)
+        payload = {"image": image, "region": box_to_wire(region), "upscale": upscale}
+        reply = await self.worker.call(APPLE_METHOD, payload)
+        return tuple(token_from_wire(token) for token in reply)
+
+    async def aclose(self) -> None:
+        await self.worker.aclose()

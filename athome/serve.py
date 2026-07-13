@@ -47,9 +47,10 @@ class RapidMlxSettings(SectionSettings):
 
 
 class MlxVlmSettings(SectionSettings):
-    """The ``[serve.mlx-vlm]`` section: the vision model served over mlx-vlm and its port."""
+    """The ``[serve.mlx-vlm]`` section: the daily-pinned mlx-vlm version, vision model, and port."""
 
     section: ClassVar[tuple[str, ...]] = ("serve", "mlx-vlm")
+    version: str
     model: str = "mlx-community/dots.ocr-4bit"
     port: int = 8401
 
@@ -110,7 +111,7 @@ def command_for(recipe: Recipe) -> tuple[str, ...]:
             return (
                 "uvx",
                 "--from",
-                "mlx-vlm",
+                f"mlx-vlm=={settings.version}",
                 "mlx_vlm.server",
                 "--model",
                 settings.model,
@@ -119,6 +120,14 @@ def command_for(recipe: Recipe) -> tuple[str, ...]:
             )
         case "llama-server":
             return tuple(shlex.split(load(LlamaServerSettings).command))
+
+
+def configured_model(recipe: Recipe) -> str | None:
+    match settings_for(recipe):
+        case RapidMlxSettings(model=model) | MlxVlmSettings(model=model):
+            return model
+        case LlamaServerSettings():
+            return None
 
 
 def configured(recipe: Recipe) -> bool:
@@ -170,12 +179,25 @@ class ManagedServer:
                 return False
         return response.is_success
 
+    async def verify_served_model(self) -> None:
+        """Raise :class:`ServeError` unless ``GET /v1/models`` lists this recipe's configured model."""
+        if (want := configured_model(self.recipe)) is None:
+            return
+        port = settings_for(self.recipe).port
+        async with health_client() as client:
+            response = await client.get(f"http://127.0.0.1:{port}/v1/models")
+        if want not in (served := [model["id"] for model in response.json()["data"]]):
+            raise ServeError(f"{self.recipe} on port {port} serves {served}, not the configured model {want!r}")
+
     async def wait_healthy(self) -> None:
         deadline = anyio.current_time() + READY_TIMEOUT_S
-        while not await self.health():
+        while True:
+            healthy = await self.health()
             if anyio.current_time() >= deadline:
                 port = settings_for(self.recipe).port
                 raise HealthTimeout(f"{self.recipe} not healthy on port {port} after {READY_TIMEOUT_S:.0f}s")
+            if healthy:
+                return
             await anyio.sleep(READY_POLL_S)
 
     async def ensure(self, *, persistent: bool = False) -> ServerHandle:
@@ -193,11 +215,14 @@ class ManagedServer:
             The running server's handle.
 
         Raises:
+            ServeError: A server already answering on the port serves a different model.
             HealthTimeout: The server did not report healthy within the ready timeout.
         """
         if await self.health():
+            await self.verify_served_model()
             return self.handle(pid=detach.running(detach_name(self.recipe)))
         command = command_for(self.recipe)
+        pid: int | None = None
         if persistent:
             await launchd.install(
                 AgentSpec(
@@ -207,17 +232,19 @@ class ManagedServer:
                     log_name=detach_name(self.recipe),
                 )
             )
+        else:
+            pid = (await detach.launch(command, name=detach_name(self.recipe))).pid
+        try:
             await self.wait_healthy()
-            return self.handle(pid=None)
-        run = await detach.launch(command, name=detach_name(self.recipe))
-        await self.wait_healthy()
-        return self.handle(pid=run.pid)
+        except HealthTimeout:
+            await self.stop()
+            raise
+        return self.handle(pid=pid)
 
     async def stop(self) -> None:
-        """Stop this recipe — boot out its launchd agent, or kill its detached process group."""
+        """Stop this recipe — boot out its launchd agent *and* kill its detached process group."""
         if agent_label(self.recipe) in launchd.installed():
             await launchd.uninstall(agent_label(self.recipe))
-            return
         if (pid := detach.running(detach_name(self.recipe))) is not None:
             kill_group(pid)
 
