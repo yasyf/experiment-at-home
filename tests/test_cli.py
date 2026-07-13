@@ -45,20 +45,43 @@ def test_json_option_is_flag() -> None:
     assert result.output == '{"ok": true}\n'
 
 
-def test_main_lists_four_subcommands_without_import() -> None:
-    modules = ("athome.cache", "athome.launchd", "athome.detach", "athome.sync")
-    for module in modules:
-        sys.modules.pop(module, None)
-    result = CliRunner().invoke(main, ["--help"])
-    assert result.exit_code == 0
-    for name in ("cache", "launchd", "run", "sync"):
-        assert name in result.output
-    for module in modules:
-        assert module not in sys.modules
+def test_main_lists_subcommands_without_import() -> None:
+    modules = (
+        "athome.cache",
+        "athome.launchd",
+        "athome.detach",
+        "athome.sync",
+        "athome.serve",
+        "athome.llm.batch",
+        "athome.ocr.profiles",
+        "athome.bakeoff",
+        "athome.hf",
+    )
+    saved = {name: sys.modules.pop(name, None) for name in modules}
+    try:
+        result = CliRunner().invoke(main, ["--help"])
+        assert result.exit_code == 0
+        for name in ("cache", "launchd", "run", "sync", "serve", "status", "batch", "ocr", "bakeoff", "hf"):
+            assert name in result.output
+        for module in modules:
+            assert module not in sys.modules
+    finally:
+        sys.modules.update({name: module for name, module in saved.items() if module is not None})
 
 
 def test_main_list_commands_sorted() -> None:
-    assert main.list_commands(click.Context(main)) == ["cache", "launchd", "run", "sync"]
+    assert main.list_commands(click.Context(main)) == [
+        "bakeoff",
+        "batch",
+        "cache",
+        "hf",
+        "launchd",
+        "ocr",
+        "run",
+        "serve",
+        "status",
+        "sync",
+    ]
 
 
 def test_lazy_group_defers_import_until_invoked() -> None:

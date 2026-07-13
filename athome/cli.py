@@ -101,6 +101,12 @@ main = click.version_option(package_name="experiment-at-home")(
             "launchd": ("athome.launchd:cli", "List, inspect, and remove athome launchd agents."),
             "run": ("athome.detach:cli", "Launch and track detached overnight runs."),
             "sync": ("athome.sync:cli", "Mirror a tree with sha256 verification."),
+            "serve": ("athome.serve:cli", "Start, stop, and inspect local model servers."),
+            "status": ("athome.serve:status_cli", "Show launchd agents and configured-server health."),
+            "batch": ("athome.llm.batch:cli", "Submit, poll, and collect 50%-off provider batch jobs."),
+            "ocr": ("athome.ocr.profiles:cli", "Read an image or PDF into Markdown."),
+            "bakeoff": ("athome.bakeoff:cli", "Run an A/B/N endpoint bake-off from a spec module."),
+            "hf": ("athome.hf:cli", "Pull and push pinned Hugging Face snapshots."),
         },
     )
 )

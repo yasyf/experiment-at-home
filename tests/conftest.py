@@ -11,6 +11,24 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--run-live",
+        action="store_true",
+        default=False,
+        help="Run @pytest.mark.live smokes against real MLX/models/API/Modal.",
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if config.getoption("--run-live"):
+        return
+    skip_live = pytest.mark.skip(reason="live smoke; pass --run-live to run against real MLX/models/API/Modal")
+    for item in items:
+        if "live" in item.keywords:
+            item.add_marker(skip_live)
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
