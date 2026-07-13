@@ -48,7 +48,8 @@
       "source": {
         "source": "github",
         "repo": "yasyf/cc-notes"
-      }
+      },
+      "autoUpdate": true
     },
     "cc-context": {
       "source": {
