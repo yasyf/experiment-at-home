@@ -1,0 +1,49 @@
+[project]
+name = "athome-ocr-paddle"
+version = "0.0.0" # inert sentinel; the real version is set from the release tag
+description = "PP-OCRv6 detection+recognition sidecar for athome's OCR ensemble."
+readme = "README.md"
+license = "PolyForm-Noncommercial-1.0.0"
+authors = [{ name = "Yasyf Mohamedali", email = "yasyfm@gmail.com" }]
+# A separate uv project on a GIL-enabled 3.13 interpreter: onnxruntime publishes no free-threaded
+# (``cp314t``) wheel, so PP-OCRv6 cannot import into athome's 3.14t runtime. athome spawns this sidecar
+# via ``uvx athome-ocr-paddle`` and round-trips frames over the vendored (stdlib-only) wire protocol.
+# ``rapidocr`` (v3) is used over ``rapidocr-onnxruntime`` (v1.x) because only v3 loads arbitrary PP-OCRv6
+# ONNX weights via explicit ``EngineType``/``model_path`` config; ``opencv-python-headless`` is pinned
+# over full ``opencv-python`` because RapidOCR pulls OpenCV and the GUI build clashes with linked libs.
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "rapidocr>=3.0.0",
+    "onnxruntime>=1.20.0",
+    "huggingface-hub>=0.27.0",
+    "opencv-python-headless>=4.10.0",
+    "pillow>=10",
+    "numpy>=1.26",
+    "pyyaml>=6",
+    "modal>=1.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.8",
+]
+
+[project.scripts]
+athome-ocr-paddle = "athome_ocr_paddle:main"
+athome-ocr-paddle-modal = "athome_ocr_paddle.modal_client:main"
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "athome_ocr_paddle"
+module-root = ""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--tb=short", "-q"]
+markers = [
+    "live: Tests requiring real onnxruntime/PP-OCRv6 weights/Modal (skipped in the mocked run)",
+]
