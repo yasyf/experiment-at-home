@@ -41,4 +41,36 @@ jobs:
           rm -rf .wheel-smoke
           uv venv --seed .wheel-smoke
           uv pip install --python .wheel-smoke/bin/python dist/*.whl
-          .wheel-smoke/bin/experiment-at-home --help
+          .wheel-smoke/bin/athome --help
+
+  # stream-trade runs Python 3.14 free-threaded: athome core must import with the
+  # GIL still disabled (a non-free-threaded extension wheel silently re-enables it).
+  # This job is the empirical verdict on every core dep's free-threaded support.
+  freethreaded:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          python-version: "3.14t"
+          cache-dependency-glob: uv.lock
+
+      - name: Sync (dev)
+        run: uv sync --extra dev
+
+      - name: Import every core module with the GIL still disabled
+        run: |
+          uv run python -c "
+          import sys
+          import athome
+          import athome.cache, athome.cli, athome.config, athome.detach, athome.errors
+          import athome.launchd, athome.llmcache, athome.ocr, athome.progress
+          import athome.store, athome.sync, athome.wire, athome.workers
+          assert not sys._is_gil_enabled(), 'an import re-enabled the GIL'
+          print('GIL still disabled after importing athome core')
+          "
+
+      - name: Test (pytest)
+        run: uv run pytest
