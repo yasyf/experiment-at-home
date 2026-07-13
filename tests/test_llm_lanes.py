@@ -180,6 +180,57 @@ async def test_metered_records_spend_before_fallible_sink(
     assert llm.default_guard().spent == pytest.approx(expected)
 
 
+async def test_metered_invoke_raises_releases_reservation() -> None:
+    prompt = "some prompt text here"
+
+    async def boom() -> str:
+        raise RuntimeError("provider failed")
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        await metered("claude-haiku-4-5", prompt, boom, lambda result: result)
+    guard = llm.default_guard()
+    assert guard.reserved == pytest.approx(0.0)
+    assert guard.spent == pytest.approx(0.0)
+
+
+async def test_metered_render_raises_releases_reservation() -> None:
+    prompt = "some prompt text here"
+
+    async def invoke() -> str:
+        return "ok"
+
+    def render(_: str) -> str:
+        raise RuntimeError("render failed")
+
+    with pytest.raises(RuntimeError, match="render failed"):
+        await metered("claude-haiku-4-5", prompt, invoke, render)
+    guard = llm.default_guard()
+    assert guard.reserved == pytest.approx(0.0)
+    assert guard.spent == pytest.approx(0.0)
+
+
+async def test_metered_cancelled_mid_invoke_releases_reservation() -> None:
+    prompt = "some prompt text here"
+    parked = anyio.Event()
+
+    async def invoke() -> str:
+        parked.set()  # reservation is outstanding; park here until the scope cancels
+        await anyio.sleep_forever()
+        return "never"
+
+    async def run() -> None:
+        await metered("claude-haiku-4-5", prompt, invoke, lambda result: result)
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(run)
+        await parked.wait()
+        group.cancel_scope.cancel()
+
+    guard = llm.default_guard()
+    assert guard.reserved == pytest.approx(0.0)
+    assert guard.spent == pytest.approx(0.0)
+
+
 async def test_local_text_wraps_transport_and_records(local_env: SimpleNamespace) -> None:
     local_env.spawn.call.return_value = "local text"
     result = await local("hi there")

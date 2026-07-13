@@ -68,6 +68,12 @@ async def test_concurrent_upserts_to_one_namespace_both_survive() -> None:
     assert matrix.shape == (2, 2)
 
 
+def test_embed_index_documents_single_writer_contract() -> None:
+    doc = (EmbedIndex.__doc__ or "").lower()
+    assert "single writer per namespace" in doc
+    assert "does not span processes" in doc
+
+
 async def test_matrix_persists_across_instances_without_reembedding() -> None:
     await EmbedIndex("ns", FakeBackend({"foo": [1.0, 0.0, 0.0], "bar": [0.0, 1.0, 0.0]})).upsert(
         {"a": "foo", "b": "bar"}

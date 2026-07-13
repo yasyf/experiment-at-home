@@ -5,6 +5,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING, Literal, overload
 
+from anyio import CancelScope
 from pydantic import BaseModel
 
 from athome.config import SectionSettings, load
@@ -64,26 +65,30 @@ async def metered[R](
     projected = cost(price_model, input_tokens=input_tokens, output_tokens=OUTPUT_ALLOWANCE_TOKENS)
     await guard.check(projected)
     started = perf_counter()
+    settled = False
     try:
         result = await invoke()
-    except BaseException:
-        await guard.record(projected, 0.0)
-        raise
-    output_tokens = len(render(result)) // 4
-    spent = cost(price_model, input_tokens=input_tokens, output_tokens=output_tokens)
-    await guard.record(projected, spent)
-    default_log().add(
-        CallRecord(
-            model=price_model,
-            latency_s=perf_counter() - started,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cost_usd=spent,
-            served_model=None,
-            system_fingerprint=None,
+        output_tokens = len(render(result)) // 4
+        spent = cost(price_model, input_tokens=input_tokens, output_tokens=output_tokens)
+        await guard.record(projected, spent)
+        settled = True
+        default_log().add(
+            CallRecord(
+                model=price_model,
+                latency_s=perf_counter() - started,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_usd=spent,
+                served_model=None,
+                system_fingerprint=None,
+            )
         )
-    )
-    return result
+        return result
+    finally:
+        if not settled:
+            # Shield so a cancellation delivered mid-release cannot abort it and leak the reservation.
+            with CancelScope(shield=True):
+                await guard.release(projected)
 
 
 async def small(prompt: str, *, model: TierName = "small", timeout: int = 180) -> str:

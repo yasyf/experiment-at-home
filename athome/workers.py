@@ -109,29 +109,45 @@ class PipeWorker:
     async def call(self, method: str, payload: Wire) -> Wire:
         async with self.lock:
             await self.ensure_spawned()
-            await self.process.stdin.send(encode({"method": method, "payload": payload}))
-            match await self.next_frame():
+            try:
+                await self.process.stdin.send(encode({"method": method, "payload": payload}))
+                frame = await self.next_frame()
+            except BaseException:
+                await self.poison()
+                raise
+            match frame:
                 case {"ok": result}:
                     return result
                 case {"err": str() as message}:
                     raise WorkerError(message)
-                case frame:
+                case _:
                     raise WorkerError(f"malformed reply frame: {frame!r}")
 
     async def aclose(self) -> None:
-        if self.process is None:
-            return
-        process, self.process = self.process, None
-        await process.stdin.aclose()
-        with anyio.move_on_after(ACLOSE_TIMEOUT):
-            await process.wait()
+        with anyio.CancelScope(shield=True):
+            if (process := self.detach()) is None:
+                return
+            await process.stdin.aclose()
+            with anyio.move_on_after(ACLOSE_TIMEOUT):
+                await process.wait()
+            await self.reap(process)
+
+    async def poison(self) -> None:
+        with anyio.CancelScope(shield=True):
+            if (process := self.detach()) is not None:
+                await self.reap(process)
+
+    def detach(self) -> Process | None:
+        process, self.process, self.stdout = self.process, None, None
+        return process
+
+    async def reap(self, process: Process) -> None:
         if process.returncode is None:
             process.kill()
             await process.wait()
-        if self.stderr_thread is not None:
-            await anyio.to_thread.run_sync(self.stderr_thread.join, STDERR_JOIN_TIMEOUT)
-        self.stdout = None
-        self.stderr_thread = None
+        if (thread := self.stderr_thread) is not None:
+            self.stderr_thread = None
+            await anyio.to_thread.run_sync(thread.join, STDERR_JOIN_TIMEOUT)
 
     async def ensure_spawned(self) -> None:
         if self.process is not None:

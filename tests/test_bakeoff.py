@@ -153,6 +153,21 @@ async def test_arm_omitting_viable_field_on_an_item_is_not_viable(monkeypatch: p
     assert board.passed_gate is False
 
 
+async def test_arm_omitting_viable_field_on_every_item_is_not_viable(monkeypatch: pytest.MonkeyPatch) -> None:
+    use_fake_clients(monkeypatch)
+
+    async def task(client: FakeClient, item: object) -> dict[str, object]:
+        if client.base_url == RAPID.base_url:
+            return {"exact": 1.0}
+        return {"exact": 0.5, "viable": 1.0}
+
+    board = await run(BakeoffSpec(task=task, corpus=CORPUS, arms=(LLAMA, RAPID), primary_metric="exact"))
+    rapid = next(result for result in board.results if result.arm == "rapid")
+    assert "viable" not in rapid.metrics
+    assert board.winner == "llama"
+    assert board.passed_gate is False
+
+
 async def test_gate_applies_multiple_comparison_correction(monkeypatch: pytest.MonkeyPatch) -> None:
     use_fake_clients(monkeypatch)
     baseline = Arm(name="base", base_url="http://base/v1", model="m")

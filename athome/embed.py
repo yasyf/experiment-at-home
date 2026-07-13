@@ -160,6 +160,12 @@ class EmbedIndex:
     matrix is persisted as an ``.npz`` blob through :class:`athome.cache.Cache` atomic writes.
     Call :meth:`upsert` or :meth:`matrix` before :meth:`mmr`, which reranks the loaded matrix.
 
+    Concurrency contract: :meth:`upsert` serialises its read-modify-write per namespace with an
+    in-process :class:`anyio.Lock`, so concurrent upserts within one process never lose updates.
+    That lock does not span processes, so the contract is a single writer per namespace across
+    processes; a second writing process can still clobber an update. A cross-process file lock is
+    intentionally out of scope — run one writer per namespace.
+
     Example:
         >>> index = EmbedIndex("exemplars", LocalBackend())
         >>> await index.upsert({"a": "first", "b": "second"})

@@ -42,3 +42,12 @@ class SpendGuard:
         async with self.lock:
             self.reserved -= reserved
             self.spent += actual
+
+    async def release(self, reserved: float) -> None:
+        """Release the ``reserved`` projection without recording spend, atomically.
+
+        The failure/cancel counterpart to :meth:`record`: a call that never completes
+        frees its reservation so the cap is not permanently consumed.
+        """
+        async with self.lock:
+            self.reserved -= reserved

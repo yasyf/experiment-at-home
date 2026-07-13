@@ -71,6 +71,18 @@ sys.stderr.write("fatal: died before handshake\\n"); sys.stderr.flush()
 sys.exit(9)
 """
 
+DELAY_SOURCE = """
+import time
+from athome.workers import serve
+
+class Handler:
+    def slow_echo(self, payload):
+        time.sleep(payload["delay"])
+        return payload["value"]
+
+serve(Handler())
+"""
+
 
 def wire_side_effect(path: str) -> str:
     Path(path).write_text("pwned")
@@ -292,6 +304,17 @@ async def test_handshake_crash_tears_worker_down() -> None:
         assert worker.process is None
         assert worker.stdout is None
         assert worker.stderr_thread is None
+
+
+async def test_call_cancel_poisons_worker_against_stale_reply() -> None:
+    async with running(DELAY_SOURCE) as worker:
+        assert await worker.call("slow_echo", {"delay": 0.0, "value": "WARM"}) == "WARM"
+        with anyio.move_on_after(0.15):
+            await worker.call("slow_echo", {"delay": 0.5, "value": "STALE"})
+        assert worker.process is None
+        assert worker.stdout is None
+        assert worker.stderr_thread is None
+        assert await worker.call("slow_echo", {"delay": 0.0, "value": "FRESH"}) == "FRESH"
 
 
 async def test_lease_release_survives_cancel_under_contention() -> None:

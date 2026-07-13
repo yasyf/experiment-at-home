@@ -3,13 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import anyio
 import httpx
 import pytest
 
 from athome import serve
 from athome.config import load
 from athome.detach import DetachedRun
-from athome.launchd import KeepAlive
+from athome.launchd import KeepAlive, LaunchdError
 from athome.serve import HealthTimeout, ManagedServer, ServeError, ServerHandle, command_for, down, probe_all, up
 
 if TYPE_CHECKING:
@@ -153,6 +154,24 @@ async def test_ensure_rejects_healthy_server_with_wrong_model(monkeypatch: pytes
     assert launched == []
 
 
+async def test_ensure_rejects_launched_server_with_wrong_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    launched: list[object] = []
+
+    async def fake_launch(command: object, *, name: str) -> DetachedRun:
+        launched.append(command)
+        return DetachedRun(name=name, pid=555, log_path=Path("/tmp/x.log"))
+
+    monkeypatch.setattr(ManagedServer, "health", health_sequence(False, True))
+    mock_models(monkeypatch, "mlx-community/some-other-model")
+    monkeypatch.setattr(serve.detach, "launch", fake_launch)
+    monkeypatch.setattr(serve.launchd, "installed", lambda **_: [])
+    monkeypatch.setattr(serve.detach, "running", lambda name: 555)
+    monkeypatch.setattr(serve, "kill_group", lambda pid: None)
+    with pytest.raises(ServeError, match="dots.ocr-4bit"):
+        await ManagedServer("mlx-vlm").ensure()
+    assert launched != []
+
+
 async def test_ensure_spawns_detached_with_command_vector(monkeypatch: pytest.MonkeyPatch) -> None:
     configure_rapid_mlx(monkeypatch)
     captured: dict[str, object] = {}
@@ -163,6 +182,7 @@ async def test_ensure_spawns_detached_with_command_vector(monkeypatch: pytest.Mo
         return DetachedRun(name=name, pid=4321, log_path=Path("/tmp/x.log"))
 
     monkeypatch.setattr(ManagedServer, "health", health_sequence(False, True))
+    mock_models(monkeypatch, "mlx-community/Qwen3-4bit")
     monkeypatch.setattr(serve.detach, "launch", fake_launch)
     handle = await ManagedServer("rapid-mlx").ensure()
     assert captured["command"] == command_for("rapid-mlx")
@@ -179,6 +199,7 @@ async def test_ensure_persistent_installs_keepalive_agent(monkeypatch: pytest.Mo
         return Path("/tmp/agent.plist")
 
     monkeypatch.setattr(ManagedServer, "health", health_sequence(False, True))
+    mock_models(monkeypatch, "mlx-community/dots.ocr-4bit")
     monkeypatch.setattr(serve.launchd, "install", fake_install)
     handle = await ManagedServer("mlx-vlm").ensure(persistent=True)
     spec = captured["spec"]
@@ -219,6 +240,30 @@ async def test_ensure_tears_down_detached_run_on_timeout(monkeypatch: pytest.Mon
     assert killed == [777]
 
 
+async def test_ensure_cancellation_tears_down_launched_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    killed: list[int] = []
+    probes = {"n": 0}
+
+    async def fake_launch(command: object, *, name: str) -> DetachedRun:
+        return DetachedRun(name=name, pid=999, log_path=Path("/tmp/x.log"))
+
+    async def probe(self: ManagedServer) -> bool:
+        probes["n"] += 1
+        if probes["n"] == 1:
+            return False
+        await anyio.sleep_forever()
+        return False
+
+    monkeypatch.setattr(ManagedServer, "health", probe)
+    monkeypatch.setattr(serve.detach, "launch", fake_launch)
+    monkeypatch.setattr(serve.launchd, "installed", lambda **_: [])
+    monkeypatch.setattr(serve.detach, "running", lambda name: 999)
+    monkeypatch.setattr(serve, "kill_group", killed.append)
+    with anyio.move_on_after(0.05):
+        await ManagedServer("mlx-vlm").ensure()
+    assert killed == [999]
+
+
 async def test_ensure_persistent_uninstalls_agent_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     removed: list[str] = []
 
@@ -252,6 +297,20 @@ async def test_stop_covers_both_detached_and_launchd(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(serve, "kill_group", killed.append)
     await ManagedServer("mlx-vlm").stop()
     assert removed == ["com.athome.serve-mlx-vlm"]
+    assert killed == [4242]
+
+
+async def test_stop_kills_detached_when_launchd_uninstall_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    killed: list[int] = []
+
+    async def boom_uninstall(label: str) -> None:
+        raise LaunchdError(f"{label} still loaded after launchctl bootout")
+
+    monkeypatch.setattr(serve.launchd, "installed", lambda **_: ["com.athome.serve-mlx-vlm"])
+    monkeypatch.setattr(serve.launchd, "uninstall", boom_uninstall)
+    monkeypatch.setattr(serve.detach, "running", lambda name: 4242)
+    monkeypatch.setattr(serve, "kill_group", killed.append)
+    await ManagedServer("mlx-vlm").stop()
     assert killed == [4242]
 
 

@@ -166,16 +166,21 @@ def gate_pvalue(diffs: Sequence[float], *, permutations: int, rng: random.Random
 
 
 class WinnerPicker:
-    """Picks the best viable arm by primary metric, then tiebreak; the ``viable`` field gates entry."""
+    """Picks the best viable arm by primary metric, then tiebreak; a declared ``viable`` field gates entry."""
 
     @classmethod
     def pick(cls, results: Sequence[ArmResult], spec: BakeoffSpec) -> ArmResult | None:
-        viable = [result for result in results if cls.is_viable(result)]
+        declared = cls.viable_declared(results)
+        viable = [result for result in results if cls.is_viable(result, declared=declared)]
         return max(viable, key=lambda result: cls.sort_key(result, spec)) if viable else None
 
     @staticmethod
-    def is_viable(result: ArmResult) -> bool:
-        return result.metrics.get(VIABLE_METRIC, 1.0) >= 1.0
+    def viable_declared(results: Sequence[ArmResult]) -> bool:
+        return any(VIABLE_METRIC in result.metrics for result in results)
+
+    @staticmethod
+    def is_viable(result: ArmResult, *, declared: bool) -> bool:
+        return not declared or result.metrics.get(VIABLE_METRIC, 0.0) >= 1.0
 
     @staticmethod
     def sort_key(result: ArmResult, spec: BakeoffSpec) -> tuple[float, float]:
@@ -185,8 +190,8 @@ class WinnerPicker:
         )
 
     @classmethod
-    def rank_key(cls, result: ArmResult, spec: BakeoffSpec) -> tuple[bool, float, float]:
-        return (cls.is_viable(result), *cls.sort_key(result, spec))
+    def rank_key(cls, result: ArmResult, spec: BakeoffSpec, *, declared: bool) -> tuple[bool, float, float]:
+        return (cls.is_viable(result, declared=declared), *cls.sort_key(result, spec))
 
 
 def passed_gate(
@@ -225,23 +230,21 @@ async def run(spec: BakeoffSpec) -> Leaderboard:
     settings = load(BakeoffSettings)
     outputs = {arm.name: await run_arm(arm, spec, concurrency=settings.concurrency) for arm in spec.arms}
     baseline = spec.arms[0].name
-    results = tuple(
-        sorted(
-            (
-                ArmResult(
-                    arm=arm.name,
-                    metrics=mean_by_field(outputs[arm.name]) | {AGREEMENT_METRIC: agreement(arm.name, outputs)},
-                    per_field_disagreement=field_disagreement(outputs[arm.name], outputs[baseline]),
-                )
-                for arm in spec.arms
-            ),
-            key=lambda result: WinnerPicker.rank_key(result, spec),
-            reverse=True,
+    results = [
+        ArmResult(
+            arm=arm.name,
+            metrics=mean_by_field(outputs[arm.name]) | {AGREEMENT_METRIC: agreement(arm.name, outputs)},
+            per_field_disagreement=field_disagreement(outputs[arm.name], outputs[baseline]),
         )
+        for arm in spec.arms
+    ]
+    declared = WinnerPicker.viable_declared(results)
+    ranked = tuple(
+        sorted(results, key=lambda result: WinnerPicker.rank_key(result, spec, declared=declared), reverse=True)
     )
-    winner = WinnerPicker.pick(results, spec)
+    winner = WinnerPicker.pick(ranked, spec)
     return Leaderboard(
-        results=results,
+        results=ranked,
         winner=winner.arm if winner else "",
         passed_gate=passed_gate(winner, spec, outputs, settings),
     )

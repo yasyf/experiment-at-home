@@ -15,7 +15,7 @@ from athome import detach, launchd, llmcache
 from athome.cli import coro, emit, json_option
 from athome.config import SectionSettings, load
 from athome.errors import AthomeError
-from athome.launchd import AgentSpec, KeepAlive
+from athome.launchd import AgentSpec, KeepAlive, LaunchdError
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
@@ -180,7 +180,11 @@ class ManagedServer:
         return response.is_success
 
     async def verify_served_model(self) -> None:
-        """Raise :class:`ServeError` unless ``GET /v1/models`` lists this recipe's configured model."""
+        """Raise :class:`ServeError` unless ``GET /v1/models`` lists this recipe's configured model.
+
+        This is an identity check, not authentication: a hostile process holding the port could
+        spoof the model id, and trusting a localhost endpoint is inherent to the design.
+        """
         if (want := configured_model(self.recipe)) is None:
             return
         port = settings_for(self.recipe).port
@@ -197,6 +201,7 @@ class ManagedServer:
                 port = settings_for(self.recipe).port
                 raise HealthTimeout(f"{self.recipe} not healthy on port {port} after {READY_TIMEOUT_S:.0f}s")
             if healthy:
+                await self.verify_served_model()
                 return
             await anyio.sleep(READY_POLL_S)
 
@@ -215,7 +220,7 @@ class ManagedServer:
             The running server's handle.
 
         Raises:
-            ServeError: A server already answering on the port serves a different model.
+            ServeError: The adopted or launched server serves a different model.
             HealthTimeout: The server did not report healthy within the ready timeout.
         """
         if await self.health():
@@ -223,30 +228,41 @@ class ManagedServer:
             return self.handle(pid=detach.running(detach_name(self.recipe)))
         command = command_for(self.recipe)
         pid: int | None = None
-        if persistent:
-            await launchd.install(
-                AgentSpec(
-                    label=agent_label(self.recipe),
-                    command=command,
-                    schedule=KeepAlive(),
-                    log_name=detach_name(self.recipe),
-                )
-            )
-        else:
-            pid = (await detach.launch(command, name=detach_name(self.recipe))).pid
         try:
+            if persistent:
+                await launchd.install(
+                    AgentSpec(
+                        label=agent_label(self.recipe),
+                        command=command,
+                        schedule=KeepAlive(),
+                        log_name=detach_name(self.recipe),
+                    )
+                )
+            else:
+                pid = (await detach.launch(command, name=detach_name(self.recipe))).pid
             await self.wait_healthy()
-        except HealthTimeout:
-            await self.stop()
+        except BaseException:
+            with anyio.CancelScope(shield=True):
+                await self.stop()
             raise
         return self.handle(pid=pid)
 
     async def stop(self) -> None:
-        """Stop this recipe — boot out its launchd agent *and* kill its detached process group."""
+        """Stop this recipe — boot out its launchd agent *and* kill its detached process group.
+
+        The two teardowns run independently: a launchd uninstall failure never skips the
+        detached-process kill.
+        """
         if agent_label(self.recipe) in launchd.installed():
-            await launchd.uninstall(agent_label(self.recipe))
+            try:
+                await launchd.uninstall(agent_label(self.recipe))
+            except LaunchdError:
+                pass
         if (pid := detach.running(detach_name(self.recipe))) is not None:
-            kill_group(pid)
+            try:
+                kill_group(pid)
+            except ProcessLookupError:
+                pass
 
     def client(self, *, cached: bool = False) -> AsyncOpenAI:
         """Return an ``AsyncOpenAI`` client bound to this recipe's endpoint.

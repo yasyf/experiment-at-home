@@ -2,7 +2,18 @@
 
 Two codex finder lanes (security/secrets/batch/modal/hf + correctness) over the
 v0.2 code. fable synthesis: accept the list below; fix with fail-first regression
-tests, then a refuter pass. The finders confirmed clean: keys flow through pydantic
+tests, then a refuter pass.
+
+**Refuter round (over the applied fixes):** 14 fixes held; 10 had residual gaps,
+hardened in a second round — SV2 (verify the served model after launch, not only
+on adopt), SV3 (broaden teardown to any failure + shield + independent stop legs),
+B1 (fsync the intent + refuse a fresh submit while a dangling intent exists), B2
+(journal-before-submit on the retry path too), B3 (track the retry root explicitly
+instead of a string sentinel that can appear in user ids), B5 (snapshot `reqs`),
+L1 (release the spend reservation on cancel/exception, shielded — else the budget
+leaks), O1 (poison a `PipeWorker` on cancel so a stale reply frame can't cross-talk),
+BO1 (a hard-constraint field absent on every item = not viable). E1's cross-process
+lost-update is scoped out by design (single-writer-per-namespace, documented). The finders confirmed clean: keys flow through pydantic
 settings (never logged/URL'd/journaled), `ensure_write_auth` precedes the HF push,
 `custom_id` (not order) correlates results, `expired`≠`failed`, Modal parity
 asserts before ready with no local fallback, and the 73 ty diagnostics are

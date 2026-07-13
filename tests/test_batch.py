@@ -349,6 +349,139 @@ async def test_submit_rejects_duplicate_custom_id(monkeypatch: pytest.MonkeyPatc
     assert list((load(AthomeSettings).batches_root).glob("*.jsonl")) == []
 
 
+async def test_dangling_intent_blocks_new_submit(monkeypatch: pytest.MonkeyPatch) -> None:
+    set_keys(monkeypatch)
+    handler, submits = anthropic_router([])
+    patch_http(monkeypatch, batch.anthropic, handler)
+    root = load(AthomeSettings).batches_root
+    root.mkdir(parents=True, exist_ok=True)
+    dangling = root / "anthropic-deadbeef.jsonl"
+    intent = {
+        "event": "intent",
+        "schema_version": 1,
+        "provider": "anthropic",
+        "requests": [{"custom_id": "a", "body": MODEL_BODY}],
+    }
+    dangling.write_text(json.dumps(intent) + "\n")
+
+    with pytest.raises(BatchError, match="dangling submit attempt"):
+        await batch.submit(reqs("b"), provider="anthropic", max_usd=100.0)
+    assert submits == []  # never reached the provider — no fresh attempt UUID created
+
+    with dangling.open("a") as fh:
+        fh.write(json.dumps({"event": "submitted", "batch_id": "msgbatch_old"}) + "\n")
+    job = await batch.submit(reqs("b"), provider="anthropic", max_usd=100.0)
+    assert job.provider_batch_id == "msgbatch_1"  # a completed prior attempt does not block
+    assert len(submits) == 1
+
+
+async def test_intent_fsynced_before_provider_submit(monkeypatch: pytest.MonkeyPatch) -> None:
+    set_keys(monkeypatch)
+    events: list[str] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        events.append("fsync")
+        return real_fsync(fd)
+
+    monkeypatch.setattr("athome.llm.batch.state.os.fsync", recording_fsync)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/messages/batches":
+            events.append("submit")
+            return httpx.Response(200, json={"id": "msgbatch_1", "processing_status": "in_progress"})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    patch_http(monkeypatch, batch.anthropic, handler)
+    await batch.submit(reqs("a"), provider="anthropic", max_usd=100.0)
+    assert "fsync" in events and "submit" in events
+    assert events.index("fsync") < events.index("submit")  # intent durable before the provider is billed
+
+
+async def test_crash_after_retry_submit_leaves_reconcilable_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    set_keys(monkeypatch)
+    results = [
+        {"custom_id": "ok", "result": {"type": "succeeded", "message": {"id": "m"}}},
+        {"custom_id": "gone", "result": {"type": "expired"}},
+    ]
+    handler, submits = anthropic_router(results)
+    patch_http(monkeypatch, batch.anthropic, handler)
+
+    job = await batch.submit(reqs("ok", "gone"), provider="anthropic", max_usd=100.0)
+    assert len(submits) == 1
+
+    original_append = RunSink.append
+
+    async def crash_on_retry_confirm(self: RunSink, record: dict) -> None:
+        if record.get("event") == "retry":
+            raise RuntimeError("crash after retry provider-accept, before retry journal")
+        await original_append(self, record)
+
+    monkeypatch.setattr(RunSink, "append", crash_on_retry_confirm)
+    with pytest.raises(RuntimeError, match="crash after retry provider-accept"):
+        await batch.collect(job)
+    monkeypatch.setattr(RunSink, "append", original_append)
+
+    assert len(submits) == 2  # the retry batch was billed exactly once
+    records = load_journal(job.state_path)
+    assert any(r.get("event") == "retry_intent" and r.get("old_custom_id") == "gone" for r in records)
+    assert not any(r.get("event") == "retry" for r in records)  # no confirmed batch_id — reconcilable
+
+    await batch.collect(job)
+    assert len(submits) == 2  # a resumed collect reconciles instead of resubmitting the still-expired item
+    assert not any(r.get("event") == "retry" for r in load_journal(job.state_path))
+
+
+async def test_user_custom_id_with_retry_sentinel_round_trips(monkeypatch: pytest.MonkeyPatch) -> None:
+    set_keys(monkeypatch)
+    user_id = "order::retry::v2"
+    handler, submits = anthropic_router([{"custom_id": user_id, "result": {"type": "expired"}}])
+    patch_http(monkeypatch, batch.anthropic, handler)
+    special_body = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "special"}], "max_tokens": 8}
+
+    job = await batch.submit([BatchRequest(custom_id=user_id, body=special_body)], provider="anthropic", max_usd=100.0)
+    collected = {r.custom_id: r.status for r in await batch.collect(job)}
+    assert collected == {user_id: BatchStatus.EXPIRED}
+
+    assert len(submits) == 2
+    resubmitted = submits[1]["requests"]
+    assert len(resubmitted) == 1
+    assert resubmitted[0]["params"] == special_body  # original body recovered by explicit root, not a "::retry::" split
+    assert resubmitted[0]["custom_id"].startswith(f"{user_id}::retry::")
+    retries = [r for r in load_journal(job.state_path) if r.get("event") == "retry"]
+    assert len(retries) == 1
+    assert retries[0]["old_custom_id"] == user_id
+    assert retries[0]["root_custom_id"] == user_id  # tracked whole, never truncated to "order"
+
+
+async def test_submit_snapshots_reqs_against_concurrent_mutation(monkeypatch: pytest.MonkeyPatch) -> None:
+    set_keys(monkeypatch)
+    original = reqs("a", "b")
+    seen: dict[str, list] = {}
+
+    class FakeAdapter:
+        def estimate_usd(self, r: object) -> float:
+            original.append(BatchRequest("a", dict(MODEL_BODY)))  # concurrent mutation adds a duplicate
+            return 0.0
+
+        async def submit(self, r: object) -> str:
+            seen["reqs"] = list(r)  # type: ignore[arg-type]
+            return "batch_x"
+
+        async def poll(self, batch_id: str) -> object:
+            raise AssertionError("poll not expected during submit")
+
+        async def collect(self, batch_id: str) -> object:
+            raise AssertionError("collect not expected during submit")
+
+    monkeypatch.setattr(batch, "provider_for", lambda provider: FakeAdapter())
+    job = await batch.submit(original, provider="anthropic", max_usd=100.0)
+
+    assert [r.custom_id for r in seen["reqs"]] == ["a", "b"]  # provider saw the entry snapshot, not the mutation
+    intent = next(r for r in load_journal(job.state_path) if r.get("event") == "intent")
+    assert [entry["custom_id"] for entry in intent["requests"]] == ["a", "b"]
+
+
 # --- openai flow -------------------------------------------------------------
 
 

@@ -152,12 +152,16 @@ def now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+async def fsync_path(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        await asyncio.to_thread(os.fsync, fd)
+    finally:
+        os.close(fd)
+
+
 def fresh_custom_id(custom_id: str) -> str:
     return f"{custom_id}::retry::{uuid.uuid4().hex[:8]}"
-
-
-def root_custom_id(custom_id: str) -> str:
-    return custom_id.split("::retry::")[0]
 
 
 def check_max_usd(max_usd: float) -> None:
@@ -210,6 +214,16 @@ def submitted_batch_id(state_path: Path) -> str | None:
     )
 
 
+def dangling_attempts(provider: Provider) -> list[Path]:
+    return [
+        path
+        for path in sorted(batches_root().glob(f"{provider}-*.jsonl"))
+        if (records := load_journal(path))
+        and any(record.get("event") == "intent" for record in records)
+        and not any(record.get("event") == "submitted" for record in records)
+    ]
+
+
 def submitted_bodies(state_path: Path) -> dict[str, dict[str, Wire]]:
     return {entry["custom_id"]: entry["body"] for entry in intent_record(state_path)["requests"]}
 
@@ -219,8 +233,12 @@ def collected_ids(state_path: Path) -> set[str]:
 
 
 def retried_ids(state_path: Path) -> set[str]:
-    return {record["old_custom_id"] for record in load_journal(state_path) if record.get("event") == "retry"}
+    return {record["old_custom_id"] for record in load_journal(state_path) if record.get("event") == "retry_intent"}
 
 
 def retry_records(state_path: Path) -> list[dict[str, object]]:
     return [record for record in load_journal(state_path) if record.get("event") == "retry"]
+
+
+def retry_roots(state_path: Path) -> dict[str, str]:
+    return {str(record["new_custom_id"]): str(record["root_custom_id"]) for record in retry_records(state_path)}

@@ -24,12 +24,14 @@ from athome.llm.batch.state import (
     check_max_usd,
     check_unique_custom_ids,
     collected_ids,
+    dangling_attempts,
     fresh_custom_id,
+    fsync_path,
     new_attempt_id,
     now_iso,
     retried_ids,
     retry_records,
-    root_custom_id,
+    retry_roots,
     state_lock,
     state_path_for,
     submitted_bodies,
@@ -59,11 +61,14 @@ async def submit(reqs: Sequence[BatchRequest], *, provider: Provider, max_usd: f
     both are checked before the pre-submit estimate, which itself precedes any network
     call: an over-budget batch raises :class:`BudgetExceeded` and never reaches the
     provider. The submit *intent* (the request bodies under their ``custom_id`` keys) is
-    journaled to a JSONL state file — the sole idempotency and resume layer — *before*
-    the provider call, and the returned ``batch_id`` is journaled *after* it, all under
-    an exclusive lock on the state file. A crash between the two leaves a dangling
-    attempt with no ``batch_id``; :meth:`BatchJob.open` reconciles it (raises rather than
-    blind-resubmitting) so a lost response never double-bills.
+    journaled to a JSONL state file — the sole idempotency and resume layer — and
+    ``fsync``-ed to disk *before* the provider call, and the returned ``batch_id`` is
+    journaled *after* it, all under an exclusive lock on the state file. A crash between
+    the two leaves a durable dangling attempt with no ``batch_id``; :meth:`BatchJob.open`
+    reconciles it and a fresh ``submit`` refuses while one exists (both raise rather than
+    blind-resubmitting), so a lost response never double-bills. ``reqs`` is snapshotted at
+    entry, so concurrent mutation of the caller's sequence cannot slip a duplicate past
+    validation.
 
     Args:
         reqs: The requests to batch, each with its own ``custom_id`` correlation key.
@@ -74,11 +79,18 @@ async def submit(reqs: Sequence[BatchRequest], *, provider: Provider, max_usd: f
         The submitted job, backed by its state file under ``batches_root``.
 
     Raises:
-        BatchError: ``max_usd`` is not finite and positive, or a ``custom_id`` repeats.
+        BatchError: ``max_usd`` is not finite and positive, a ``custom_id`` repeats, or a
+            prior attempt is dangling (intent journaled but no ``batch_id``).
         BudgetExceeded: The estimated cost exceeds ``max_usd``.
     """
+    reqs = tuple(reqs)
     check_max_usd(max_usd)
     check_unique_custom_ids(reqs)
+    if dangling := dangling_attempts(provider):
+        raise BatchError(
+            f"dangling submit attempt(s) with an intent but no batch_id: {[str(path) for path in dangling]}. "
+            "A batch may already be running at the provider — reconcile it before submitting again."
+        )
     adapter = provider_for(provider)
     if (estimate := adapter.estimate_usd(reqs)) > max_usd:
         raise BudgetExceeded(f"estimated ${estimate:.4f} exceeds max ${max_usd:.4f}")
@@ -94,6 +106,7 @@ async def submit(reqs: Sequence[BatchRequest], *, provider: Provider, max_usd: f
                 "requests": [{"custom_id": req.custom_id, "body": req.body} for req in reqs],
             }
         )
+        await fsync_path(path)
         batch_id = await adapter.submit(reqs)
         await sink.append({"event": "submitted", "batch_id": batch_id})
     return BatchJob(provider=provider, provider_batch_id=batch_id, state_path=path)
@@ -168,20 +181,30 @@ async def resubmit_expired(
     expired = [r for r in results if r.status is BatchStatus.EXPIRED and r.custom_id not in retried]
     if not expired:
         return
+    roots = retry_roots(job.state_path)
     fresh = [
-        BatchRequest(custom_id=fresh_custom_id(r.custom_id), body=bodies[root_custom_id(r.custom_id)]) for r in expired
+        (r.custom_id, root, BatchRequest(fresh_custom_id(r.custom_id), bodies[root]))
+        for r in expired
+        for root in (roots.get(r.custom_id, r.custom_id),)
     ]
-    batch_id = await adapter.submit(fresh)
-    for old, new in zip(expired, fresh, strict=True):
+    for old, root, req in fresh:
+        await sink.append(
+            {"event": "retry_intent", "old_custom_id": old, "root_custom_id": root, "new_custom_id": req.custom_id}
+        )
+    await fsync_path(job.state_path)
+    batch_id = await adapter.submit([req for _, _, req in fresh])
+    for old, root, req in fresh:
         logger.info(
-            "batch {}: resubmitting expired {} as {} in {}",
-            job.provider_batch_id,
-            old.custom_id,
-            new.custom_id,
-            batch_id,
+            "batch {}: resubmitting expired {} as {} in {}", job.provider_batch_id, old, req.custom_id, batch_id
         )
         await sink.append(
-            {"event": "retry", "old_custom_id": old.custom_id, "new_custom_id": new.custom_id, "batch_id": batch_id}
+            {
+                "event": "retry",
+                "old_custom_id": old,
+                "root_custom_id": root,
+                "new_custom_id": req.custom_id,
+                "batch_id": batch_id,
+            }
         )
 
 
