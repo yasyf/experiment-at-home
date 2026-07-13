@@ -15,7 +15,17 @@ from anyio.streams.buffered import BufferedByteReceiveStream
 
 from athome.config import base_environ
 from athome.errors import AthomeError
-from athome.wire import LENGTH_PREFIX, WIRE_VERSION, WireError, decode, encode, read_frame, validate, write_frame
+from athome.wire import (
+    LENGTH_PREFIX,
+    MAX_FRAME_BYTES,
+    WIRE_VERSION,
+    WireError,
+    decode,
+    encode,
+    read_frame,
+    validate,
+    write_frame,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -29,7 +39,6 @@ STDERR_CHUNK = 4096
 STDERR_TAIL_CHUNKS = 16
 ACLOSE_TIMEOUT = 5.0
 STDERR_JOIN_TIMEOUT = 2.0
-MAX_FRAME_BYTES = 256 * 1024 * 1024
 
 
 class WorkerError(AthomeError):
@@ -137,7 +146,7 @@ class PipeWorker:
         self.stderr_thread.start()
         try:
             await self.handshake()
-        except HandshakeMismatch:
+        except BaseException:
             await self.aclose()
             raise
 
@@ -223,7 +232,8 @@ class WorkerPool:
         try:
             yield worker
         finally:
-            await self.release(worker)
+            with anyio.CancelScope(shield=True):
+                await self.release(worker)
 
     async def prefetch(self, key: str, method: str, payload: Wire) -> None:
         worker = await self.acquire(None)
@@ -232,7 +242,8 @@ class WorkerPool:
             async with self.guard:
                 self.affinity[key] = worker
         finally:
-            await self.release(worker)
+            with anyio.CancelScope(shield=True):
+                await self.release(worker)
 
     async def aclose(self) -> None:
         async with anyio.create_task_group() as group:

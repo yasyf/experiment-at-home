@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import os
 import shutil
 from typing import TYPE_CHECKING
 
@@ -99,21 +101,107 @@ def test_location_parse_ipv6_bracket() -> None:
 
 @pytest.mark.parametrize(
     "dst",
-    ["-oProxyCommand=evil", "/dst;touch /tmp/pwn", "host:/safe|reboot", "host:/x`id`"],
-    ids=["leading-dash", "semicolon", "pipe", "backtick"],
+    ["h>st:/dst", "h<st:/dst", "h st:/dst", "h(x):/dst", "h\\x:/dst", 'h"x:/dst'],
+    ids=["gt", "lt", "space", "paren", "backslash", "quote"],
 )
-async def test_unsafe_operands_rejected_before_rsync(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dst: str) -> None:
+async def test_remote_host_metachar_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dst: str) -> None:
     src = make_tree(tmp_path / "src", {"a.txt": b"x"})
-    called = False
+    ran = False
 
-    async def fail_rsync(*args: object, **kwargs: object) -> None:
-        nonlocal called
-        called = True
+    async def spy_run(command: object, **kwargs: object) -> None:
+        nonlocal ran
+        ran = True
 
-    monkeypatch.setattr(athome.sync, "rsync", fail_rsync)
+    monkeypatch.setattr(athome.sync.anyio, "run_process", spy_run)
     with pytest.raises(SyncVerificationError, match="unsafe"):
         await mirror(src, dst)
-    assert called is False
+    assert ran is False
+
+
+async def test_direct_rsync_guards_remote_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    src = make_tree(tmp_path / "src", {"a.txt": b"x"})
+    ran = False
+
+    async def spy_run(command: object, **kwargs: object) -> None:
+        nonlocal ran
+        ran = True
+
+    monkeypatch.setattr(athome.sync.anyio, "run_process", spy_run)
+    with pytest.raises(SyncVerificationError, match="unsafe"):
+        await athome.sync.rsync(src, "ev;l:/dst")
+    assert ran is False
+
+
+async def test_remote_rsync_uses_secluded_args_single_operand(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    src = make_tree(tmp_path / "src", {"a.txt": b"x"})
+    captured: list[tuple[str, ...]] = []
+
+    async def capture(command: tuple[str, ...], **kwargs: object) -> None:
+        captured.append(command)
+
+    monkeypatch.setattr(athome.sync.anyio, "run_process", capture)
+    dst = "safehost:/weird > dir"
+    await athome.sync.rsync(src, dst)
+    argv = captured[0]
+    assert "-s" in argv
+    assert argv[argv.index("-e") + 1] == "ssh"
+    assert f"{dst}/" in argv
+    assert argv.index("--") < argv.index(f"{dst}/")
+
+
+async def test_local_metachar_path_transfers_safely(tmp_path: Path) -> None:
+    src = make_tree(tmp_path / "src", {"weird > name.txt": b"payload", "a.txt": b"ok"})
+    dst = tmp_path / "dst dir"
+    report = await mirror(src, str(dst))
+    assert report.verified is True
+    assert (dst / "weird > name.txt").read_bytes() == b"payload"
+    assert (dst / "a.txt").read_bytes() == b"ok"
+
+
+async def test_delete_verified_skips_file_changed_in_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    src = make_tree(tmp_path / "src", {"trigger.txt": b"go", "victim.txt": b"original"})
+    verified = {
+        "trigger.txt": hashlib.sha256(b"go").hexdigest(),
+        "victim.txt": hashlib.sha256(b"original").hexdigest(),
+    }
+    real_unlink = os.unlink
+    tampered = False
+
+    def tamper_then_unlink(path: object, *, dir_fd: int | None = None) -> None:
+        nonlocal tampered
+        if not tampered:
+            tampered = True
+            (src / "victim.txt").write_bytes(b"changed-in-window")
+        return real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", tamper_then_unlink)
+    await athome.sync.delete_verified(src, verified)
+    assert (src / "victim.txt").read_bytes() == b"changed-in-window"
+    assert not (src / "trigger.txt").exists()
+
+
+async def test_delete_verified_refuses_symlinked_parent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    src = make_tree(tmp_path / "src", {"trigger.txt": b"go", "sub/b.txt": b"inside"})
+    outside = make_tree(tmp_path / "outside", {"b.txt": b"OUTSIDE-SURVIVOR"})
+    verified = {
+        "trigger.txt": hashlib.sha256(b"go").hexdigest(),
+        "sub/b.txt": hashlib.sha256(b"inside").hexdigest(),
+    }
+    real_unlink = os.unlink
+    swapped = False
+
+    def swap_then_unlink(path: object, *, dir_fd: int | None = None) -> None:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            shutil.rmtree(src / "sub")
+            (src / "sub").symlink_to(outside)
+        return real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", swap_then_unlink)
+    await athome.sync.delete_verified(src, verified)
+    assert (outside / "b.txt").read_bytes() == b"OUTSIDE-SURVIVOR"
+    assert not (src / "trigger.txt").exists()
 
 
 async def test_move_preserves_files_created_after_verification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

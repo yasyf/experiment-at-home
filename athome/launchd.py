@@ -6,6 +6,7 @@ import re
 import shlex
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import anyio
 import click
@@ -14,10 +15,12 @@ from athome.cli import coro, emit, json_option
 from athome.config import AthomeSettings, load
 from athome.errors import AthomeError
 
+if TYPE_CHECKING:
+    import subprocess
+
 LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
 LABEL_NAMESPACE = "com.athome."
 LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*")
-BOOTOUT_ABSENT_CODES = frozenset({3, 113})
 PID_RE = re.compile(r"\bpid = (\d+)")
 EXIT_RE = re.compile(r"last exit code = (\d+)")
 
@@ -128,6 +131,10 @@ def plist_dict(spec: AgentSpec) -> dict[str, object]:
     )
 
 
+async def launchctl_print(label: str) -> subprocess.CompletedProcess[bytes]:
+    return await anyio.run_process(["launchctl", "print", f"gui/{os.getuid()}/{label}"], check=False)
+
+
 async def install(spec: AgentSpec) -> Path:
     """Write ``spec``'s plist and (re)load it into the user's GUI domain; return the plist path.
 
@@ -149,19 +156,23 @@ async def uninstall(label: str) -> None:
     """Boot the agent out of the GUI domain and remove its plist.
 
     Raises:
-        LaunchdError: ``launchctl bootout`` failed for a reason other than the agent
-            being absent, leaving the still-running agent's plist in place.
+        LaunchdError: the agent is still loaded after ``launchctl bootout``, so its
+            plist is kept rather than orphaning a live agent with no on-disk definition.
     """
     path = agent_path(label)
+    # bootout's exit code is not portable: an already-unloaded agent returns 5
+    # (Input/output error) on a real host, indistinguishable by code from a genuine
+    # failure. So we ignore the code and trust the observable post-state — if
+    # `launchctl print` still resolves the service, the agent is still loaded.
     result = await anyio.run_process(["launchctl", "bootout", f"gui/{os.getuid()}", str(path)], check=False)
-    if result.returncode and result.returncode not in BOOTOUT_ABSENT_CODES:
-        raise LaunchdError(f"launchctl bootout failed for {label}: {result.stderr.decode().strip()}")
+    if not (await launchctl_print(label)).returncode:
+        raise LaunchdError(f"{label} still loaded after launchctl bootout: {result.stderr.decode().strip()}")
     await anyio.Path(path).unlink()
 
 
 async def status(label: str) -> AgentStatus:
     """Report ``label``'s installed/running state by parsing ``launchctl print gui/<uid>/<label>``."""
-    result = await anyio.run_process(["launchctl", "print", f"gui/{os.getuid()}/{label}"], check=False)
+    result = await launchctl_print(label)
     if result.returncode:
         return AgentStatus(label, agent_path(label).exists(), running=False, pid=None, last_exit=None)
     text = result.stdout.decode()

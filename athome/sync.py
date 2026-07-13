@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import os
+import re
 import shlex
 import shutil
 from dataclasses import asdict, dataclass
@@ -17,7 +20,7 @@ if TYPE_CHECKING:
 
 MAX_REPAIR_ROUNDS = 3
 REQUIRED_TOOLS = ("rsync", "shasum")
-SHELL_METACHARACTERS = frozenset(";|&$`\n")
+REMOTE_HOST = re.compile(r"[A-Za-z0-9._@\[\]:-]+")
 
 
 class SyncVerificationError(AthomeError):
@@ -57,9 +60,9 @@ def require_tools() -> None:
             raise SyncVerificationError(f"required tool not found on PATH: {tool}")
 
 
-def guard_operands(*operands: str | None) -> None:
-    if bad := next((op for op in operands if op and (op.startswith("-") or SHELL_METACHARACTERS & set(op))), None):
-        raise SyncVerificationError(f"refusing unsafe sync operand: {bad!r}")
+def guard_host(host: str) -> None:
+    if not REMOTE_HOST.fullmatch(host):
+        raise SyncVerificationError(f"refusing unsafe remote host: {host!r}")
 
 
 def parse_manifest(output: str) -> dict[str, str]:
@@ -89,13 +92,15 @@ async def shell(command: str, *, host: str | None = None) -> str:
     return (await anyio.run_process(("ssh", host, command) if host else ("/bin/sh", "-c", command))).stdout.decode()
 
 
-async def rsync(src: Path, dst: str, *, checksum: bool = False, remote: bool = False) -> None:
+async def rsync(src: Path, dst: str, *, checksum: bool = False) -> None:
+    if (host := Location.parse(dst).host) is not None:
+        guard_host(host)
     await anyio.run_process(
         (
             "rsync",
             "-a",
             *(("--checksum",) if checksum else ()),
-            *(("-e", "ssh") if remote else ()),
+            *(("-s", "-e", "ssh") if host is not None else ()),
             "--exclude",
             "._*",
             "--",
@@ -123,10 +128,42 @@ def prune_empty_dirs(root: Path) -> None:
             path.rmdir()
 
 
+def open_dir_nofollow(root: Path, parents: Sequence[str]) -> int | None:
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    for part in parents:
+        try:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        except OSError:
+            os.close(fd)
+            return None
+        os.close(fd)
+        fd = child
+    return fd
+
+
+def digest_at(dir_fd: int, name: str) -> str | None:
+    try:
+        handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError:
+        return None
+    with os.fdopen(handle, "rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def unlink_verified(src: Path, name: str, digest: str) -> None:
+    *parents, base = Path(name).parts
+    if (dir_fd := open_dir_nofollow(src, parents)) is None:
+        return
+    try:
+        if digest_at(dir_fd, base) == digest:
+            os.unlink(base, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 async def delete_verified(src: Path, verified: dict[str, str]) -> None:
-    current = await src_manifest(src)
-    for name in (name for name, digest in verified.items() if current.get(name) == digest):
-        (src / name).unlink()
+    for name, digest in verified.items():
+        unlink_verified(src, name, digest)
     prune_empty_dirs(src)
 
 
@@ -151,12 +188,11 @@ async def mirror(src: Path, dst: str, *, delete_source: bool = False) -> SyncRep
     """
     require_tools()
     location = Location.parse(dst)
-    guard_operands(str(src), dst, location.host, location.path)
     swept = 0
     mismatches: list[str] = []
     source: dict[str, str] = {}
     for attempt in range(MAX_REPAIR_ROUNDS + 1):
-        await rsync(src, dst, checksum=attempt > 0, remote=location.host is not None)
+        await rsync(src, dst, checksum=attempt > 0)
         swept += await sweep(location)
         if not (mismatches := diff_manifests(source := await src_manifest(src), await dst_manifest(location))):
             break

@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-13
+
 ### Added
 - `athome.config` — the pydantic-settings surface over `~/.athome/config.toml` (`ATHOME_` env prefix, per-module sections, `load()` accessor).
 - `athome.cache` — namespaced, content+version-keyed cache with atomic staging writes, stale-tmp sweeping, and the `@cached` decorator (`athome cache stats`).
@@ -18,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `athome.store` — the shared aiosqlite scaffold (WAL, busy timeout, idempotent schema).
 - `athome.ocr` protocol types — `TokenOcr`, `DocOcr`, `Document`, `OcrToken`, `Box` (engines land in 0.2).
 - CI gate asserting the core imports on Python 3.14 free-threaded with the GIL still disabled.
-- The in-repo `athome` Claude Code plugin (marketplace + skills skeleton).
+- The in-repo `athome` Claude Code plugin (marketplace + `cache`/`overnight` skills).
 
-[Unreleased]: https://github.com/yasyf/experiment-at-home/commits/main
+[Unreleased]: https://github.com/yasyf/experiment-at-home/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/yasyf/experiment-at-home/releases/tag/v0.1.0

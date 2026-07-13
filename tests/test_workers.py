@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copyreg
 import pickle
 import sys
 from contextlib import asynccontextmanager
@@ -9,7 +10,7 @@ from typing import TYPE_CHECKING
 import anyio
 import pytest
 
-from athome.wire import LENGTH_PREFIX, WIRE_VERSION, WireError, decode, encode, validate
+from athome.wire import LENGTH_PREFIX, WIRE_VERSION, WireError, decode, encode, read_frame, validate
 from athome.workers import (
     MAX_FRAME_BYTES,
     HandshakeMismatch,
@@ -64,6 +65,12 @@ sys.stderr.write("fatal: engine exploded\\n"); sys.stderr.flush()
 sys.exit(7)
 """
 
+HANDSHAKE_CRASH_SOURCE = """
+import sys
+sys.stderr.write("fatal: died before handshake\\n"); sys.stderr.flush()
+sys.exit(9)
+"""
+
 
 def wire_side_effect(path: str) -> str:
     Path(path).write_text("pwned")
@@ -86,6 +93,21 @@ class OversizedPrefixStream:
     async def receive_exactly(self, nbytes: int) -> bytes:
         if nbytes == LENGTH_PREFIX:
             return self.prefix
+        self.body_reads += 1
+        raise AssertionError("body must not be read for an oversized frame")
+
+
+class SyncOversizedPrefixStream:
+    def __init__(self, size: int) -> None:
+        self.prefix = size.to_bytes(LENGTH_PREFIX, "big")
+        self.offset = 0
+        self.body_reads = 0
+
+    def read(self, nbytes: int) -> bytes:
+        if self.offset < LENGTH_PREFIX:
+            chunk = self.prefix[self.offset : self.offset + nbytes]
+            self.offset += len(chunk)
+            return chunk
         self.body_reads += 1
         raise AssertionError("body must not be read for an oversized frame")
 
@@ -231,6 +253,70 @@ async def test_pool_acquire_returns_permit_on_cancel() -> None:
             await anyio.sleep(0.05)
             group.cancel_scope.cancel()
         pool.guard.release()
+        with anyio.fail_after(2):
+            first = await pool.acquire(None)
+            second = await pool.acquire(None)
+        assert {first, second} == set(pool.workers)
+    finally:
+        await pool.aclose()
+
+
+def test_decode_refuses_ext_gadget(tmp_path: Path) -> None:
+    marker = tmp_path / "ext-pwned.txt"
+    code = 0x00E11EAF
+    module, name = wire_side_effect.__module__, wire_side_effect.__qualname__
+    copyreg.add_extension(module, name, code)
+    copyreg._extension_cache[code] = wire_side_effect
+    try:
+        body = pickle.dumps(ReduceGadget(str(marker)), protocol=5)
+        with pytest.raises(WireError):
+            decode(len(body).to_bytes(LENGTH_PREFIX, "big") + body)
+    finally:
+        copyreg.remove_extension(module, name, code)
+        copyreg._extension_cache.pop(code, None)
+    assert not marker.exists()
+
+
+def test_read_frame_rejects_oversized_prefix() -> None:
+    stream = SyncOversizedPrefixStream(MAX_FRAME_BYTES + 1)
+    with pytest.raises(WireError):
+        read_frame(stream)
+    assert stream.body_reads == 0
+
+
+async def test_handshake_crash_tears_worker_down() -> None:
+    async with running(HANDSHAKE_CRASH_SOURCE) as worker:
+        with pytest.raises(WorkerCrashed) as excinfo:
+            await worker.call("echo", 1)
+        assert excinfo.value.returncode == 9
+        assert worker.process is None
+        assert worker.stdout is None
+        assert worker.stderr_thread is None
+
+
+async def test_lease_release_survives_cancel_under_contention() -> None:
+    pool = WorkerPool(WorkerSpec((sys.executable, "-c", HANDLER_SOURCE)), size=2)
+    entered = anyio.Event()
+    gate = anyio.Event()
+    scopes: list[anyio.CancelScope] = []
+
+    async def leaser() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            async with pool.lease():
+                entered.set()
+                await gate.wait()
+
+    try:
+        async with anyio.create_task_group() as group:
+            group.start_soon(leaser)
+            await entered.wait()
+            await pool.guard.acquire()
+            gate.set()
+            await anyio.sleep(0.05)
+            scopes[0].cancel()
+            await anyio.sleep(0.05)
+            pool.guard.release()
         with anyio.fail_after(2):
             first = await pool.acquire(None)
             second = await pool.acquire(None)

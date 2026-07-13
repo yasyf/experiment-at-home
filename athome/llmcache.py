@@ -60,6 +60,7 @@ class LlmCacheMiss(AthomeError):
 
 
 def cache_key(request: httpx.Request, *, schema_version: int) -> str:
+    """Content address for ``request``; request headers are intentionally excluded from the key (donor semantics)."""
     return sha256(
         b"\x00".join(
             (
@@ -67,7 +68,7 @@ def cache_key(request: httpx.Request, *, schema_version: int) -> str:
                 request.method.encode(),
                 request.url.scheme.encode(),
                 request.url.host.encode(),
-                str(request.url.port or DEFAULT_PORTS[request.url.scheme]).encode(),
+                str(request.url.port if request.url.port is not None else DEFAULT_PORTS[request.url.scheme]).encode(),
                 request.url.path.encode(),
                 urlencode(sorted(request.url.params.multi_items())).encode(),
                 request.content,

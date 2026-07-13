@@ -11,6 +11,7 @@ import pytest
 from click.testing import CliRunner
 
 from athome.cache import (
+    HEARTBEAT_SUFFIX,
     STALE_TMP_SECONDS,
     Cache,
     CacheKey,
@@ -105,7 +106,7 @@ async def test_stale_tmp_swept_on_open() -> None:
     (stale_dir / "member").write_bytes(b"leftover")
     fresh = shard / "beadfeed.tmp-live"
     fresh.write_bytes(b"in-flight")
-    old = time.time() - 2 * 86400
+    old = time.time() - 2 * STALE_TMP_SECONDS
     os.utime(stale_file, (old, old))
     os.utime(stale_dir, (old, old))
 
@@ -221,6 +222,25 @@ async def test_open_sweep_skips_active_staging_dir() -> None:
     entry = await cache.get(key)
     assert entry is not None
     assert await (entry / "part").read_bytes() == b"partial"
+
+
+async def test_sweep_skips_staging_with_recent_heartbeat_from_other_process() -> None:
+    Cache.open("crossproc", version=1)
+    shard = version_root("crossproc", 1) / "ab"
+    shard.mkdir(parents=True, exist_ok=True)
+    staging = shard / "deadbeef.tmp-otherproc"
+    staging.mkdir()
+    (staging / "part").write_bytes(b"in-flight")
+    marker = shard / f"{staging.name}{HEARTBEAT_SUFFIX}"
+    marker.write_bytes(b"")
+    old = time.time() - 2 * STALE_TMP_SECONDS
+    os.utime(staging, (old, old))
+
+    Cache.open("crossproc", version=1)
+
+    assert staging.exists()
+    assert (staging / "part").read_bytes() == b"in-flight"
+    assert marker.exists()
 
 
 async def test_key_distinguishes_float_bit_patterns() -> None:

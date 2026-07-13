@@ -43,9 +43,15 @@ def load_journal(path: Path) -> list[dict[str, object]]:
 
 
 async def append_line(path: Path, record: Mapping[str, object]) -> None:
+    # Loop past short writes. Within the FS atomic-append size the record is one atomic O_APPEND
+    # write; a larger record lands intact but not atomically against concurrent writers (contract:
+    # single-writer resume).
+    payload = (json.dumps(record) + "\n").encode()
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     try:
-        os.write(fd, (json.dumps(record) + "\n").encode())
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(fd, payload[offset:])
     finally:
         os.close(fd)
 

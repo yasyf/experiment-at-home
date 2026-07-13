@@ -187,6 +187,25 @@ async def test_append_is_one_kernel_write_per_record(tmp_path: Path, monkeypatch
     assert json.loads(record_writes[0]) == {"unit": "a", "status": "done"}
 
 
+async def test_append_loops_past_a_short_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "out.jsonl"
+    real_write = os.write
+    calls = {"n": 0}
+
+    def short_write(fd: int, data: bytes) -> int:
+        calls["n"] += 1
+        return real_write(fd, bytes(data)[:5]) if calls["n"] == 1 else real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", short_write)
+    record = {"unit": "a", "status": "done", "payload": "x" * 200}
+    await append_line(path, record)
+
+    assert calls["n"] >= 2
+    lines = path.read_text().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == record
+
+
 async def test_concurrent_appends_never_splice_records(tmp_path: Path) -> None:
     path = tmp_path / "out.jsonl"
     records = [{"i": i, "blob": str(i) * 8000} for i in range(30)]

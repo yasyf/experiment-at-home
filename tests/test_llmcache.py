@@ -213,6 +213,12 @@ def test_cache_key_collapses_default_port() -> None:
     )
 
 
+def test_cache_key_distinguishes_explicit_zero_port_from_default() -> None:
+    assert cache_key(httpx.Request("GET", "http://h:0/x"), schema_version=1) != cache_key(
+        httpx.Request("GET", "http://h:80/x"), schema_version=1
+    )
+
+
 async def test_record_mode_refreshes_stored_row_on_rerecord() -> None:
     bodies = iter([b"first", b"second"])
     mock, seen = counting_origin(lambda: httpx.Response(200, content=next(bodies)))

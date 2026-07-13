@@ -4,6 +4,14 @@ Two codex finder passes (security/subprocess + correctness/atomicity) over the v
 core. fable synthesis: accept the list below; fix before tagging v0.1.0. Each fix
 lands with a regression test that fails before and passes after.
 
+A follow-up codex **refuter** pass over the applied fixes found residual gaps in 11
+of them; those are hardened in a second round (W1 EXT-opcode block, W2 sidecar
+read cap, W3 broadened teardown, W4 shielded pool releases, L2 verify-by-state not
+exit-code, S1 rsync `--secluded-args` + host allowlist, S2 symlink-safe deletion,
+C2 heartbeat marker + longer threshold, M1 explicit-port-0, P1 short-write loop).
+The refuter's M3 "request headers absent from key" is **rejected** — excluding
+request headers is intended donor semantics (auth tokens must never enter the key).
+
 ## wire + workers (`athome/wire.py`, `athome/workers.py`)
 
 - **W1 — pickle deserializes before validation.** `decode()` runs `pickle.loads()`

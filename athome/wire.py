@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 WIRE_VERSION = 1
 LENGTH_PREFIX = 4
 PICKLE_PROTOCOL = 5
+MAX_FRAME_BYTES = 256 * 1024 * 1024
 
 type Wire = None | bool | int | float | str | bytes | list[Wire] | tuple[Wire, ...] | dict[str, Wire]
 
@@ -23,13 +24,33 @@ class WireError(Exception):
     """
 
 
-class RestrictedUnpickler(pickle.Unpickler):
-    """A :class:`pickle.Unpickler` that resolves no globals.
+def refuse_extension_opcode(unpickler: pickle._Unpickler) -> object:
+    raise WireError("wire frames carry no extension opcodes")
+
+
+# TODO(phase-b): replace the pickle codec before the Modal remote boundary — a
+# length-prefixed pickle, even a restricted one, is a local-trust format only and is
+# not safe to decode across an untrusted remote container.
+class RestrictedUnpickler(pickle._Unpickler):
+    """A pure-Python :class:`pickle.Unpickler` that resolves no globals and no extensions.
 
     Wire values are primitives and containers only, so unpickling one never needs a
-    class or function. Refusing every :meth:`find_class` lookup turns a ``__reduce__``
-    gadget frame into a :class:`WireError` at load time instead of code execution.
+    class, a function, or a registered extension. Refusing every :meth:`find_class`
+    lookup turns a ``__reduce__`` gadget frame into a :class:`WireError` at load time
+    instead of code execution; refusing the ``EXT1``/``EXT2``/``EXT4`` opcodes closes the
+    parallel path that resolves a callable straight from ``copyreg._extension_cache``
+    without ever consulting :meth:`find_class`.
+
+    This guards the *local* trust boundary only — a sidecar spawned on the same host.
+    The Phase B Modal boundary, where the child is a remote container, must revisit the
+    pickle codec itself.
     """
+
+    dispatch = pickle._Unpickler.dispatch | {
+        pickle.EXT1[0]: refuse_extension_opcode,
+        pickle.EXT2[0]: refuse_extension_opcode,
+        pickle.EXT4[0]: refuse_extension_opcode,
+    }
 
     def find_class(self, module: str, name: str) -> object:
         raise WireError(f"wire frames carry no code; refused {module}.{name}")
@@ -95,9 +116,11 @@ def read_frame(stream: BinaryIO) -> Wire:
     """Read and decode one length-prefixed wire frame from a binary stream (sync, sidecar side).
 
     Raises :class:`EOFError` when the writer closes before a full frame, so a sidecar
-    serve loop can exit cleanly on parent shutdown.
+    serve loop can exit cleanly on parent shutdown, and :class:`WireError` when the
+    declared length exceeds :data:`MAX_FRAME_BYTES` — refused before the body is read.
     """
-    size = int.from_bytes(read_exactly(stream, LENGTH_PREFIX), "big")
+    if (size := int.from_bytes(read_exactly(stream, LENGTH_PREFIX), "big")) > MAX_FRAME_BYTES:
+        raise WireError(f"frame length {size} exceeds {MAX_FRAME_BYTES}-byte cap")
     return loads(read_exactly(stream, size))
 
 

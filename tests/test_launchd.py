@@ -139,7 +139,7 @@ async def test_install_raises_on_bootstrap_failure(monkeypatch: pytest.MonkeyPat
 
 async def test_uninstall_boots_out_and_unlinks(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(launchd, "LAUNCH_AGENTS", tmp_path / "LaunchAgents")
-    fake = FakeLaunchctl()
+    fake = FakeLaunchctl(print=(113, b"", b"Could not find service"))
     monkeypatch.setattr("anyio.run_process", fake)
     path = await launchd.install(base_spec(KeepAlive()))
     fake.calls.clear()
@@ -147,7 +147,10 @@ async def test_uninstall_boots_out_and_unlinks(monkeypatch: pytest.MonkeyPatch, 
     await launchd.uninstall("com.athome.demo")
 
     assert not path.exists()
-    assert fake.calls == [["launchctl", "bootout", f"gui/{os.getuid()}", str(path)]]
+    assert fake.calls == [
+        ["launchctl", "bootout", f"gui/{os.getuid()}", str(path)],
+        ["launchctl", "print", f"gui/{os.getuid()}/com.athome.demo"],
+    ]
 
 
 async def test_status_running(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -190,34 +193,45 @@ async def test_uninstall_rejects_path_label(monkeypatch: pytest.MonkeyPatch, tmp
     assert fake.calls == []
 
 
-async def test_uninstall_raises_on_genuine_bootout_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_uninstall_raises_when_still_loaded_after_bootout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     monkeypatch.setattr(launchd, "LAUNCH_AGENTS", tmp_path / "LaunchAgents")
     fake = FakeLaunchctl()
     monkeypatch.setattr("anyio.run_process", fake)
     path = await launchd.install(base_spec(KeepAlive()))
     fake.overrides["bootout"] = (5, b"", b"Boot-out failed: 5: Input/output error")
+    fake.overrides["print"] = (0, b"com.athome.demo = {\n\tstate = running\n\tpid = 4242\n}\n", b"")
     fake.calls.clear()
 
-    with pytest.raises(LaunchdError, match="Input/output error"):
+    with pytest.raises(LaunchdError, match="still loaded"):
         await launchd.uninstall("com.athome.demo")
 
     assert path.exists()
-    assert fake.calls == [["launchctl", "bootout", f"gui/{os.getuid()}", str(path)]]
+    assert fake.calls == [
+        ["launchctl", "bootout", f"gui/{os.getuid()}", str(path)],
+        ["launchctl", "print", f"gui/{os.getuid()}/com.athome.demo"],
+    ]
 
 
-@pytest.mark.parametrize("code", [3, 113])
-async def test_uninstall_ignores_absent_bootout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int) -> None:
+@pytest.mark.parametrize("bootout_code", [3, 5, 113])
+async def test_uninstall_unlinks_when_not_loaded_despite_bootout_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bootout_code: int
+) -> None:
     monkeypatch.setattr(launchd, "LAUNCH_AGENTS", tmp_path / "LaunchAgents")
-    fake = FakeLaunchctl()
+    fake = FakeLaunchctl(print=(113, b"", b"Could not find service"))
     monkeypatch.setattr("anyio.run_process", fake)
     path = await launchd.install(base_spec(KeepAlive()))
-    fake.overrides["bootout"] = (code, b"", f"Boot-out failed: {code}: No such process".encode())
+    fake.overrides["bootout"] = (bootout_code, b"", f"Boot-out failed: {bootout_code}".encode())
     fake.calls.clear()
 
     await launchd.uninstall("com.athome.demo")
 
     assert not path.exists()
-    assert fake.calls == [["launchctl", "bootout", f"gui/{os.getuid()}", str(path)]]
+    assert fake.calls == [
+        ["launchctl", "bootout", f"gui/{os.getuid()}", str(path)],
+        ["launchctl", "print", f"gui/{os.getuid()}/com.athome.demo"],
+    ]
 
 
 def test_installed_scans_namespace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -26,7 +26,8 @@ if TYPE_CHECKING:
     import pathlib
     from collections.abc import AsyncIterator
 
-STALE_TMP_SECONDS = 86400.0
+STALE_TMP_SECONDS = 604800.0
+HEARTBEAT_SUFFIX = ".heartbeat"
 PERSON = b"athome-cache"
 DIGEST_BYTES = 16
 TYPE_TAGS: dict[type, bytes] = {bool: b"?:", int: b"i:", float: b"f:", str: b"s:", bytes: b"b:"}
@@ -72,14 +73,26 @@ def remove_path(path: os.PathLike[str] | str) -> None:
         os.unlink(path)
 
 
+def heartbeat_fresh(staging: pathlib.Path, cutoff: float) -> bool:
+    with suppress(FileNotFoundError):
+        return staging.with_name(staging.name + HEARTBEAT_SUFFIX).stat().st_mtime >= cutoff
+    return False
+
+
+def reapable(tmp: pathlib.Path, cutoff: float) -> bool:
+    return tmp.stat().st_mtime < cutoff and (tmp.name.endswith(HEARTBEAT_SUFFIX) or not heartbeat_fresh(tmp, cutoff))
+
+
 def sweep_stale_tmps(root: pathlib.Path) -> None:
+    # No cross-process locking: the threshold sits well above any real write duration and write()
+    # drops a heartbeat marker at start, so another process's sweep never reaps an in-flight write.
+    # A write outliving STALE_TMP_SECONDS remains a residual (unrefreshed) race.
     cutoff = time.time() - STALE_TMP_SECONDS
     for tmp in root.glob("*/*.tmp-*"):
-        if str(tmp) in ACTIVE_STAGING:
-            continue
-        with suppress(FileNotFoundError):
-            if tmp.stat().st_mtime < cutoff:
-                remove_path(tmp)
+        if str(tmp) not in ACTIVE_STAGING:
+            with suppress(FileNotFoundError):
+                if reapable(tmp, cutoff):
+                    remove_path(tmp)
 
 
 async def discard(path: Path) -> None:
@@ -189,9 +202,12 @@ class Cache:
         final = self.entry_path(key)
         await final.parent.mkdir(parents=True, exist_ok=True)
         staging = final.parent / f"{final.name}.tmp-{uuid4().hex}"
-        # Registered until published so a concurrent stale-tmp sweep never reaps an in-flight write.
+        marker = final.parent / f"{staging.name}{HEARTBEAT_SUFFIX}"
+        # Registered until published so a same-process sweep never reaps an in-flight write; the
+        # marker's mtime carries that liveness to another process's sweep.
         ACTIVE_STAGING.add(str(staging))
         try:
+            await marker.write_bytes(b"")
             try:
                 yield staging
             except BaseException:
@@ -200,6 +216,7 @@ class Cache:
             await publish(staging, final)
         finally:
             ACTIVE_STAGING.discard(str(staging))
+            await discard(marker)
 
     async def stats(self) -> CacheStats:
         """Count the published entries and total bytes in this cache's version tree."""
