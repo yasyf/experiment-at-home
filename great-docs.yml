@@ -1,0 +1,68 @@
+# Great Docs configuration — https://posit-dev.github.io/great-docs/
+# Build: uv run great-docs build · Preview: uv run great-docs preview
+
+module: athome
+display_name: experiment-at-home
+parser: google
+dynamic: true
+repo: https://github.com/yasyf/experiment-at-home
+site_url: "https://yasyf.github.io/experiment-at-home/"
+pypi: true
+github_style: widget
+jupyter: python3
+
+# Rewrite generated reference titles to pre-parsed pandoc-native Spans so Quarto
+# doesn't re-parse the bracketed-span sidebar markup on every page — Pandoc
+# backtracks exponentially on __dunder__ emphasis candidates (jgm/pandoc#11687),
+# which can push a large API reference's build past an hour. No-op until you add
+# a reference: section below. See docs/scripts/native_reference_titles.py.
+pre_render:
+  - docs/scripts/native_reference_titles.py
+
+# Conservative defaults: a solid navbar and a single accent, no gradient
+# presets or hero starfield. The gradient/starfield extras read as busy and the
+# starfield canvas intercepts homepage clicks; keep them off unless asked.
+# Palette from the mascot: near-black banner background, roof-orange accent.
+navbar_color: "#171a21"
+accent_color: "#e85d2c"
+dark_mode_toggle: true
+back_to_top: true
+keyboard_nav: true
+
+# Navbar logo + favicon are auto-detected from docs/assets/logo.png (the
+# generated mascot); no logo key is needed here.
+hero:
+  name: experiment-at-home
+  # Keep the tagline equal to the README opener fragment (one fragment, five surfaces).
+  tagline: "The plumbing every local AI experiment rebuilds, built once."
+
+# Narrative doc sections are optional — dynamic mode generates the API reference
+# from docstrings without them. Uncomment and point at docs/ dirs as they appear.
+# sections:
+#   - title: Getting Started
+#     dir: docs/getting-started
+#     index: true
+#   - title: Guide
+#     dir: docs/guide
+#     navbar_after: Getting Started
+#     index: true
+
+cli:
+  enabled: true
+  module: athome.cli
+  name: cli
+
+authors:
+  - name: Yasyf Mohamedali
+    role: Maintainer
+    github: yasyf
+    email: yasyfm@gmail.com
+
+# Curated symbol reference (public API only). Optional — without it, dynamic
+# mode documents everything in athome.__all__.
+# reference:
+#   - title: Core
+#     desc: The main entry points.
+#     contents:
+#       - SomePublicClass
+#       - some_public_function
