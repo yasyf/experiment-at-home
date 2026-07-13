@@ -48,9 +48,9 @@ def emit(data: object, *, as_json: bool) -> None:
 
 
 class LazyGroup(click.Group):
-    """Click group whose subcommands import lazily from 'module:attr' strings."""
+    """Click group whose subcommands import lazily from ('module:attr', short_help) entries."""
 
-    def __init__(self, *, lazy_subcommands: Mapping[str, str], **kwargs: Any) -> None:
+    def __init__(self, *, lazy_subcommands: Mapping[str, tuple[str, str]], **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.lazy_subcommands = dict(lazy_subcommands)
 
@@ -58,9 +58,9 @@ class LazyGroup(click.Group):
         return sorted({*super().list_commands(ctx), *self.lazy_subcommands})
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
-        if (target := self.lazy_subcommands.get(cmd_name)) is None:
+        if (entry := self.lazy_subcommands.get(cmd_name)) is None:
             return super().get_command(ctx, cmd_name)
-        module_name, _, attr = target.partition(":")
+        module_name, _, attr = entry[0].partition(":")
         return getattr(importlib.import_module(module_name), attr)
 
     def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
@@ -68,7 +68,15 @@ class LazyGroup(click.Group):
         if not names:
             return
         limit = formatter.width - 6 - max(len(name) for name in names)
-        rows = [(name, cmd.get_short_help_str(limit) if (cmd := self.commands.get(name)) else "") for name in names]
+        rows = [
+            (
+                name,
+                entry[1]
+                if (entry := self.lazy_subcommands.get(name)) is not None
+                else self.commands[name].get_short_help_str(limit),
+            )
+            for name in names
+        ]
         with formatter.section("Commands"):
             formatter.write_dl(rows)
 
@@ -89,10 +97,10 @@ main = click.version_option(package_name="experiment-at-home")(
         name="athome",
         help="The plumbing every local AI experiment rebuilds, built once.",
         lazy_subcommands={
-            "cache": "athome.cache:cli",
-            "launchd": "athome.launchd:cli",
-            "run": "athome.detach:cli",
-            "sync": "athome.sync:cli",
+            "cache": ("athome.cache:cli", "Inspect the shared content-keyed cache."),
+            "launchd": ("athome.launchd:cli", "List, inspect, and remove athome launchd agents."),
+            "run": ("athome.detach:cli", "Launch and track detached overnight runs."),
+            "sync": ("athome.sync:cli", "Mirror a tree with sha256 verification."),
         },
     )
 )

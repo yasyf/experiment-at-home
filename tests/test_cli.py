@@ -63,7 +63,7 @@ def test_main_list_commands_sorted() -> None:
 
 def test_lazy_group_defers_import_until_invoked() -> None:
     sys.modules.pop("tests.lazy_probe", None)
-    group = AthomeGroup(name="t", lazy_subcommands={"probe": "tests.lazy_probe:cli"})
+    group = AthomeGroup(name="t", lazy_subcommands={"probe": ("tests.lazy_probe:cli", "Probe.")})
     help_result = CliRunner().invoke(group, ["--help"])
     assert help_result.exit_code == 0
     assert "probe" in help_result.output
@@ -77,7 +77,7 @@ def test_lazy_group_defers_import_until_invoked() -> None:
 def test_athome_error_renders_stderr_and_exits_1() -> None:
     messages: list[str] = []
     sink = logger.add(messages.append, level="ERROR", format="{message}")
-    group = AthomeGroup(name="t", lazy_subcommands={"boom": "tests.lazy_probe:boom"})
+    group = AthomeGroup(name="t", lazy_subcommands={"boom": ("tests.lazy_probe:boom", "Boom.")})
     try:
         result = CliRunner().invoke(group, ["boom"])
     finally:
