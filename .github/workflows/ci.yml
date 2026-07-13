@@ -25,8 +25,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache-dependency-glob: uv.lock
 
-      - name: Sync (dev)
-        run: uv sync --extra dev
+      - name: Sync (dev + llm)
+        # The `llm` extra brings spawnllm so the research-judge suite runs with real
+        # coverage. Other extras (ocr's ocrmac is macOS-only; modal/hf/serve are mocked)
+        # stay out — their tests skip or mock. The free-threaded job below stays dev-only.
+        run: uv sync --extra dev --extra llm
 
       - name: Type check (ty, warnings only)
         continue-on-error: true

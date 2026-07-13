@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING
 
 import anyio
 import pytest
-from spawnllm import BackendCallError
 
 from athome.research import judge as judge_mod
 from athome.research.judge import (
@@ -25,6 +24,10 @@ from athome.research.judge import (
     vote_of,
     with_backoff,
 )
+
+# spawnllm is the `llm` extra; skip this module cleanly on the dev-only free-threaded CI job.
+spawnllm = pytest.importorskip("spawnllm")
+BackendCallError = spawnllm.BackendCallError
 
 if TYPE_CHECKING:
     from pathlib import Path
