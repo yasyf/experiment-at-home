@@ -3,13 +3,22 @@ from __future__ import annotations
 import pickle
 import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import anyio
 import pytest
 
-from athome.wire import WIRE_VERSION, WireError, decode, encode, validate
-from athome.workers import HandshakeMismatch, PipeWorker, WorkerCrashed, WorkerError, WorkerPool, WorkerSpec
+from athome.wire import LENGTH_PREFIX, WIRE_VERSION, WireError, decode, encode, validate
+from athome.workers import (
+    MAX_FRAME_BYTES,
+    HandshakeMismatch,
+    PipeWorker,
+    WorkerCrashed,
+    WorkerError,
+    WorkerPool,
+    WorkerSpec,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -54,6 +63,31 @@ sys.stdin.buffer.read(4)
 sys.stderr.write("fatal: engine exploded\\n"); sys.stderr.flush()
 sys.exit(7)
 """
+
+
+def wire_side_effect(path: str) -> str:
+    Path(path).write_text("pwned")
+    return path
+
+
+class ReduceGadget:
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+    def __reduce__(self) -> tuple[object, tuple[str]]:
+        return (wire_side_effect, (self.path,))
+
+
+class OversizedPrefixStream:
+    def __init__(self, size: int) -> None:
+        self.prefix = size.to_bytes(LENGTH_PREFIX, "big")
+        self.body_reads = 0
+
+    async def receive_exactly(self, nbytes: int) -> bytes:
+        if nbytes == LENGTH_PREFIX:
+            return self.prefix
+        self.body_reads += 1
+        raise AssertionError("body must not be read for an oversized frame")
 
 
 @asynccontextmanager
@@ -151,5 +185,55 @@ async def test_pool_lease_affinity_after_prefetch() -> None:
             assert leased is warmed
             assert leased is not held
             assert (await leased.call("fingerprint", None))["pid"] == warmed.fingerprint["pid"]
+    finally:
+        await pool.aclose()
+
+
+def test_decode_refuses_reduce_gadget(tmp_path: Path) -> None:
+    marker = tmp_path / "pwned.txt"
+    body = pickle.dumps(ReduceGadget(str(marker)), protocol=5)
+    with pytest.raises(WireError):
+        decode(len(body).to_bytes(LENGTH_PREFIX, "big") + body)
+    assert not marker.exists()
+
+
+async def test_next_frame_rejects_oversized_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = PipeWorker(WorkerSpec((sys.executable, "-c", "")))
+    stream = OversizedPrefixStream(MAX_FRAME_BYTES + 1)
+    monkeypatch.setattr(worker, "stdout", stream)
+    with pytest.raises(WireError):
+        await worker.next_frame()
+    assert stream.body_reads == 0
+
+
+async def test_handshake_mismatch_tears_worker_down() -> None:
+    async with running(BAD_WIRE_SOURCE) as worker:
+        with pytest.raises(HandshakeMismatch):
+            await worker.call("echo", 1)
+        assert worker.process is None
+        assert worker.stdout is None
+        assert worker.stderr_thread is None
+
+
+async def test_pool_acquire_returns_permit_on_cancel() -> None:
+    pool = WorkerPool(WorkerSpec((sys.executable, "-c", HANDLER_SOURCE)), size=2)
+    try:
+        await pool.guard.acquire()
+        started = anyio.Event()
+
+        async def stalled() -> None:
+            started.set()
+            await pool.acquire(None)
+
+        async with anyio.create_task_group() as group:
+            group.start_soon(stalled)
+            await started.wait()
+            await anyio.sleep(0.05)
+            group.cancel_scope.cancel()
+        pool.guard.release()
+        with anyio.fail_after(2):
+            first = await pool.acquire(None)
+            second = await pool.acquire(None)
+        assert {first, second} == set(pool.workers)
     finally:
         await pool.aclose()

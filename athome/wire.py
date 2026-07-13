@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import pickle
 from typing import TYPE_CHECKING
 
@@ -20,6 +21,22 @@ class WireError(Exception):
     ``wire`` must import with only the standard library so sidecar distributions that
     do not depend on ``athome`` can vendor it.
     """
+
+
+class RestrictedUnpickler(pickle.Unpickler):
+    """A :class:`pickle.Unpickler` that resolves no globals.
+
+    Wire values are primitives and containers only, so unpickling one never needs a
+    class or function. Refusing every :meth:`find_class` lookup turns a ``__reduce__``
+    gadget frame into a :class:`WireError` at load time instead of code execution.
+    """
+
+    def find_class(self, module: str, name: str) -> object:
+        raise WireError(f"wire frames carry no code; refused {module}.{name}")
+
+
+def loads(body: bytes) -> Wire:
+    return validate(RestrictedUnpickler(io.BytesIO(body)).load())
 
 
 def validate(obj: object) -> Wire:
@@ -62,7 +79,7 @@ def decode(frame: bytes) -> Wire:
     size = int.from_bytes(frame[:LENGTH_PREFIX], "big")
     if len(frame) - LENGTH_PREFIX != size:
         raise WireError(f"frame declares {size} bytes, body carries {len(frame) - LENGTH_PREFIX}")
-    return validate(pickle.loads(frame[LENGTH_PREFIX:]))
+    return loads(frame[LENGTH_PREFIX:])
 
 
 def read_exactly(stream: BinaryIO, size: int) -> bytes:
@@ -81,7 +98,7 @@ def read_frame(stream: BinaryIO) -> Wire:
     serve loop can exit cleanly on parent shutdown.
     """
     size = int.from_bytes(read_exactly(stream, LENGTH_PREFIX), "big")
-    return validate(pickle.loads(read_exactly(stream, size)))
+    return loads(read_exactly(stream, size))
 
 
 def write_frame(stream: BinaryIO, obj: Wire) -> None:

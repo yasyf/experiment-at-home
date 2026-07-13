@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 MAX_REPAIR_ROUNDS = 3
 REQUIRED_TOOLS = ("rsync", "shasum")
+SHELL_METACHARACTERS = frozenset(";|&$`\n")
 
 
 class SyncVerificationError(AthomeError):
@@ -44,6 +45,8 @@ class Location:
 
     @classmethod
     def parse(cls, target: str) -> Location:
+        if "[" in target and (end := target.find("]")) != -1 and target[end + 1 : end + 2] == ":":
+            return cls(target[: end + 1], target[end + 2 :])
         head, sep, tail = target.partition(":")
         return cls(head, tail) if sep and "/" not in head else cls(None, target)
 
@@ -52,6 +55,11 @@ def require_tools() -> None:
     for tool in REQUIRED_TOOLS:
         if shutil.which(tool) is None:
             raise SyncVerificationError(f"required tool not found on PATH: {tool}")
+
+
+def guard_operands(*operands: str | None) -> None:
+    if bad := next((op for op in operands if op and (op.startswith("-") or SHELL_METACHARACTERS & set(op))), None):
+        raise SyncVerificationError(f"refusing unsafe sync operand: {bad!r}")
 
 
 def parse_manifest(output: str) -> dict[str, str]:
@@ -81,9 +89,19 @@ async def shell(command: str, *, host: str | None = None) -> str:
     return (await anyio.run_process(("ssh", host, command) if host else ("/bin/sh", "-c", command))).stdout.decode()
 
 
-async def rsync(src: Path, dst: str, *, checksum: bool = False) -> None:
+async def rsync(src: Path, dst: str, *, checksum: bool = False, remote: bool = False) -> None:
     await anyio.run_process(
-        ("rsync", "-a", *(("--checksum",) if checksum else ()), "--exclude", "._*", f"{src}/", f"{dst}/")
+        (
+            "rsync",
+            "-a",
+            *(("--checksum",) if checksum else ()),
+            *(("-e", "ssh") if remote else ()),
+            "--exclude",
+            "._*",
+            "--",
+            f"{src}/",
+            f"{dst}/",
+        )
     )
 
 
@@ -97,6 +115,19 @@ async def src_manifest(src: Path) -> dict[str, str]:
 
 async def dst_manifest(location: Location) -> dict[str, str]:
     return parse_manifest(await shell(manifest_command(location.path), host=location.host))
+
+
+def prune_empty_dirs(root: Path) -> None:
+    for path in sorted((p for p in root.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+        if not any(path.iterdir()):
+            path.rmdir()
+
+
+async def delete_verified(src: Path, verified: dict[str, str]) -> None:
+    current = await src_manifest(src)
+    for name in (name for name, digest in verified.items() if current.get(name) == digest):
+        (src / name).unlink()
+    prune_empty_dirs(src)
 
 
 async def mirror(src: Path, dst: str, *, delete_source: bool = False) -> SyncReport:
@@ -120,12 +151,14 @@ async def mirror(src: Path, dst: str, *, delete_source: bool = False) -> SyncRep
     """
     require_tools()
     location = Location.parse(dst)
+    guard_operands(str(src), dst, location.host, location.path)
     swept = 0
     mismatches: list[str] = []
+    source: dict[str, str] = {}
     for attempt in range(MAX_REPAIR_ROUNDS + 1):
-        await rsync(src, dst, checksum=attempt > 0)
+        await rsync(src, dst, checksum=attempt > 0, remote=location.host is not None)
         swept += await sweep(location)
-        if not (mismatches := diff_manifests(await src_manifest(src), await dst_manifest(location))):
+        if not (mismatches := diff_manifests(source := await src_manifest(src), await dst_manifest(location))):
             break
     else:
         raise SyncVerificationError(
@@ -140,7 +173,7 @@ async def mirror(src: Path, dst: str, *, delete_source: bool = False) -> SyncRep
         swept_appledoubles=swept,
     )
     if delete_source:
-        await shell(f"find {shlex.quote(str(src))} -mindepth 1 -delete")
+        await delete_verified(src, source)
     return report
 
 

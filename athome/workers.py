@@ -15,7 +15,7 @@ from anyio.streams.buffered import BufferedByteReceiveStream
 
 from athome.config import base_environ
 from athome.errors import AthomeError
-from athome.wire import LENGTH_PREFIX, WIRE_VERSION, decode, encode, read_frame, validate, write_frame
+from athome.wire import LENGTH_PREFIX, WIRE_VERSION, WireError, decode, encode, read_frame, validate, write_frame
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -29,6 +29,7 @@ STDERR_CHUNK = 4096
 STDERR_TAIL_CHUNKS = 16
 ACLOSE_TIMEOUT = 5.0
 STDERR_JOIN_TIMEOUT = 2.0
+MAX_FRAME_BYTES = 256 * 1024 * 1024
 
 
 class WorkerError(AthomeError):
@@ -134,7 +135,11 @@ class PipeWorker:
         self.stdout = BufferedByteReceiveStream(self.process.stdout)
         self.stderr_thread = threading.Thread(target=self.pump_stderr, args=(read_fd,), daemon=True)
         self.stderr_thread.start()
-        await self.handshake()
+        try:
+            await self.handshake()
+        except HandshakeMismatch:
+            await self.aclose()
+            raise
 
     async def handshake(self) -> None:
         match await self.next_frame():
@@ -148,7 +153,9 @@ class PipeWorker:
     async def next_frame(self) -> Wire:
         try:
             prefix = await self.stdout.receive_exactly(LENGTH_PREFIX)
-            body = await self.stdout.receive_exactly(int.from_bytes(prefix, "big"))
+            if (size := int.from_bytes(prefix, "big")) > MAX_FRAME_BYTES:
+                raise WireError(f"frame length {size} exceeds {MAX_FRAME_BYTES}-byte cap")
+            body = await self.stdout.receive_exactly(size)
         except anyio.IncompleteRead:
             raise await self.crashed() from None
         return decode(prefix + body)
@@ -195,11 +202,15 @@ class WorkerPool:
 
     async def acquire(self, key: str | None) -> PipeWorker:
         await self.available.acquire()
-        async with self.guard:
-            if key is not None and (worker := self.affinity.get(key)) is not None and worker in self.free:
-                self.free.remove(worker)
-                return worker
-            return self.free.pop()
+        try:
+            async with self.guard:
+                if key is not None and (worker := self.affinity.get(key)) is not None and worker in self.free:
+                    self.free.remove(worker)
+                    return worker
+                return self.free.pop()
+        except BaseException:
+            self.available.release()
+            raise
 
     async def release(self, worker: PipeWorker) -> None:
         async with self.guard:

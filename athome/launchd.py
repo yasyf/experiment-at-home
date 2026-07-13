@@ -16,6 +16,8 @@ from athome.errors import AthomeError
 
 LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
 LABEL_NAMESPACE = "com.athome."
+LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*")
+BOOTOUT_ABSENT_CODES = frozenset({3, 113})
 PID_RE = re.compile(r"\bpid = (\d+)")
 EXIT_RE = re.compile(r"last exit code = (\d+)")
 
@@ -68,6 +70,9 @@ class AgentSpec:
     working_dir: Path | None = None
     env: tuple[tuple[str, str], ...] = ()
 
+    def __post_init__(self) -> None:
+        validate_label(self.label)
+
 
 @dataclass(frozen=True, slots=True)
 class AgentStatus:
@@ -80,8 +85,14 @@ class AgentStatus:
     last_exit: int | None
 
 
+def validate_label(label: str) -> str:
+    if not LABEL_RE.fullmatch(label):
+        raise LaunchdError(f"invalid launchd label {label!r}: expected reverse-DNS, no slashes or '..'")
+    return label
+
+
 def agent_path(label: str) -> Path:
-    return LAUNCH_AGENTS / f"{label}.plist"
+    return LAUNCH_AGENTS / f"{validate_label(label)}.plist"
 
 
 def wrapper_command(command: tuple[str, ...]) -> str:
@@ -135,9 +146,16 @@ async def install(spec: AgentSpec) -> Path:
 
 
 async def uninstall(label: str) -> None:
-    """Boot the agent out of the GUI domain and remove its plist."""
+    """Boot the agent out of the GUI domain and remove its plist.
+
+    Raises:
+        LaunchdError: ``launchctl bootout`` failed for a reason other than the agent
+            being absent, leaving the still-running agent's plist in place.
+    """
     path = agent_path(label)
-    await anyio.run_process(["launchctl", "bootout", f"gui/{os.getuid()}", str(path)], check=False)
+    result = await anyio.run_process(["launchctl", "bootout", f"gui/{os.getuid()}", str(path)], check=False)
+    if result.returncode and result.returncode not in BOOTOUT_ABSENT_CODES:
+        raise LaunchdError(f"launchctl bootout failed for {label}: {result.stderr.decode().strip()}")
     await anyio.Path(path).unlink()
 
 

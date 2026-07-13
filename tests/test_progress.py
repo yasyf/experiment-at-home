@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+import json
+import os
 from typing import TYPE_CHECKING
 
+import anyio
 import pytest
 from loguru import logger
 
-from athome.progress import FailureBudgetExceeded, PhaseMissing, Phases, RunSink, WorkSet
+from athome.progress import (
+    FailureBudgetExceeded,
+    PhaseMissing,
+    Phases,
+    ReservedFieldConflict,
+    RunSink,
+    WorkSet,
+    append_line,
+    load_journal,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -60,6 +72,15 @@ async def test_done_journals_extra_fields(tmp_path: Path) -> None:
     assert len(lines) == 1
     assert '"cost": 1.5' in lines[0]
     assert WorkSet.open(path).is_done("a")
+
+
+async def test_done_rejects_reserved_status_field(tmp_path: Path) -> None:
+    path = tmp_path / "work.jsonl"
+    work = WorkSet.open(path)
+    with pytest.raises(ReservedFieldConflict):
+        await work.done("a", status="error")
+    assert not path.exists()
+    assert not work.is_done("a")
 
 
 async def test_truncated_tail_is_skipped_with_a_warning(tmp_path: Path) -> None:
@@ -147,3 +168,49 @@ async def test_phase_missing_carries_the_phase_name(tmp_path: Path) -> None:
     phases = Phases.open(tmp_path / "phases.jsonl")
     with pytest.raises(PhaseMissing, match="refine"):
         phases.require("refine")
+
+
+async def test_append_is_one_kernel_write_per_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    real_write = os.write
+    writes: list[bytes] = []
+
+    def recording_write(fd: int, data: bytes) -> int:
+        writes.append(data)
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", recording_write)
+    await append_line(tmp_path / "out.jsonl", {"unit": "a", "status": "done"})
+
+    record_writes = [data for data in writes if b'"unit"' in data]
+    assert len(record_writes) == 1
+    assert record_writes[0].endswith(b"\n")
+    assert json.loads(record_writes[0]) == {"unit": "a", "status": "done"}
+
+
+async def test_concurrent_appends_never_splice_records(tmp_path: Path) -> None:
+    path = tmp_path / "out.jsonl"
+    records = [{"i": i, "blob": str(i) * 8000} for i in range(30)]
+    async with anyio.create_task_group() as tg:
+        for record in records:
+            tg.start_soon(append_line, path, record)
+
+    parsed = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(parsed) == len(records)
+    assert sorted(rec["i"] for rec in parsed) == list(range(30))
+
+
+async def test_truncated_tail_after_append_skips_only_partial_final_line(tmp_path: Path) -> None:
+    path = tmp_path / "out.jsonl"
+    await append_line(path, {"i": 0})
+    await append_line(path, {"i": 1})
+    with path.open("a") as file:
+        file.write('{"i": 2, "par')
+
+    messages: list[str] = []
+    handler = logger.add(messages.append, level="WARNING")
+    try:
+        loaded = load_journal(path)
+    finally:
+        logger.remove(handler)
+    assert [rec["i"] for rec in loaded] == [0, 1]
+    assert any("truncated final line" in message for message in messages)

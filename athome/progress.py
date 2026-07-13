@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import anyio
 from loguru import logger
 
 from athome.errors import AthomeError
@@ -13,6 +13,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping
     from pathlib import Path
 
+RESERVED_FIELDS = frozenset({"unit", "status"})
+
 
 class FailureBudgetExceeded(AthomeError):
     """Raised when a ``RunSink``'s recorded failures exceed its budget."""
@@ -20,6 +22,10 @@ class FailureBudgetExceeded(AthomeError):
 
 class PhaseMissing(AthomeError):
     """Raised by ``Phases.require`` when a required phase has not been marked."""
+
+
+class ReservedFieldConflict(AthomeError):
+    """Raised when ``WorkSet.done`` receives an extra field that the record owns."""
 
 
 def parse_records(path: Path, lines: list[str]) -> Iterator[dict[str, object]]:
@@ -37,8 +43,11 @@ def load_journal(path: Path) -> list[dict[str, object]]:
 
 
 async def append_line(path: Path, record: Mapping[str, object]) -> None:
-    async with await anyio.Path(path).open("a") as file:
-        await file.write(json.dumps(record) + "\n")
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(fd, (json.dumps(record) + "\n").encode())
+    finally:
+        os.close(fd)
 
 
 @dataclass(slots=True)
@@ -69,6 +78,8 @@ class WorkSet:
         return [unit for unit in units if unit not in self._done]
 
     async def done(self, unit: str, **extra: object) -> None:
+        if reserved := RESERVED_FIELDS & extra.keys():
+            raise ReservedFieldConflict(f"reserved journal fields: {sorted(reserved)}")
         await append_line(self.path, {"unit": unit, "status": "done"} | extra)
         self._done.add(unit)
 

@@ -171,6 +171,55 @@ async def test_status_not_loaded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     assert fake.calls == [["launchctl", "print", f"gui/{os.getuid()}/com.athome.demo"]]
 
 
+def test_agent_spec_rejects_path_label() -> None:
+    with pytest.raises(LaunchdError):
+        AgentSpec(label="/tmp/victim", command=("athome",), schedule=KeepAlive())
+
+
+async def test_uninstall_rejects_path_label(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(launchd, "LAUNCH_AGENTS", tmp_path / "LaunchAgents")
+    victim = tmp_path / "victim.plist"
+    victim.write_bytes(b"do not touch")
+    fake = FakeLaunchctl()
+    monkeypatch.setattr("anyio.run_process", fake)
+
+    with pytest.raises(LaunchdError):
+        await launchd.uninstall(str(tmp_path / "victim"))
+
+    assert victim.exists()
+    assert fake.calls == []
+
+
+async def test_uninstall_raises_on_genuine_bootout_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(launchd, "LAUNCH_AGENTS", tmp_path / "LaunchAgents")
+    fake = FakeLaunchctl()
+    monkeypatch.setattr("anyio.run_process", fake)
+    path = await launchd.install(base_spec(KeepAlive()))
+    fake.overrides["bootout"] = (5, b"", b"Boot-out failed: 5: Input/output error")
+    fake.calls.clear()
+
+    with pytest.raises(LaunchdError, match="Input/output error"):
+        await launchd.uninstall("com.athome.demo")
+
+    assert path.exists()
+    assert fake.calls == [["launchctl", "bootout", f"gui/{os.getuid()}", str(path)]]
+
+
+@pytest.mark.parametrize("code", [3, 113])
+async def test_uninstall_ignores_absent_bootout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int) -> None:
+    monkeypatch.setattr(launchd, "LAUNCH_AGENTS", tmp_path / "LaunchAgents")
+    fake = FakeLaunchctl()
+    monkeypatch.setattr("anyio.run_process", fake)
+    path = await launchd.install(base_spec(KeepAlive()))
+    fake.overrides["bootout"] = (code, b"", f"Boot-out failed: {code}: No such process".encode())
+    fake.calls.clear()
+
+    await launchd.uninstall("com.athome.demo")
+
+    assert not path.exists()
+    assert fake.calls == [["launchctl", "bootout", f"gui/{os.getuid()}", str(path)]]
+
+
 def test_installed_scans_namespace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     agents = tmp_path / "LaunchAgents"
     agents.mkdir()

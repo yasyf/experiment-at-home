@@ -197,3 +197,45 @@ def test_cache_key_selectivity(left: httpx.Request, right: httpx.Request, expect
 def test_cache_key_varies_on_schema_version() -> None:
     request = httpx.Request("POST", CHAT_URL, content=REQUEST_BODY)
     assert cache_key(request, schema_version=1) != cache_key(request, schema_version=2)
+
+
+def test_cache_key_distinguishes_scheme_and_port() -> None:
+    keys = {
+        cache_key(httpx.Request("GET", url), schema_version=1)
+        for url in ("http://h/x", "https://h/x", "https://h:8443/x")
+    }
+    assert len(keys) == 3
+
+
+def test_cache_key_collapses_default_port() -> None:
+    assert cache_key(httpx.Request("GET", "https://h/x"), schema_version=1) == cache_key(
+        httpx.Request("GET", "https://h:443/x"), schema_version=1
+    )
+
+
+async def test_record_mode_refreshes_stored_row_on_rerecord() -> None:
+    bodies = iter([b"first", b"second"])
+    mock, seen = counting_origin(lambda: httpx.Response(200, content=next(bodies)))
+    recorder = CachingTransport(inner=mock, mode=LlmCacheMode.RECORD, schema_version=1, db_path=db_path())
+    async with httpx.AsyncClient(transport=recorder) as client:
+        await client.post(CHAT_URL, content=REQUEST_BODY)
+        await client.post(CHAT_URL, content=REQUEST_BODY)
+    assert len(seen) == 2
+
+    replayer = CachingTransport(inner=mock, mode=LlmCacheMode.REPLAY, schema_version=1, db_path=db_path())
+    async with httpx.AsyncClient(transport=replayer) as client:
+        replayed = await client.post(CHAT_URL, content=REQUEST_BODY)
+    assert replayed.content == b"second"
+
+
+async def test_duplicate_response_headers_survive_replay() -> None:
+    dup_headers = [("set-cookie", "a=1"), ("set-cookie", "b=2"), ("content-type", "application/json")]
+    mock, _ = counting_origin(lambda: httpx.Response(200, headers=dup_headers, content=RESPONSE_BODY))
+    recorder = CachingTransport(inner=mock, mode=LlmCacheMode.RECORD, schema_version=1, db_path=db_path())
+    async with httpx.AsyncClient(transport=recorder) as client:
+        await client.post(CHAT_URL, content=REQUEST_BODY)
+
+    replayer = CachingTransport(inner=mock, mode=LlmCacheMode.REPLAY, schema_version=1, db_path=db_path())
+    async with httpx.AsyncClient(transport=replayer) as client:
+        replayed = await client.post(CHAT_URL, content=REQUEST_BODY)
+    assert replayed.headers.get_list("set-cookie") == ["a=1", "b=2"]

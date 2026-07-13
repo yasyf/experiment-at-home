@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 SENTINEL = "ATHOME-RUN-DONE"
+NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 
 def run_log(name: str) -> Path:
@@ -79,13 +80,16 @@ async def launch(command: Sequence[str], *, name: str) -> DetachedRun:
     Raises:
         DetachError: A live run already holds ``name``.
     """
+    if not NAME_RE.fullmatch(name):
+        raise DetachError(f"invalid run name {name!r}: must match [A-Za-z0-9._-]+")
     if (pid := running(name)) is not None:
         raise DetachError(f"a run named {name!r} is already live (pid {pid})")
     log_path, pid_path = run_log(name), run_pidfile(name)
     await anyio.Path(log_path.parent).mkdir(parents=True, exist_ok=True)
     prefix = f"{env}; " if (env := load(AthomeSettings).env_prefix_cmd) else ""
     inner = (
-        f'{prefix}{shlex.join(command)}; rc=$?; echo "{SENTINEL} name={name} exit=$rc" >> {shlex.quote(str(log_path))}'
+        f"{prefix}{shlex.join(command)}; rc=$?; "
+        f'echo "{SENTINEL} name="{shlex.quote(name)}" exit=$rc" >> {shlex.quote(str(log_path))}'
     )
     with log_path.open("ab") as log_file:
         process = await anyio.open_process(

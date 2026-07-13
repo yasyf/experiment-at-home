@@ -127,3 +127,21 @@ def test_cli_wait_emits_json() -> None:
     result = runner.invoke(cli, ["wait", "cjson", "--poll", "0.02", "--timeout", "5", "--json"])
     assert result.exit_code == 0
     assert result.output.strip() == '{"name": "cjson", "exit": 2}'
+
+
+async def test_launch_rejects_shell_injection_in_name(tmp_path: Path) -> None:
+    pwned = tmp_path / "pwned"
+    with pytest.raises(DetachError):
+        await launch(["/bin/sh", "-c", "exit 0"], name=f"x$(touch {pwned})")
+    await anyio.sleep(0.3)
+    assert not pwned.exists()
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["x$(touch p)", "a;b", "a b", "back`tick`", "slash/ed", "nl\nx", "star*", "", "quote'd"],
+    ids=["cmdsub", "semicolon", "space", "backtick", "slash", "newline", "glob", "empty", "quote"],
+)
+async def test_launch_rejects_invalid_name(name: str) -> None:
+    with pytest.raises(DetachError):
+        await launch(["/bin/sh", "-c", "exit 0"], name=name)

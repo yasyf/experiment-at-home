@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import aiosqlite
+import anyio
 import pytest
 
 from athome.store import Store
@@ -67,3 +68,21 @@ async def test_foreign_keys_enforced(tmp_path: Path) -> None:
     async with Store.open(tmp_path / "fk.sqlite", schema=schema) as store:
         with pytest.raises(aiosqlite.IntegrityError):
             await store.execute("INSERT INTO child (parent_id) VALUES (?)", [999])
+
+
+async def test_execute_serializes_write_and_commit(tmp_path: Path) -> None:
+    async with Store.open(tmp_path / "db.sqlite", schema=SCHEMA) as store:
+        async with store.lock:
+            with anyio.CancelScope() as scope, anyio.fail_after(1):
+                async with anyio.create_task_group() as tg:
+
+                    async def blocked_writer() -> None:
+                        await store.execute("INSERT INTO items (name) VALUES (?)", ["leaked"])
+
+                    tg.start_soon(blocked_writer)
+                    await anyio.sleep(0.05)
+                    scope.cancel()
+        assert await store.fetch_one("SELECT name FROM items WHERE name = ?", ["leaked"]) is None
+        await store.execute("INSERT INTO items (name) VALUES (?)", ["ok"])
+        row = await store.fetch_one("SELECT name FROM items WHERE name = ?", ["ok"])
+        assert row is not None and row["name"] == "ok"

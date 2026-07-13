@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import aiosqlite
+import anyio
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Sequence
@@ -13,9 +14,14 @@ if TYPE_CHECKING:
 
 @dataclass(slots=True)
 class Store:
-    """An open aiosqlite database with WAL, busy_timeout, and a schema applied."""
+    """An open aiosqlite database with WAL, busy_timeout, and a schema applied.
+
+    Single-writer: a per-``Store`` ``anyio.Lock`` serializes ``execute`` so a write and
+    its commit land as one unit and no other task's commit flushes a partial write.
+    """
 
     db: aiosqlite.Connection
+    lock: anyio.Lock = field(default_factory=anyio.Lock)
 
     @classmethod
     @asynccontextmanager
@@ -40,5 +46,6 @@ class Store:
             return list(await cur.fetchall())
 
     async def execute(self, sql: str, params: Sequence[object] = ()) -> None:
-        await self.db.execute(sql, params)
-        await self.db.commit()
+        async with self.lock:
+            await self.db.execute(sql, params)
+            await self.db.commit()

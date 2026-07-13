@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 import time
 from typing import TYPE_CHECKING
 
@@ -9,7 +10,16 @@ import anyio
 import pytest
 from click.testing import CliRunner
 
-from athome.cache import Cache, CacheKeyError, CacheStats, cached, cli, stats_all
+from athome.cache import (
+    STALE_TMP_SECONDS,
+    Cache,
+    CacheKey,
+    CacheKeyError,
+    CacheStats,
+    cached,
+    cli,
+    stats_all,
+)
 from athome.config import AthomeSettings, load
 
 if TYPE_CHECKING:
@@ -170,6 +180,57 @@ async def test_stats_all_aggregates_versions_per_namespace() -> None:
 
 async def test_stats_all_empty_when_cache_root_absent() -> None:
     assert await stats_all() == []
+
+
+@pytest.mark.parametrize(
+    "namespace",
+    ["../../x", "..", ".", "a/b"],
+    ids=["traversal", "dotdot", "dot", "slash"],
+)
+def test_open_rejects_bad_namespace(namespace: str) -> None:
+    with pytest.raises(CacheKeyError):
+        Cache.open(namespace, version=1)
+
+
+async def test_forged_digest_key_rejected(tmp_path: Path) -> None:
+    cache = Cache.open("blobs", version=1)
+    escape = tmp_path / "escape-target"
+    for forged in (CacheKey(digest=str(escape)), CacheKey(digest="/etc/x"), CacheKey(digest="..")):
+        with pytest.raises(CacheKeyError):
+            cache.entry_path(forged)
+        with pytest.raises(CacheKeyError):
+            await cache.get(forged)
+        with pytest.raises(CacheKeyError):
+            await cache.put_bytes(forged, b"pwn")
+    assert not escape.exists()
+    real = cache.entry_path(cache.key("legit"))
+    assert load(AthomeSettings).cache_root in real.parents
+
+
+async def test_open_sweep_skips_active_staging_dir() -> None:
+    cache = Cache.open("live", version=1)
+    key = cache.key("longwrite")
+    async with cache.write(key) as staging:
+        await staging.mkdir()
+        await (staging / "part").write_bytes(b"partial")
+        old = time.time() - 2 * STALE_TMP_SECONDS
+        os.utime(str(staging), (old, old))
+        Cache.open("live", version=1)
+        assert await staging.exists()
+        assert await (staging / "part").exists()
+    entry = await cache.get(key)
+    assert entry is not None
+    assert await (entry / "part").read_bytes() == b"partial"
+
+
+async def test_key_distinguishes_float_bit_patterns() -> None:
+    cache = Cache.open("floats", version=1)
+    nan1 = struct.unpack(">d", b"\x7f\xf8\x00\x00\x00\x00\x00\x01")[0]
+    nan2 = struct.unpack(">d", b"\x7f\xf8\x00\x00\x00\x00\x00\x02")[0]
+    assert cache.key(nan1) != cache.key(nan2)
+    assert cache.key(0.0) != cache.key(-0.0)
+    assert cache.key(nan1) == cache.key(struct.unpack(">d", b"\x7f\xf8\x00\x00\x00\x00\x00\x01")[0])
+    assert cache.key(1.5) == cache.key(1.5)
 
 
 def test_cli_stats_json() -> None:

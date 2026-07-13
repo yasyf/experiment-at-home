@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS responses (
 );
 """
 SKIP_HEADERS = frozenset({"content-length", "content-encoding", "transfer-encoding", "connection"})
+DEFAULT_PORTS = {"http": 80, "https": 443}
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 RETRY_MAX_ATTEMPTS = 3
 RETRY_BASE_DELAY = 0.5
@@ -64,7 +65,9 @@ def cache_key(request: httpx.Request, *, schema_version: int) -> str:
             (
                 str(schema_version).encode(),
                 request.method.encode(),
+                request.url.scheme.encode(),
                 request.url.host.encode(),
+                str(request.url.port or DEFAULT_PORTS[request.url.scheme]).encode(),
                 request.url.path.encode(),
                 urlencode(sorted(request.url.params.multi_items())).encode(),
                 request.content,
@@ -74,7 +77,7 @@ def cache_key(request: httpx.Request, *, schema_version: int) -> str:
 
 
 def stored_headers(headers: httpx.Headers) -> list[tuple[str, str]]:
-    return [(name, value) for name, value in headers.items() if name.lower() not in SKIP_HEADERS]
+    return [(name, value) for name, value in headers.multi_items() if name.lower() not in SKIP_HEADERS]
 
 
 async def load_response(store: Store, key: str, request: httpx.Request) -> httpx.Response | None:
@@ -117,12 +120,13 @@ class RetryTransport(httpx.AsyncBaseTransport):
 
 @dataclass(slots=True)
 class CachingTransport(httpx.AsyncBaseTransport):
-    """Record/replay layer keyed on sha256(schema_version, method, host, path, sorted-query, body).
+    """Record/replay layer keyed on sha256(schema_version, method, scheme, host, port, path, sorted-query, body).
 
     Headers are excluded from the key by design (auth and session noise never perturb
-    replay), and only ``2xx`` responses are recorded. The sqlite store lives under
-    ``load(AthomeSettings).cache_root / "llmcache" / "llmcache.db"`` and opens lazily on
-    the first request, closing when the transport does.
+    replay), and only ``2xx`` responses are recorded. Streaming responses are fully
+    buffered: the body is read into memory before it is stored. The sqlite store lives
+    under ``load(AthomeSettings).cache_root / "llmcache" / "llmcache.db"`` and opens
+    lazily on the first request, closing when the transport does.
     """
 
     inner: httpx.AsyncBaseTransport
@@ -151,7 +155,7 @@ class CachingTransport(httpx.AsyncBaseTransport):
         headers = stored_headers(response.headers)
         if response.status_code // 100 == 2:
             await store.execute(
-                "INSERT OR IGNORE INTO responses (key, status, headers, body, created_at) VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO responses (key, status, headers, body, created_at) VALUES (?, ?, ?, ?, ?)",
                 [key, response.status_code, json.dumps(headers), body, datetime.now(UTC).isoformat()],
             )
         return httpx.Response(response.status_code, headers=headers, content=body, request=request)

@@ -91,3 +91,43 @@ async def test_missing_tool_names_it(tmp_path: Path, monkeypatch: pytest.MonkeyP
 )
 def test_location_parse(target: str, expected: Location) -> None:
     assert Location.parse(target) == expected
+
+
+def test_location_parse_ipv6_bracket() -> None:
+    assert Location.parse("user@[::1]:/dst") == Location("user@[::1]", "/dst")
+
+
+@pytest.mark.parametrize(
+    "dst",
+    ["-oProxyCommand=evil", "/dst;touch /tmp/pwn", "host:/safe|reboot", "host:/x`id`"],
+    ids=["leading-dash", "semicolon", "pipe", "backtick"],
+)
+async def test_unsafe_operands_rejected_before_rsync(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dst: str) -> None:
+    src = make_tree(tmp_path / "src", {"a.txt": b"x"})
+    called = False
+
+    async def fail_rsync(*args: object, **kwargs: object) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(athome.sync, "rsync", fail_rsync)
+    with pytest.raises(SyncVerificationError, match="unsafe"):
+        await mirror(src, dst)
+    assert called is False
+
+
+async def test_move_preserves_files_created_after_verification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    src = make_tree(tmp_path / "src", {"a.txt": b"keep"})
+    dst = tmp_path / "dst"
+    real_local_files = athome.sync.local_files
+
+    def inject_after_verification(root: Path) -> list[Path]:
+        result = real_local_files(root)
+        (root / "sneaky.txt").write_bytes(b"appeared-after-verify")
+        return result
+
+    monkeypatch.setattr(athome.sync, "local_files", inject_after_verification)
+    report = await mirror(src, str(dst), delete_source=True)
+    assert report.verified is True
+    assert not (src / "a.txt").exists()
+    assert (src / "sneaky.txt").read_bytes() == b"appeared-after-verify"

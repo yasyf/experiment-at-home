@@ -99,7 +99,6 @@ lands with a regression test that fails before and passes after.
 - **P2 — `done(**extra)` overwrites reserved fields.** `done("a", status="error")`
   marks done in memory but journals an error → pending after restart. Fix: reject
   reserved keys (`unit`, `status`) in `**extra`.
-- **P3 — failure budget not recounted on resume.** Reopening an over-budget journal
-  continues; the in-memory counter starts at 0. Fix: recount `failed` records on
-  `open` and seed the counter. (Cross-process budgets stay out of scope — single
-  writer.)
+- **P3 — failure budget not recounted on resume.** *Review false positive —
+  already satisfied at HEAD.* `RunSink.open` already recounts `failed` records and
+  seeds the counter (`test_failure_budget_survives_resume` covers it); no change.

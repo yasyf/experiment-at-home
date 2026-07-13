@@ -152,6 +152,7 @@ class Store:
     """An open aiosqlite database with WAL, busy_timeout, and a schema applied."""
 
     db: aiosqlite.Connection
+    lock: anyio.Lock = field(default_factory=anyio.Lock)   # serializes execute+commit (single-writer)
 
     @classmethod
     @asynccontextmanager
@@ -256,7 +257,7 @@ class RetryTransport(httpx.AsyncBaseTransport):
     """Retries 429/5xx/transport errors with capped exponential backoff (default 3 tries)."""
 
 class CachingTransport(httpx.AsyncBaseTransport):
-    """Record/replay layer keyed on sha256(schema_version, method, host, path, sorted-query, body)."""
+    """Record/replay layer keyed on sha256(schema_version, method, scheme, host, port, path, sorted-query, body)."""
     # headers excluded from the key by design (auth/session noise);
     # only 2xx responses are recorded; sqlite store under
     # load(AthomeSettings).cache_root / "llmcache" / "llmcache.db" via athome.store
@@ -349,6 +350,7 @@ cc-steer-lab phase gating). Pure stdlib + anyio.
 ```python
 class FailureBudgetExceeded(AthomeError): ...
 class PhaseMissing(AthomeError): ...
+class ReservedFieldConflict(AthomeError): ...   # done(**extra) may not shadow unit/status
 
 class WorkSet:
     """A resumable set of work units journaled as JSONL; errors are retried on resume."""

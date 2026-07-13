@@ -4,7 +4,9 @@ import errno
 import functools
 import os
 import pickle
+import re
 import shutil
+import struct
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
@@ -26,11 +28,15 @@ if TYPE_CHECKING:
 
 STALE_TMP_SECONDS = 86400.0
 PERSON = b"athome-cache"
+DIGEST_BYTES = 16
 TYPE_TAGS: dict[type, bytes] = {bool: b"?:", int: b"i:", float: b"f:", str: b"s:", bytes: b"b:"}
+NAMESPACE_RE = re.compile(r"[A-Za-z0-9._-]+")
+DIGEST_RE = re.compile(rf"[0-9a-f]{{{DIGEST_BYTES * 2}}}")
+ACTIVE_STAGING: set[str] = set()
 
 
 class CacheKeyError(AthomeError):
-    """Raised when a cached call receives an argument that is not a hashable primitive or tuple."""
+    """Raised for an invalid cache address: a non-primitive argument, a bad namespace, or a malformed digest."""
 
 
 def frame(chunk: bytes) -> bytes:
@@ -39,7 +45,9 @@ def frame(chunk: bytes) -> bytes:
 
 def encode_part(part: bytes | str | int | float | bool | None | tuple[object, ...]) -> bytes:
     match part:
-        case bool() | int() | float():
+        case float():
+            return TYPE_TAGS[float] + struct.pack(">d", part)
+        case bool() | int():
             return TYPE_TAGS[type(part)] + repr(part).encode()
         case str():
             return b"s:" + part.encode()
@@ -67,6 +75,8 @@ def remove_path(path: os.PathLike[str] | str) -> None:
 def sweep_stale_tmps(root: pathlib.Path) -> None:
     cutoff = time.time() - STALE_TMP_SECONDS
     for tmp in root.glob("*/*.tmp-*"):
+        if str(tmp) in ACTIVE_STAGING:
+            continue
         with suppress(FileNotFoundError):
             if tmp.stat().st_mtime < cutoff:
                 remove_path(tmp)
@@ -138,6 +148,8 @@ class Cache:
     @classmethod
     def open(cls, namespace: str, *, version: int) -> Cache:
         """Open (creating on first use) the cache tree for ``namespace`` at ``version``, sweeping stale temps."""
+        if not NAMESPACE_RE.fullmatch(namespace) or namespace in {".", ".."}:
+            raise CacheKeyError(f"invalid cache namespace {namespace!r}")
         base = load(AthomeSettings).cache_root / namespace / f"v{version}"
         base.mkdir(parents=True, exist_ok=True)
         sweep_stale_tmps(base)
@@ -146,9 +158,11 @@ class Cache:
     def key(self, *parts: bytes | str | int | float | bool | None) -> CacheKey:
         """Derive a content address from a type-tagged, length-framed encoding of ``parts``."""
         material = b"".join(frame(encode_part(part)) for part in parts)
-        return CacheKey(blake2b(material, digest_size=16, person=PERSON).hexdigest())
+        return CacheKey(blake2b(material, digest_size=DIGEST_BYTES, person=PERSON).hexdigest())
 
     def entry_path(self, key: CacheKey) -> Path:
+        if not DIGEST_RE.fullmatch(key.digest):
+            raise CacheKeyError(f"invalid cache digest {key.digest!r}")
         return self.root / key.digest[:2] / key.digest
 
     async def get(self, key: CacheKey) -> Path | None:
@@ -175,12 +189,17 @@ class Cache:
         final = self.entry_path(key)
         await final.parent.mkdir(parents=True, exist_ok=True)
         staging = final.parent / f"{final.name}.tmp-{uuid4().hex}"
+        # Registered until published so a concurrent stale-tmp sweep never reaps an in-flight write.
+        ACTIVE_STAGING.add(str(staging))
         try:
-            yield staging
-        except BaseException:
-            await discard(staging)
-            raise
-        await publish(staging, final)
+            try:
+                yield staging
+            except BaseException:
+                await discard(staging)
+                raise
+            await publish(staging, final)
+        finally:
+            ACTIVE_STAGING.discard(str(staging))
 
     async def stats(self) -> CacheStats:
         """Count the published entries and total bytes in this cache's version tree."""
@@ -212,6 +231,7 @@ def cached[F: Callable[..., Awaitable[object]]](*, ns: str, version: int) -> Cal
     """
 
     def decorate(func: F) -> F:
+        # Keyed on __qualname__: safe for module-level functions; two closures sharing a qualname collide.
         cache, qualname = Cache.open(ns, version=version), func.__qualname__
 
         @functools.wraps(func)
