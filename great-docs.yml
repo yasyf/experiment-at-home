@@ -58,11 +58,97 @@ authors:
     github: yasyf
     email: yasyfm@gmail.com
 
-# Curated symbol reference (public API only). Optional — without it, dynamic
-# mode documents everything in athome.__all__.
-# reference:
-#   - title: Core
-#     desc: The main entry points.
-#     contents:
-#       - SomePublicClass
-#       - some_public_function
+# Curated symbol reference (public API only). Type aliases (launchd.Schedule,
+# wire.Wire) stay out — great-docs cannot document Kind.TYPE_ALIAS.
+reference:
+  - title: Config
+    desc: The pydantic-settings surface over ~/.athome/config.toml.
+    contents:
+      - config.SectionSettings
+      - config.AthomeSettings
+      - config.load
+  - title: Cache
+    desc: Content+version-keyed caching with atomic staging writes.
+    contents:
+      - cache.Cache
+      - cache.CacheKey
+      - cache.CacheStats
+      - cache.cached
+      - cache.stats_all
+      - cache.CacheKeyError
+  - title: LLM cache
+    desc: Record/replay HTTP caching for OpenAI-shaped clients.
+    contents:
+      - llmcache.LlmCacheMode
+      - llmcache.LlmCacheSettings
+      - llmcache.CachingTransport
+      - llmcache.RetryTransport
+      - llmcache.transport
+      - llmcache.LlmCacheMiss
+  - title: Workers
+    desc: Sidecar subprocesses speaking the length-prefixed wire protocol.
+    contents:
+      - workers.WorkerTransport
+      - workers.WorkerSpec
+      - workers.PipeWorker
+      - workers.WorkerPool
+      - workers.serve
+      - workers.WorkerError
+      - workers.WorkerCrashed
+      - workers.HandshakeMismatch
+      - wire.validate
+      - wire.encode
+      - wire.decode
+      - wire.WireError
+  - title: Progress
+    desc: Resumable work-sets, crash-safe run sinks, phase gating.
+    contents:
+      - progress.WorkSet
+      - progress.RunSink
+      - progress.Phases
+      - progress.FailureBudgetExceeded
+      - progress.PhaseMissing
+  - title: launchd
+    desc: Declarative launchd agents.
+    contents:
+      - launchd.AgentSpec
+      - launchd.Calendar
+      - launchd.Interval
+      - launchd.KeepAlive
+      - launchd.AgentStatus
+      - launchd.plist_dict
+      - launchd.install
+      - launchd.uninstall
+      - launchd.status
+      - launchd.installed
+      - launchd.LaunchdError
+  - title: Detach
+    desc: Sentinel-tracked detached overnight runs.
+    contents:
+      - detach.DetachedRun
+      - detach.launch
+      - detach.wait
+      - detach.running
+      - detach.DetachError
+  - title: Sync
+    desc: Verified rsync mirroring.
+    contents:
+      - sync.mirror
+      - sync.SyncReport
+      - sync.SyncVerificationError
+  - title: Store
+    desc: The shared aiosqlite scaffold.
+    contents:
+      - store.Store
+  - title: OCR types
+    desc: Protocols for token- and document-level OCR engines.
+    contents:
+      - ocr.Box
+      - ocr.OcrToken
+      - ocr.Document
+      - ocr.TokenOcr
+      - ocr.DocOcr
+  - title: Errors
+    desc: The exception root the CLI renders.
+    contents:
+      - errors.AthomeError
