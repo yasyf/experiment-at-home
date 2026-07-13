@@ -27,9 +27,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+serve = ["httpx>=0.28", "openai>=1.50"]
+llm = ["spawnllm>=0.6.1"]
+ocr = ["ocrmac>=1.0"]
+modal = ["modal>=0.66"]
+hf = ["huggingface-hub>=0.26"]
+embed = ["numpy>=2", "sentence-transformers>=3"]
 dev = [
     "pytest>=8.0",
     "ruff>=0.8",
+    "numpy>=2",
 ]
 
 [project.scripts]
@@ -57,6 +64,7 @@ addopts = ["-ra", "--strict-markers", "--tb=short", "-q"]
 markers = [
     "unit: Pure unit tests",
     "integration: Integration tests",
+    "live: Tests requiring real MLX/models/API/Modal (skipped in the mocked run)",
 ]
 
 # ty (Astral) is the default type checker. It runs on every commit via the prek
