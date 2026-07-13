@@ -1,0 +1,13 @@
+{
+  "name": "athome",
+  "version": "0.1.0",
+  "description": "Skills for the athome SDK — caching, overnight runs, local serving, OCR profiles, LLM call policy, and autoresearch loops.",
+  "author": {
+    "name": "Yasyf Mohamedali",
+    "url": "https://github.com/yasyf"
+  },
+  "homepage": "https://github.com/yasyf/experiment-at-home",
+  "repository": "https://github.com/yasyf/experiment-at-home",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "skills": "./skills"
+}

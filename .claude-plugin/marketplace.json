@@ -1,0 +1,27 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "experiment-at-home",
+  "description": "The plumbing every local AI experiment rebuilds, built once.",
+  "owner": {
+    "name": "yasyf"
+  },
+  "plugins": [
+    {
+      "name": "athome",
+      "source": "./plugin",
+      "description": "Skills for the athome SDK — caching, overnight runs, local serving, OCR profiles, LLM call policy, and autoresearch loops.",
+      "category": "development",
+      "tags": [
+        "mlx",
+        "ocr",
+        "caching",
+        "llm",
+        "launchd",
+        "autoresearch"
+      ],
+      "author": {
+        "name": "yasyf"
+      }
+    }
+  ]
+}
