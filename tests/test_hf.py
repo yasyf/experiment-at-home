@@ -30,6 +30,10 @@ def whoami_response(role: str) -> dict[str, object]:
     }
 
 
+def oauth_whoami_response() -> dict[str, object]:
+    return {"type": "user", "name": "yasyf", "auth": {"type": "oauth", "expiresAt": "2026-08-01T07:15:36.000Z"}}
+
+
 @pytest.fixture
 def fake_hub(monkeypatch: pytest.MonkeyPatch) -> Iterator[ModuleType]:
     monkeypatch.setenv("HF_TOKEN", "tok_write")
@@ -65,6 +69,18 @@ async def test_ensure_write_auth_accepts_write_token(fake_hub: ModuleType) -> No
 
 async def test_ensure_write_auth_rejects_read_token(fake_hub: ModuleType) -> None:
     fake_hub.whoami.return_value = whoami_response("read")
+    with pytest.raises(HfAuthError):
+        await ensure_write_auth()
+
+
+async def test_ensure_write_auth_accepts_oauth_token(fake_hub: ModuleType) -> None:
+    fake_hub.whoami.return_value = oauth_whoami_response()
+    await ensure_write_auth()
+    fake_hub.whoami.assert_called_once_with(token="tok_write")
+
+
+async def test_ensure_write_auth_rejects_unrecognized_shape(fake_hub: ModuleType) -> None:
+    fake_hub.whoami.return_value = {"type": "user", "name": "yasyf", "auth": {"type": "saml_sso"}}
     with pytest.raises(HfAuthError):
         await ensure_write_auth()
 

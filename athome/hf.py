@@ -69,19 +69,30 @@ async def snapshot(repo: str, *, revision: str | None = None) -> Path:
 
 
 async def ensure_write_auth() -> None:
-    """Assert ``HF_TOKEN`` carries write scope, failing loudly before any push reaches the hub.
+    """Assert the configured token can push, failing loudly before any push reaches the hub.
 
-    A read-scoped token ``whoami``\\ s cleanly yet 403s on upload; this preflight raises on the
-    role instead, so the failure surfaces here rather than mid-push.
+    A read-scoped *classic* token ``whoami``\\ s cleanly yet 403s on upload; this preflight raises
+    on the role instead, so the failure surfaces here rather than mid-push. An *OAuth* token — what
+    ``huggingface-cli login`` mints — is write-scoped but carries no role in its ``whoami`` shape
+    (``{"type": "oauth", "expiresAt": …}``), so it is accepted on its type; a narrowly-scoped OAuth
+    token is caught by the hub at push, not here.
 
     Raises:
-        HfAuthError: The token resolves to a non-write role.
+        HfAuthError: The token is a non-write classic role, or an unrecognized auth shape.
     """
     from huggingface_hub import whoami
 
-    info = await to_thread.run_sync(functools.partial(whoami, token=load(HfSettings).token.get_secret_value()))
-    if (role := info["auth"]["accessToken"]["role"]) != "write":
-        raise HfAuthError(f"HF_TOKEN has role {role!r}; a write-scoped token is required to push")
+    auth = (await to_thread.run_sync(functools.partial(whoami, token=load(HfSettings).token.get_secret_value())))["auth"]
+    match auth:
+        case {"type": "oauth"} | {"type": "access_token", "accessToken": {"role": "write"}}:
+            return
+        case {"type": "access_token", "accessToken": {"role": role}}:
+            raise HfAuthError(f"HF_TOKEN has role {role!r}; a write-scoped token is required to push")
+        case _:
+            raise HfAuthError(
+                f"HF_TOKEN whoami returned an unrecognized auth shape (type={auth.get('type')!r}); "
+                "expected an OAuth login or a write-scoped access token"
+            )
 
 
 async def push(repo: str, local_dir: Path, *, revision: str = "main") -> None:
