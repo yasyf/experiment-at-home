@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -86,3 +87,50 @@ async def test_execute_serializes_write_and_commit(tmp_path: Path) -> None:
         await store.execute("INSERT INTO items (name) VALUES (?)", ["ok"])
         row = await store.fetch_one("SELECT name FROM items WHERE name = ?", ["ok"])
         assert row is not None and row["name"] == "ok"
+
+
+async def test_busy_timeout_default(tmp_path: Path) -> None:
+    async with Store.open(tmp_path / "db.sqlite", schema=SCHEMA) as store:
+        row = await store.fetch_one("PRAGMA busy_timeout")
+        assert row is not None
+        assert row[0] == 5000
+
+
+async def test_busy_timeout_override_reflected(tmp_path: Path) -> None:
+    async with Store.open(tmp_path / "db.sqlite", schema=SCHEMA, busy_timeout_ms=30000) as store:
+        row = await store.fetch_one("PRAGMA busy_timeout")
+        assert row is not None
+        assert row[0] == 30000
+
+
+async def test_execute_retries_until_lock_released(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("athome.store.LOCKED_RETRY_ATTEMPTS", 100)
+    monkeypatch.setattr("athome.store.LOCKED_RETRY_BASE_DELAY", 0.01)
+    monkeypatch.setattr("athome.store.LOCKED_RETRY_MAX_DELAY", 0.02)
+    db_path = tmp_path / "db.sqlite"
+    async with Store.open(db_path, schema=SCHEMA, busy_timeout_ms=1) as store:
+        async with aiosqlite.connect(db_path) as blocker:
+            await blocker.execute("INSERT INTO items (name) VALUES (?)", ["holder"])
+            async with anyio.create_task_group() as tg:
+
+                async def release() -> None:
+                    await anyio.sleep(0.1)
+                    await blocker.rollback()
+
+                tg.start_soon(release)
+                await store.execute("INSERT INTO items (name) VALUES (?)", ["delayed"])
+        row = await store.fetch_one("SELECT name FROM items WHERE name = ?", ["delayed"])
+        assert row is not None and row["name"] == "delayed"
+
+
+async def test_execute_raises_after_retry_bound(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("athome.store.LOCKED_RETRY_ATTEMPTS", 3)
+    monkeypatch.setattr("athome.store.LOCKED_RETRY_BASE_DELAY", 0.01)
+    monkeypatch.setattr("athome.store.LOCKED_RETRY_MAX_DELAY", 0.02)
+    db_path = tmp_path / "db.sqlite"
+    async with Store.open(db_path, schema=SCHEMA, busy_timeout_ms=1) as store:
+        async with aiosqlite.connect(db_path) as blocker:
+            await blocker.execute("INSERT INTO items (name) VALUES (?)", ["holder"])
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                await store.execute("INSERT INTO items (name) VALUES (?)", ["never"])
+        assert await store.fetch_one("SELECT name FROM items WHERE name = ?", ["never"]) is None

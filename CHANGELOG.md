@@ -6,6 +6,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-13
+
+### Added
+- `athome.cache.atomic_write_bytes` / `atomic_write_text` — atomic same-filesystem writes to any caller-chosen path (temp sibling, `fsync`, `os.replace`), for standalone files that live outside a cache namespace.
+- `Cache.open(..., root=)` — a per-call cache-root override, so a CLI flag or a test fixture can point one cache at its own directory without mutating the process-wide `cache_root` setting.
+- `Store.open(..., busy_timeout_ms=)` plus retry-on-locked in `Store.execute` (bounded exponential backoff), for higher-contention sqlite consumers.
+
 ## [0.3.0] - 2026-07-13
 
 ### Added

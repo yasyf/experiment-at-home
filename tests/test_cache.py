@@ -17,6 +17,8 @@ from athome.cache import (
     CacheKey,
     CacheKeyError,
     CacheStats,
+    atomic_write_bytes,
+    atomic_write_text,
     cached,
     cli,
     stats_all,
@@ -262,3 +264,71 @@ def test_cli_stats_json() -> None:
     result = CliRunner().invoke(cli, ["stats", "--json"])
     assert result.exit_code == 0
     assert json.loads(result.output) == [{"namespace": "clins", "entries": 1, "bytes": 4}]
+
+
+async def test_atomic_write_bytes_round_trip(tmp_path: Path) -> None:
+    target = anyio.Path(tmp_path) / "meta.bin"
+    await atomic_write_bytes(target, b"payload")
+    assert await target.read_bytes() == b"payload"
+
+
+async def test_atomic_write_text_round_trip(tmp_path: Path) -> None:
+    target = anyio.Path(tmp_path) / "meta.json"
+    await atomic_write_text(target, "hello ünïcode")
+    assert await target.read_text() == "hello ünïcode"
+
+
+async def test_atomic_write_creates_parent_dirs(tmp_path: Path) -> None:
+    target = anyio.Path(tmp_path) / "a" / "b" / "c" / "file"
+    await atomic_write_bytes(target, b"deep")
+    assert await target.read_bytes() == b"deep"
+    assert await target.parent.is_dir()
+
+
+async def test_atomic_write_overwrites_existing(tmp_path: Path) -> None:
+    target = anyio.Path(tmp_path) / "f"
+    await atomic_write_text(target, "first")
+    await atomic_write_text(target, "second")
+    assert await target.read_text() == "second"
+    leftovers = [entry.name async for entry in anyio.Path(tmp_path).iterdir() if ".tmp-" in entry.name]
+    assert leftovers == []
+
+
+async def test_atomic_write_crash_before_rename_keeps_original_and_no_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = anyio.Path(tmp_path) / "meta.json"
+    await atomic_write_text(target, "original")
+
+    async def boom(staging: object, final: object) -> None:
+        raise RuntimeError("crash before rename")
+
+    monkeypatch.setattr("athome.cache.publish", boom)
+    with pytest.raises(RuntimeError, match="crash before rename"):
+        await atomic_write_text(target, "replacement")
+    assert await target.read_text() == "original"
+    leftovers = [entry.name async for entry in anyio.Path(tmp_path).iterdir() if ".tmp-" in entry.name]
+    assert leftovers == []
+
+
+async def test_open_with_explicit_root_writes_under_it(tmp_path: Path) -> None:
+    cache = Cache.open("blobs", version=1, root=tmp_path / "cd")
+    path = await cache.put_bytes(cache.key("x"), b"data")
+    assert str(path).startswith(str(tmp_path / "cd"))
+    assert not str(path).startswith(str(load(AthomeSettings).cache_root))
+    assert await cache.get_bytes(cache.key("x")) == b"data"
+
+
+async def test_open_explicit_roots_are_isolated(tmp_path: Path) -> None:
+    a = Cache.open("ns", version=1, root=tmp_path / "a")
+    b = Cache.open("ns", version=1, root=tmp_path / "b")
+    await a.put_bytes(a.key("k"), b"in-a")
+    assert a.root != b.root
+    assert await b.get_bytes(b.key("k")) is None
+    assert await a.get_bytes(a.key("k")) == b"in-a"
+
+
+async def test_open_default_root_uses_settings(tmp_path: Path) -> None:
+    cache = Cache.open("defaultns", version=1)
+    path = await cache.put_bytes(cache.key("x"), b"data")
+    assert str(path).startswith(str(load(AthomeSettings).cache_root))

@@ -73,6 +73,13 @@ def remove_path(path: os.PathLike[str] | str) -> None:
         os.unlink(path)
 
 
+def write_fsync(path: str, data: bytes) -> None:
+    with open(path, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def heartbeat_fresh(staging: pathlib.Path, cutoff: float) -> bool:
     with suppress(FileNotFoundError):
         return staging.with_name(staging.name + HEARTBEAT_SUFFIX).stat().st_mtime >= cutoff
@@ -106,6 +113,31 @@ async def publish(staging: Path, final: Path) -> None:
         if error.errno not in (errno.ENOTEMPTY, errno.EEXIST):
             raise
         await discard(staging)
+
+
+async def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Atomically write ``data`` to ``path`` via a temp sibling, ``fsync``, and :func:`os.replace`.
+
+    Parent directories are created as needed. A reader never observes a partial write, and a crash
+    before the rename leaves any existing file at ``path`` intact. For standalone files at a
+    caller-chosen path (transcripts, labels, ``meta.json``); use :class:`Cache` for content-keyed entries.
+
+    Example:
+        >>> await atomic_write_text(root / "meta.json", json.dumps(meta))
+    """
+    await path.parent.mkdir(parents=True, exist_ok=True)
+    staging = path.parent / f"{path.name}.tmp-{uuid4().hex}"
+    try:
+        await to_thread.run_sync(write_fsync, str(staging), data)
+        await publish(staging, path)
+    except BaseException:
+        await discard(staging)
+        raise
+
+
+async def atomic_write_text(path: Path, text: str) -> None:
+    """Atomically write ``text`` as UTF-8 to ``path``; see :func:`atomic_write_bytes`."""
+    await atomic_write_bytes(path, text.encode())
 
 
 async def entry_size(path: Path) -> int:
@@ -159,11 +191,15 @@ class Cache:
     root: Path
 
     @classmethod
-    def open(cls, namespace: str, *, version: int) -> Cache:
-        """Open (creating on first use) the cache tree for ``namespace`` at ``version``, sweeping stale temps."""
+    def open(cls, namespace: str, *, version: int, root: pathlib.Path | None = None) -> Cache:
+        """Open (creating on first use) the cache tree for ``namespace`` at ``version``, sweeping stale temps.
+
+        Pass ``root`` to override the settings ``cache_root`` for this cache only (a CLI ``--cache-dir``
+        flag, a throwaway test directory) without mutating the process-wide settings singleton.
+        """
         if not NAMESPACE_RE.fullmatch(namespace) or namespace in {".", ".."}:
             raise CacheKeyError(f"invalid cache namespace {namespace!r}")
-        base = load(AthomeSettings).cache_root / namespace / f"v{version}"
+        base = (root or load(AthomeSettings).cache_root) / namespace / f"v{version}"
         base.mkdir(parents=True, exist_ok=True)
         sweep_stale_tmps(base)
         return cls(namespace, version, Path(base))
