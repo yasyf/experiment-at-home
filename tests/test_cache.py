@@ -11,6 +11,7 @@ import pytest
 from click.testing import CliRunner
 
 from athome.cache import (
+    ACTIVE_STAGING,
     HEARTBEAT_SUFFIX,
     STALE_TMP_SECONDS,
     Cache,
@@ -77,6 +78,23 @@ async def test_write_discards_staging_on_error() -> None:
     shard = cache.root / key.digest[:2]
     leftovers = [entry.name async for entry in shard.iterdir()] if await shard.exists() else []
     assert leftovers == []
+
+
+async def test_write_cleans_up_eagerly_on_cancellation() -> None:
+    cache = Cache.open("cancelled", version=1)
+    key = cache.key("interrupted")
+    with anyio.move_on_after(0.05) as scope:
+        async with cache.write(key) as staging:
+            await staging.mkdir()
+            await (staging / "part").write_bytes(b"partial")
+            await anyio.sleep(30)
+
+    assert scope.cancelled_caught
+    assert await cache.get(key) is None
+    shard = cache.root / key.digest[:2]
+    residue = [entry.name async for entry in shard.iterdir()] if await shard.exists() else []
+    assert residue == []
+    assert ACTIVE_STAGING == set()
 
 
 async def test_version_bump_isolates_entries() -> None:

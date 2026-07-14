@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import aiosqlite
 import anyio
@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 LOCKED_RETRY_ATTEMPTS = 4
 LOCKED_RETRY_BASE_DELAY = 0.1
 LOCKED_RETRY_MAX_DELAY = 2.0
+
+type Synchronous = Literal["NORMAL", "FULL"]
 
 
 @dataclass(slots=True)
@@ -32,12 +34,26 @@ class Store:
 
     @classmethod
     @asynccontextmanager
-    async def open(cls, path: Path, *, schema: str, busy_timeout_ms: int = 5000) -> AsyncIterator[Store]:
+    async def open(
+        cls, path: Path, *, schema: str, busy_timeout_ms: int = 5000, synchronous: Synchronous = "NORMAL"
+    ) -> AsyncIterator[Store]:
+        """Open ``path`` with WAL, ``busy_timeout_ms``, ``synchronous``, and ``schema`` applied.
+
+        Pass ``synchronous="FULL"`` when an already-committed transaction must survive a power loss or
+        OS crash — under WAL the ``"NORMAL"`` default is corruption-safe but can roll back the most
+        recent commits in that case, so durability-critical writers (financial records, ledgers) want
+        ``"FULL"`` and caches keep the faster default.
+
+        Example:
+            >>> async with Store.open(path, schema=SCHEMA, synchronous="FULL") as store: ...
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(path) as db:
-            await db.execute("PRAGMA journal_mode=WAL")
-            await db.execute("PRAGMA synchronous=NORMAL")
+            # Armed before the WAL flip: converting a brand-new DB takes an exclusive lock, so a
+            # concurrent open would return SQLITE_BUSY instead of waiting.
             await db.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute(f"PRAGMA synchronous={synchronous}")
             await db.execute("PRAGMA foreign_keys=ON")
             await db.executescript(schema)
             db.row_factory = aiosqlite.Row

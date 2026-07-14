@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 import click
-from anyio import Path, to_thread
+from anyio import CancelScope, Path, to_thread
 
 from athome.cli import coro, emit, json_option
 from athome.config import AthomeSettings, load
@@ -103,7 +103,10 @@ def sweep_stale_tmps(root: pathlib.Path) -> None:
 
 
 async def discard(path: Path) -> None:
-    await to_thread.run_sync(remove_path, path)
+    # Shielded: cleanup runs on the cancellation path, where an unshielded await re-raises immediately
+    # and strands the staging path for the stale-temp sweep (or forever, for temps outside a cache tree).
+    with CancelScope(shield=True):
+        await to_thread.run_sync(remove_path, path)
 
 
 async def publish(staging: Path, final: Path) -> None:

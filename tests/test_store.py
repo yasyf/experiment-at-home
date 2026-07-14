@@ -12,6 +12,8 @@ from athome.store import Store
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from athome.store import Synchronous
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
     id INTEGER PRIMARY KEY,
@@ -101,6 +103,41 @@ async def test_busy_timeout_override_reflected(tmp_path: Path) -> None:
         row = await store.fetch_one("PRAGMA busy_timeout")
         assert row is not None
         assert row[0] == 30000
+
+
+@pytest.mark.parametrize(
+    ("synchronous", "level"),
+    [("NORMAL", 1), ("FULL", 2)],
+    ids=["normal", "full"],
+)
+async def test_synchronous_pragma_applied(tmp_path: Path, synchronous: Synchronous, level: int) -> None:
+    async with Store.open(tmp_path / "db.sqlite", schema=SCHEMA, synchronous=synchronous) as store:
+        row = await store.fetch_one("PRAGMA synchronous")
+        assert row is not None
+        assert row[0] == level
+
+
+async def test_synchronous_defaults_to_normal(tmp_path: Path) -> None:
+    async with Store.open(tmp_path / "db.sqlite", schema=SCHEMA) as store:
+        row = await store.fetch_one("PRAGMA synchronous")
+        assert row is not None
+        assert row[0] == 1
+
+
+async def test_busy_timeout_armed_before_wal_flip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    executed: list[str] = []
+    execute = aiosqlite.Connection.execute
+
+    async def record(self: aiosqlite.Connection, sql: str, *args: object, **kwargs: object) -> aiosqlite.Cursor:
+        executed.append(sql)
+        return await execute(self, sql, *args, **kwargs)
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", record)
+    async with Store.open(tmp_path / "db.sqlite", schema=SCHEMA, busy_timeout_ms=7000):
+        pass
+
+    pragmas = [sql for sql in executed if sql.startswith("PRAGMA")]
+    assert pragmas.index("PRAGMA busy_timeout=7000") < pragmas.index("PRAGMA journal_mode=WAL")
 
 
 async def test_execute_retries_until_lock_released(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
