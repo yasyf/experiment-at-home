@@ -311,6 +311,19 @@ def hide(monkeypatch: pytest.MonkeyPatch, missing: str) -> None:
     monkeypatch.setattr(importlib.util, "find_spec", lambda name, *args: None if name == missing else real(name, *args))
 
 
+def show(monkeypatch: pytest.MonkeyPatch, present: str) -> None:
+    """Make one module importable to ``find_spec`` even where it is not installed.
+
+    The inverse of :func:`hide`, so a probe that turns on a package's presence can be driven both
+    ways in a run that does not have it — the free-threaded job installs no torch.
+    """
+    real = importlib.util.find_spec
+    spec = importlib.machinery.ModuleSpec(present, None)
+    monkeypatch.setattr(
+        importlib.util, "find_spec", lambda name, *args: spec if name == present else real(name, *args)
+    )
+
+
 def test_supports_sft_always_and_the_name_is_stable() -> None:
     assert TinkerBackend.supports("sft")
     assert TinkerBackend.name == "tinker"
@@ -318,6 +331,8 @@ def test_supports_sft_always_and_the_name_is_stable() -> None:
 
 def test_supports_dpo_only_where_torch_can_back_the_custom_loss(monkeypatch: pytest.MonkeyPatch) -> None:
     """#9 — `supports("dpo")` claimed True without torch, so select() picked tinker and then died."""
+    show(monkeypatch, "torch")
+
     assert TinkerBackend.supports("dpo")
 
     hide(monkeypatch, "torch")

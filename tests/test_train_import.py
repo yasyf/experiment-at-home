@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import sysconfig
+
+import pytest
 
 HEAVY = ("tinker", "mlx", "mlx_lm", "torch", "trl", "peft", "transformers", "datasets", "modal")
+FREE_THREADED = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
 
 
 def test_importing_train_pulls_in_no_heavy_dependency() -> None:
@@ -13,6 +17,7 @@ def test_importing_train_pulls_in_no_heavy_dependency() -> None:
     assert not set(HEAVY) & sys.modules.keys()
 
 
+@pytest.mark.skipif(not FREE_THREADED, reason="`-X gil=0` is fatal on a GIL-enabled build, not ignored")
 def test_train_imports_clean_with_the_gil_disabled() -> None:
     probe = (
         "import sys, athome.train, athome.train.sidecar;"
