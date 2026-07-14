@@ -42,8 +42,14 @@ class TrainBackend(Protocol):
         """Construct the backend from its configuration section."""
         ...
 
-    async def train(self, spec: TrainSpec, *, sink: RunSink) -> Checkpoint:
-        """Train ``spec``, journaling progress to ``sink``, and converge on a servable artifact."""
+    async def train(self, spec: TrainSpec, *, sink: RunSink, work_dir: Path) -> Checkpoint:
+        """Train ``spec``, journaling progress to ``sink``, and converge on a servable artifact.
+
+        Every file the run writes — data splits, adapters, the fused model — goes under
+        ``work_dir``, which :func:`athome.train.run` mints fresh per run. A backend never
+        derives its own output directory: two runs of one family would then overwrite each
+        other's weights, including weights the registry has already registered.
+        """
         ...
 
 

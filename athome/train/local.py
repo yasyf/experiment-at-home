@@ -11,7 +11,7 @@ from athome.config import load
 from athome.errors import AthomeError
 from athome.train import sidecar
 from athome.train.data import normalize, render_mlx_jsonl
-from athome.train.spec import Checkpoint, LocalTrainSettings, TrainSettings
+from athome.train.spec import Checkpoint, LocalTrainSettings
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -154,16 +154,17 @@ class LocalBackend:
         """Construct the backend from the ``[train.local]`` config section."""
         return cls(load(LocalTrainSettings))
 
-    async def train(self, spec: TrainSpec, *, sink: RunSink) -> Checkpoint:
+    async def train(self, spec: TrainSpec, *, sink: RunSink, work_dir: Path) -> Checkpoint:
         """Train ``spec``'s LoRA with mlx-lm and fuse it into a standalone MLX model.
 
-        The run's work directory holds everything the sidecar reads and writes: the
+        ``work_dir`` holds everything the sidecar reads and writes: the
         ``{train,valid}.jsonl`` split, the ``lora.yaml`` config, the trained adapter,
         and the fused model that becomes the checkpoint's serve path.
 
         Args:
             spec: The fine-tuning request; its method must be ``sft``.
             sink: Journals the data split, the sidecar argv, and the fused artifact.
+            work_dir: The run's private working directory, minted by :func:`athome.train.run`.
 
         Returns:
             A :class:`~athome.train.spec.Checkpoint` whose ``mlx_path`` is the fused
@@ -173,12 +174,11 @@ class LocalBackend:
             UnsupportedLoraShape: The spec's :class:`~athome.train.spec.LoraSpec` asks
                 for an adapter mlx-lm cannot express.
         """
-        run_dir = load(TrainSettings).work_root / spec.name
-        adapter_dir = run_dir / ADAPTER_DIR
-        config = lora_config(spec.lora, run_dir / LORA_CONFIG)
+        adapter_dir = work_dir / ADAPTER_DIR
+        config = lora_config(spec.lora, work_dir / LORA_CONFIG)
         examples = await normalize(spec.dataset, method="sft")
         data_dir = render_mlx_jsonl(
-            examples, run_dir / DATA_DIR, val_fraction=self.settings.val_fraction, seed=spec.hyperparams.seed
+            examples, work_dir / DATA_DIR, val_fraction=self.settings.val_fraction, seed=spec.hyperparams.seed
         )
         await sink.append({"stage": "data", "examples": len(examples), "data_dir": str(data_dir)})
         command = lora_command(
@@ -190,7 +190,7 @@ class LocalBackend:
         )
         await sink.append({"stage": "train", "command": list(command)})
         await sidecar.run_process(command)
-        fused = await sidecar.fuse(adapter_dir, run_dir / FUSED_DIR, base=spec.base)
+        fused = await sidecar.fuse(adapter_dir, work_dir / FUSED_DIR, base=spec.base)
         await sink.append({"stage": "fused", "mlx_path": str(fused)})
         return Checkpoint(
             base=spec.base,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -11,7 +11,7 @@ from athome import registry, serve, train
 from athome.bakeoff import Arm, ArmResult, BakeoffSpec, Leaderboard
 from athome.config import load
 from athome.progress import load_journal
-from athome.train.spec import BASE_MODELS, Checkpoint, Hyperparams, LocalJsonlRef, TrainSpec
+from athome.train.spec import BASE_MODELS, Checkpoint, Hyperparams, LocalJsonlRef, TrainSettings, TrainSpec
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -19,9 +19,11 @@ if TYPE_CHECKING:
     from openai import AsyncOpenAI
 
     from athome.progress import RunSink
+    from athome.registry import VersionInfo
     from athome.train.spec import BackendName, Method
 
 FUSED = Path("/runs/watcher/fused")
+WEIGHTS = "model.safetensors"
 BASELINE = Arm(name="base", base_url="http://127.0.0.1:8400/v1", model="mlx-community/Qwen3-8B-4bit")
 
 
@@ -43,16 +45,28 @@ def spec(**overrides: object) -> TrainSpec:
     )
 
 
-def checkpoint() -> Checkpoint:
+def checkpoint(*, mlx_path: Path = FUSED, adapter_dir: Path = Path("/runs/watcher/adapter")) -> Checkpoint:
     return Checkpoint(
         base=BASE_MODELS["qwen3-8b"],
         backend="tinker",
         method="sft",
         step=10,
-        mlx_path=FUSED,
-        adapter_dir=Path("/runs/watcher/adapter"),
+        mlx_path=mlx_path,
+        adapter_dir=adapter_dir,
         train_cost_usd=1.25,
     )
+
+
+def fuse(work_dir: Path, weights: bytes) -> Path:
+    """Write a fused MLX directory under ``work_dir``, the way a real backend would."""
+    fused = work_dir / "fused"
+    fused.mkdir(parents=True)
+    (fused / WEIGHTS).write_bytes(weights)
+    return fused
+
+
+def weights_of(version: VersionInfo) -> bytes:
+    return (train.model_path(version) / WEIGHTS).read_bytes()
 
 
 def leaderboard(*, winner: str, passed_gate: bool, metric: float = 0.9) -> Leaderboard:
@@ -68,9 +82,13 @@ def leaderboard(*, winner: str, passed_gate: bool, metric: float = 0.9) -> Leade
 
 @dataclass(slots=True)
 class FakeBackend:
+    """Fuses distinct weights per run into whatever ``work_dir`` it is handed."""
+
     name: ClassVar[BackendName] = "tinker"
-    trained: list[TrainSpec]
-    sinks: list[RunSink]
+    trained: list[TrainSpec] = field(default_factory=list)
+    sinks: list[RunSink] = field(default_factory=list)
+    work_dirs: list[Path] = field(default_factory=list)
+    checkpoints: list[Checkpoint] = field(default_factory=list)
 
     @staticmethod
     def available() -> bool:
@@ -82,13 +100,16 @@ class FakeBackend:
 
     @classmethod
     def from_settings(cls) -> FakeBackend:
-        return cls([], [])
+        return cls()
 
-    async def train(self, spec: TrainSpec, *, sink: RunSink) -> Checkpoint:
+    async def train(self, spec: TrainSpec, *, sink: RunSink, work_dir: Path) -> Checkpoint:
         self.trained.append(spec)
         self.sinks.append(sink)
+        self.work_dirs.append(work_dir)
         await sink.append({"event": "step", "step": 10})
-        return checkpoint()
+        fused = fuse(work_dir, f"weights-{len(self.trained)}".encode())
+        self.checkpoints.append(trained := checkpoint(mlx_path=fused, adapter_dir=work_dir / "adapter"))
+        return trained
 
 
 class FakeServer:
@@ -133,14 +154,15 @@ def backend(monkeypatch: pytest.MonkeyPatch) -> FakeBackend:
     return chosen
 
 
-def stub_bakeoff(monkeypatch: pytest.MonkeyPatch, board: Leaderboard) -> list[BakeoffSpec]:
+def stub_bakeoff(monkeypatch: pytest.MonkeyPatch, *boards: Leaderboard) -> list[BakeoffSpec]:
+    """Stub the bake-off with one board per run; the final board answers every run after it."""
     from athome import bakeoff
 
     ran: list[BakeoffSpec] = []
 
     async def fake_run(spec: BakeoffSpec) -> Leaderboard:
         ran.append(spec)
-        return board
+        return boards[min(len(ran), len(boards)) - 1]
 
     monkeypatch.setattr(bakeoff, "run", fake_run)
     return ran
@@ -154,18 +176,81 @@ async def test_run_trains_evaluates_registers_and_promotes_the_winner(
     result = await train.run(spec(), evaluation=evaluation())
 
     assert backend.trained == [spec()]
-    assert result.checkpoint == checkpoint()
+    assert result.checkpoint == backend.checkpoints[0]
     assert result.metric == 0.9
     assert result.promoted is True
 
-    root = tmp_path / "registry"
-    promoted = await registry.current("watcher", root=root)
+    promoted = await registry.current("watcher", root=tmp_path / "registry")
     assert promoted is not None and promoted.version == result.version.version
-    assert promoted.metadata["mlx_path"] == str(FUSED)
+    assert promoted.metadata["source_mlx_path"] == str(backend.checkpoints[0].mlx_path)
     assert promoted.metadata["backend"] == "tinker"
     assert promoted.metadata["metric"] == 0.9
-    assert json.loads((result.version.path / train.CHECKPOINT_FILE).read_text())["mlx_path"] == str(FUSED)
+    assert json.loads((result.version.path / train.CHECKPOINT_FILE).read_text())["source_mlx_path"] == str(
+        backend.checkpoints[0].mlx_path
+    )
     assert len(ran) == 1
+
+
+async def test_the_registry_owns_a_frozen_copy_of_the_weights_it_registers(
+    monkeypatch: pytest.MonkeyPatch, backend: FakeBackend
+) -> None:
+    stub_bakeoff(monkeypatch, leaderboard(winner=train.TRAINED_ARM, passed_gate=True))
+
+    result = await train.run(spec(), evaluation=evaluation())
+
+    assert train.model_path(result.version) == result.version.path / train.MODEL_DIR
+    assert weights_of(result.version) == b"weights-1"
+    assert (train.model_path(result.version) / WEIGHTS).stat().st_mode & 0o222 == 0
+
+
+async def test_a_second_run_cannot_mutate_a_registered_or_promoted_version(
+    monkeypatch: pytest.MonkeyPatch, backend: FakeBackend, tmp_path: Path
+) -> None:
+    # MUTABLE CHECKPOINTS: a registered version used to be a pointer into the run's scratch dir,
+    # so a rerun of the family overwrote v001's weights — even when the challenger lost.
+    stub_bakeoff(
+        monkeypatch,
+        leaderboard(winner=train.TRAINED_ARM, passed_gate=True),
+        leaderboard(winner="base", passed_gate=False, metric=0.2),
+    )
+
+    winner = await train.run(spec(), evaluation=evaluation())
+    challenger = await train.run(spec(), evaluation=evaluation())
+
+    assert (winner.promoted, challenger.promoted) == (True, False)
+    assert backend.work_dirs[0] != backend.work_dirs[1]
+    assert weights_of(winner.version) == b"weights-1"
+    assert weights_of(challenger.version) == b"weights-2"
+    promoted = await registry.current("watcher", root=tmp_path / "registry")
+    assert promoted is not None and promoted.version == winner.version.version
+    assert weights_of(promoted) == b"weights-1"
+
+
+async def test_every_run_gets_its_own_work_dir(monkeypatch: pytest.MonkeyPatch, backend: FakeBackend) -> None:
+    stub_bakeoff(monkeypatch, leaderboard(winner=train.TRAINED_ARM, passed_gate=True))
+
+    await train.run(spec(), evaluation=evaluation())
+    await train.run(spec(), evaluation=evaluation())
+
+    first, second = backend.work_dirs
+    assert first != second
+    assert first.parent == second.parent == load(TrainSettings).work_root / "watcher"
+    assert (first / "fused" / WEIGHTS).read_bytes() == b"weights-1"
+    assert (second / "fused" / WEIGHTS).read_bytes() == b"weights-2"
+
+
+async def test_every_run_evaluates_on_its_own_port(monkeypatch: pytest.MonkeyPatch, backend: FakeBackend) -> None:
+    # PORT COLLISION: every evaluation used to serve on the one hardcoded port 8410, so two
+    # concurrent runs contended for a single server identity and one saw the other's model.
+    stub_bakeoff(monkeypatch, leaderboard(winner=train.TRAINED_ARM, passed_gate=True))
+
+    await train.run(spec(), evaluation=evaluation())
+    await train.run(spec(), evaluation=evaluation())
+
+    ports = [port for _, port in FakeServer.ensured]
+    assert len(set(ports)) == 2
+    assert all(port > 0 for port in ports)
+    assert FakeServer.stopped == FakeServer.ensured
 
 
 async def test_run_appends_the_trained_arm_to_the_evaluation_bakeoff(
@@ -178,21 +263,21 @@ async def test_run_appends_the_trained_arm_to_the_evaluation_bakeoff(
     arms = ran[0].arms
     assert [arm.name for arm in arms] == ["base", train.TRAINED_ARM]
     assert arms[0] is BASELINE  # the caller's baseline arm is untouched
-    assert arms[-1].base_url == f"http://127.0.0.1:{train.EVAL_PORT}/v1"
-    assert arms[-1].model == str(FUSED)
+    assert arms[-1].base_url == f"http://127.0.0.1:{FakeServer.ensured[0][1]}/v1"
+    assert arms[-1].model == str(backend.checkpoints[0].mlx_path)
     assert arms[-1].client_factory is not None
     assert (ran[0].task, ran[0].corpus, ran[0].primary_metric) == (task, ("a", "b"), "exact")
 
 
-async def test_run_serves_the_fused_artifact_on_the_eval_port_and_tears_it_down(
+async def test_run_serves_the_fused_artifact_and_tears_it_down(
     monkeypatch: pytest.MonkeyPatch, backend: FakeBackend
 ) -> None:
     stub_bakeoff(monkeypatch, leaderboard(winner="base", passed_gate=False))
 
     await train.run(spec(), evaluation=evaluation())
 
-    assert FakeServer.ensured == [(str(FUSED), train.EVAL_PORT)]
-    assert FakeServer.stopped == [(str(FUSED), train.EVAL_PORT)]
+    assert [model for model, _ in FakeServer.ensured] == [str(backend.checkpoints[0].mlx_path)]
+    assert FakeServer.stopped == FakeServer.ensured
 
 
 async def test_run_stops_the_server_when_the_bakeoff_raises(
@@ -207,7 +292,8 @@ async def test_run_stops_the_server_when_the_bakeoff_raises(
 
     with pytest.raises(RuntimeError, match="exploded"):
         await train.run(spec(), evaluation=evaluation())
-    assert FakeServer.stopped == [(str(FUSED), train.EVAL_PORT)]
+    assert FakeServer.stopped == FakeServer.ensured
+    assert [model for model, _ in FakeServer.stopped] == [str(backend.checkpoints[0].mlx_path)]
 
 
 async def test_run_registers_but_does_not_promote_a_loser(
@@ -245,30 +331,37 @@ async def test_run_writes_the_research_metric_channel(
     assert json.loads((tmp_path / train.METRIC_FILE).read_text()) == {train.METRIC_KEY: 0.77}
 
 
-async def test_run_journals_progress_to_the_work_root(
+async def test_run_journals_progress_to_its_own_work_dir(
     monkeypatch: pytest.MonkeyPatch, backend: FakeBackend, tmp_path: Path
 ) -> None:
     stub_bakeoff(monkeypatch, leaderboard(winner=train.TRAINED_ARM, passed_gate=True))
 
     result = await train.run(spec(), evaluation=evaluation())
 
-    journal = tmp_path / "runs" / "watcher" / train.JOURNAL_FILE
+    journal = backend.work_dirs[0] / train.JOURNAL_FILE
     records = load_journal(journal)
+    assert journal.parent.parent == tmp_path / "runs" / "watcher"
     assert [record["event"] for record in records] == ["selected", "step", "trained", "registered"]
     assert records[0]["backend"] == "tinker"
+    assert records[0]["work_dir"] == str(backend.work_dirs[0])
     assert records[-1]["version"] == result.version.version
     assert records[-1]["promoted"] is True
     assert backend.sinks[0].path == journal
 
 
-async def test_register_writes_a_pointer_entry_and_never_promotes(tmp_path: Path) -> None:
+async def test_register_copies_the_model_into_the_version_and_never_promotes(tmp_path: Path) -> None:
     root = tmp_path / "registry"
-    info = await train.register("watcher", FUSED, {"source": "manual"}, root=root)
+    fused = fuse(tmp_path / "scratch", b"weights-manual")
 
-    assert info.metadata["mlx_path"] == str(FUSED)
+    info = await train.register("watcher", fused, {"source": "manual"}, root=root)
+
+    assert info.metadata["source_mlx_path"] == str(fused)
+    assert info.metadata["model_dir"] == train.MODEL_DIR
     assert info.metadata["source"] == "manual"
+    assert weights_of(info) == b"weights-manual"
     assert json.loads((info.path / train.CHECKPOINT_FILE).read_text()) == {
-        "mlx_path": str(FUSED),
+        "source_mlx_path": str(fused),
+        "model_dir": train.MODEL_DIR,
         "source": "manual",
     }
     assert await registry.current("watcher", root=root) is None

@@ -7,16 +7,19 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import anyio
+import anyio.to_thread
 
-from athome.errors import AthomeError
+from athome.errors import ResearchError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
@@ -24,14 +27,23 @@ if TYPE_CHECKING:
 METADATA_NAME = "metadata.json"
 CURRENT_LINK = "current"
 STAGING_PREFIX = f".{CURRENT_LINK}.tmp."
+VERSION_STAGING_PREFIX = ".version.tmp."
 VERSION_PATTERN = re.compile(r"^v(\d{3,})-(\d{8})-([0-9a-f]{12})$")
 DIGEST_CHARS = 12
 LOCK_SUFFIX = ".lock"
 LOCK_POLL_SECONDS = 0.01
+READ_ONLY_MODE = 0o444
+DIGEST_CHUNK_BYTES = 1 << 20
 
 
-class RegistryError(AthomeError):
-    """The registry cannot satisfy the request: an unknown version, or an empty registration."""
+class RegistryError(ResearchError):
+    """The registry cannot satisfy the request: an unknown version, or an empty registration.
+
+    Subclasses :class:`~athome.errors.ResearchError` — the registry grew out of the research
+    harness, and an ``except ResearchError`` around a registry call predates its promotion to
+    :mod:`athome.registry`, so it must keep catching. Outside research, catch this or
+    :class:`~athome.errors.AthomeError`.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,12 +95,19 @@ async def register(
 ) -> VersionInfo:
     """Writes a new immutable version directory under ``root``; never flips ``current``.
 
-    The directory name embeds the next version number, today's date, and a
-    12-hex content digest over the artifact files. ``metadata.json`` is the
-    caller's metadata stamped with ``name``, ``version``, and ``created_at``.
+    The registry owns what it registers: every path source is *copied* into the version
+    directory, so the registered artifact is the registry's own and no later writer to the
+    source can mutate it. The copies land read-only. The directory name embeds the next
+    version number, today's date, and a 12-hex content digest over the stored artifact files,
+    and ``metadata.json`` is the caller's metadata stamped with ``name``, ``version``, and
+    ``created_at``.
+
+    The version is staged under a temporary name and renamed into place, so a reader never
+    sees a half-copied version directory.
 
     Args:
-        files: Artifact file name to content — raw bytes, or a path to copy.
+        files: Artifact entry name to content — raw bytes, a file to copy, or a directory
+            to copy as a tree (its files are digested under ``<entry>/<relative path>``).
         metadata: The version's provenance: dataset digest, config, metrics.
         root: The registry root the family lives under.
 
@@ -97,21 +116,20 @@ async def register(
     """
     if not files:
         raise RegistryError(f"refusing to register an empty {name} version")
-    snapshot = {
-        filename: content if isinstance(content, bytes) else await anyio.Path(content).read_bytes()
-        for filename, content in files.items()
-    }
     family = anyio.Path(root) / name
     async with _family_lock(family):
         number = existing[-1].number + 1 if (existing := await versions(name, root=root)) else 1
         now = datetime.now(UTC)
-        version = f"v{number:03d}-{now:%Y%m%d}-{_digest(snapshot)}"
-        path = family / version
-        await path.mkdir(parents=True)
-        for filename, payload in snapshot.items():
-            await (path / filename).write_bytes(payload)
+        staging = family / f"{VERSION_STAGING_PREFIX}{uuid4().hex}"
+        await staging.mkdir(parents=True)
+        for filename, content in files.items():
+            await _materialize(staging / filename, content)
+        version = f"v{number:03d}-{now:%Y%m%d}-{await _digest(staging)}"
         stamped = dict(metadata) | {"name": name, "version": version, "created_at": now.isoformat()}
-        await (path / METADATA_NAME).write_text(json.dumps(stamped, indent=2, sort_keys=True, default=str) + "\n")
+        await (staging / METADATA_NAME).write_text(json.dumps(stamped, indent=2, sort_keys=True, default=str) + "\n")
+        path = family / version
+        await staging.rename(path)
+        await _freeze(path)
     return VersionInfo(name=name, version=version, path=Path(path), metadata=stamped)
 
 
@@ -148,6 +166,36 @@ async def _family_lock(family: anyio.Path) -> AsyncIterator[None]:
         os.close(fd)
 
 
+async def _materialize(destination: anyio.Path, content: bytes | Path) -> None:
+    await destination.parent.mkdir(parents=True, exist_ok=True)
+    match content:
+        case bytes():
+            await destination.write_bytes(content)
+        case Path() if content.is_dir():
+            await anyio.to_thread.run_sync(partial(shutil.copytree, content, destination))
+        case Path():
+            await anyio.to_thread.run_sync(shutil.copy2, content, destination)
+
+
+async def _digest(staging: anyio.Path) -> str:
+    hasher = hashlib.sha256()
+    stored = [path async for path in staging.rglob("*") if await path.is_file()]
+    for name, path in sorted((str(path.relative_to(staging)), path) for path in stored):
+        hasher.update(name.encode())
+        hasher.update(b"\0")
+        async with await path.open("rb") as handle:
+            while chunk := await handle.read(DIGEST_CHUNK_BYTES):
+                hasher.update(chunk)
+        hasher.update(b"\0")
+    return hasher.hexdigest()[:DIGEST_CHARS]
+
+
+async def _freeze(path: anyio.Path) -> None:
+    async for child in path.rglob("*"):
+        if await child.is_file():
+            await child.chmod(READ_ONLY_MODE)
+
+
 async def _info(name: str, path: anyio.Path) -> VersionInfo:
     metadata_path = path / METADATA_NAME
     metadata = json.loads(await metadata_path.read_text()) if await metadata_path.exists() else {}
@@ -160,13 +208,3 @@ async def _resolve(name: str, version: str, *, root: Path) -> VersionInfo:
         listing = ", ".join(info.version for info in known) or "none registered"
         raise RegistryError(f"no {name} version {version!r} ({listing})")
     return matches[-1]
-
-
-def _digest(files: Mapping[str, bytes]) -> str:
-    hasher = hashlib.sha256()
-    for filename in sorted(files):
-        hasher.update(filename.encode())
-        hasher.update(b"\0")
-        hasher.update(files[filename])
-        hasher.update(b"\0")
-    return hasher.hexdigest()[:DIGEST_CHARS]

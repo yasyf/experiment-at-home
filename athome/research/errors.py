@@ -2,8 +2,4 @@
 
 from __future__ import annotations
 
-from athome.errors import AthomeError
-
-
-class ResearchError(AthomeError):
-    """Root of every athome research-harness error (a blocking preflight or loop failure)."""
+from athome.errors import ResearchError as ResearchError

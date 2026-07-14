@@ -402,8 +402,22 @@ def test_an_overridden_server_is_a_distinct_process_from_the_configured_one(
     assert (configured.served_model, configured.served_port) == ("mlx-community/Qwen3-4bit", 8400)
     assert (override.served_model, override.served_port) == ("/runs/watcher/fused", 8410)
     assert (configured.run_name, configured.label) == ("serve-rapid-mlx", "com.athome.serve-rapid-mlx")
-    assert (override.run_name, override.label) == ("serve-rapid-mlx-8410", "com.athome.serve-rapid-mlx-8410")
+    assert override.run_name == f"serve-rapid-mlx-{override.identity}"
+    assert override.label == f"com.athome.serve-rapid-mlx-{override.identity}"
+    assert override.identity.startswith("8410-")
     assert override.handle().base_url == "http://127.0.0.1:8410/v1"
+
+
+def test_two_overridden_servers_never_share_an_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    # PORT COLLISION: identity used to be the port alone, so two runs that landed on one port
+    # shared a run name and a launchd label, and each tore down the other's process.
+    configure_rapid_mlx(monkeypatch)
+    mine = ManagedServer("rapid-mlx", model="/runs/watcher/a/fused", port=8410)
+    yours = ManagedServer("rapid-mlx", model="/runs/watcher/b/fused", port=8410)
+    elsewhere = ManagedServer("rapid-mlx", model="/runs/watcher/a/fused", port=8411)
+
+    assert len({server.run_name for server in (mine, yours, elsewhere)}) == 3
+    assert len({server.label for server in (mine, yours, elsewhere)}) == 3
 
 
 async def test_ensure_spawns_the_overridden_model_under_its_own_run_name(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -419,10 +433,11 @@ async def test_ensure_spawns_the_overridden_model_under_its_own_run_name(monkeyp
     mock_models(monkeypatch, "/runs/watcher/fused")
     monkeypatch.setattr(serve.detach, "launch", fake_launch)
 
-    handle = await ManagedServer("rapid-mlx", model="/runs/watcher/fused", port=8410).ensure()
+    server = ManagedServer("rapid-mlx", model="/runs/watcher/fused", port=8410)
+    handle = await server.ensure()
 
     assert captured["command"] == command_for("rapid-mlx", model="/runs/watcher/fused", port=8410)
-    assert captured["name"] == "serve-rapid-mlx-8410"
+    assert captured["name"] == f"serve-rapid-mlx-{server.identity}"
     assert handle.port == 8410
     assert handle.base_url == "http://127.0.0.1:8410/v1"
 
@@ -446,11 +461,12 @@ async def test_stopping_an_overridden_server_leaves_the_configured_one_alone(
 ) -> None:
     configure_rapid_mlx(monkeypatch)
     killed: list[int] = []
+    override = ManagedServer("rapid-mlx", model="/runs/watcher/fused", port=8410)
     monkeypatch.setattr(serve.launchd, "installed", lambda **_: ["com.athome.serve-rapid-mlx"])
-    monkeypatch.setattr(serve.detach, "running", lambda name: 4242 if name == "serve-rapid-mlx-8410" else 7777)
+    monkeypatch.setattr(serve.detach, "running", lambda name: 4242 if name == override.run_name else 7777)
     monkeypatch.setattr(serve, "kill_group", killed.append)
 
-    await ManagedServer("rapid-mlx", model="/runs/watcher/fused", port=8410).stop()
+    await override.stop()
 
     assert killed == [4242]
 

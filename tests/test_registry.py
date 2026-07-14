@@ -10,7 +10,9 @@ import pytest
 from athome import registry
 from athome.registry import (
     DIGEST_CHARS,
+    METADATA_NAME,
     STAGING_PREFIX,
+    VERSION_STAGING_PREFIX,
     RegistryError,
     VersionInfo,
     current,
@@ -90,6 +92,51 @@ async def test_path_source_is_read_once_so_digest_matches_stored_bytes(
 
     stored = (info.path / "m").read_bytes()
     assert info.version.split("-")[2] == content_digest({"m": stored})
+
+
+async def test_register_copies_a_directory_tree_the_registry_then_owns(tmp_path: Path) -> None:
+    # MUTABLE CHECKPOINTS: a version that pointed at a caller's scratch directory was mutable —
+    # the next writer to that directory silently rewrote already-registered weights.
+    source = tmp_path / "scratch" / "fused"
+    (source / "nested").mkdir(parents=True)
+    (source / "model.safetensors").write_bytes(b"weights")
+    (source / "nested" / "config.json").write_bytes(b"{}")
+
+    info = await register("toy", {"model": source, "checkpoint.json": b"{}"}, {}, root=tmp_path)
+
+    assert (info.path / "model" / "model.safetensors").read_bytes() == b"weights"
+    assert (info.path / "model" / "nested" / "config.json").read_bytes() == b"{}"
+
+    (source / "model.safetensors").write_bytes(b"clobbered")
+    assert (info.path / "model" / "model.safetensors").read_bytes() == b"weights"
+
+
+async def test_registered_files_are_frozen_read_only(tmp_path: Path) -> None:
+    source = tmp_path / "scratch" / "fused"
+    source.mkdir(parents=True)
+    (source / "model.safetensors").write_bytes(b"weights")
+
+    info = await register("toy", {"model": source}, {}, root=tmp_path)
+
+    assert (info.path / "model" / "model.safetensors").stat().st_mode & 0o222 == 0
+    assert (info.path / METADATA_NAME).stat().st_mode & 0o222 == 0
+    with pytest.raises(PermissionError):
+        (info.path / "model" / "model.safetensors").write_bytes(b"clobbered")
+
+
+async def test_a_directory_digest_addresses_the_tree_and_leaves_no_staging(tmp_path: Path) -> None:
+    def tree(where: Path, weights: bytes) -> Path:
+        (where / "nested").mkdir(parents=True)
+        (where / "nested" / "model.safetensors").write_bytes(weights)
+        return where
+
+    same = await register("toy", {"model": tree(tmp_path / "a", b"weights")}, {}, root=tmp_path)
+    twin = await register("other", {"model": tree(tmp_path / "b", b"weights")}, {}, root=tmp_path)
+    differs = await register("third", {"model": tree(tmp_path / "c", b"other")}, {}, root=tmp_path)
+
+    assert same.version.split("-")[2] == twin.version.split("-")[2]
+    assert same.version.split("-")[2] != differs.version.split("-")[2]
+    assert not any(child.name.startswith(VERSION_STAGING_PREFIX) for child in (tmp_path / "toy").iterdir())
 
 
 async def test_versions_are_ordered_and_register_never_promotes(tmp_path: Path) -> None:

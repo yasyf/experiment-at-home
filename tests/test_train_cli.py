@@ -15,7 +15,7 @@ from athome.config import load
 from athome.detach import DetachedRun
 from athome.train import cli as train_cli
 from athome.train.spec import BASE_MODELS, Hyperparams, LocalJsonlRef, TrainSpec
-from tests.test_train_run import checkpoint, evaluation, leaderboard
+from tests.test_train_run import WEIGHTS, checkpoint, evaluation, fuse, leaderboard
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -59,8 +59,11 @@ def test_load_train_spec_rejects_a_target_that_is_not_a_train_spec() -> None:
         train_cli.load_train_spec("tests.test_train_cli:TARGET")
 
 
-def test_run_trains_in_the_foreground_and_reports_the_result(monkeypatch: pytest.MonkeyPatch, train_root: Path) -> None:
-    version = anyio.run(lambda: train.register("watcher", Path("/runs/watcher/fused"), {}, root=train_root))
+def test_run_trains_in_the_foreground_and_reports_the_result(
+    monkeypatch: pytest.MonkeyPatch, train_root: Path, tmp_path: Path
+) -> None:
+    fused = fuse(tmp_path / "scratch", b"weights")
+    version = anyio.run(lambda: train.register("watcher", fused, {}, root=train_root))
     trained: list[TrainSpec] = []
 
     async def fake_run(spec: TrainSpec, *, evaluation: BakeoffSpec) -> train.TrainResult:
@@ -115,10 +118,12 @@ def test_run_detached_launches_the_same_invocation_under_a_run_name(monkeypatch:
     assert launched["name"] == "train-watcher"
 
 
-def test_status_reports_the_registry_and_the_live_run(monkeypatch: pytest.MonkeyPatch, train_root: Path) -> None:
+def test_status_reports_the_registry_and_the_live_run(
+    monkeypatch: pytest.MonkeyPatch, train_root: Path, tmp_path: Path
+) -> None:
     async def seed() -> tuple[str, str]:
-        first = await train.register("watcher", Path("/runs/a"), {}, root=train_root)
-        second = await train.register("watcher", Path("/runs/b"), {}, root=train_root)
+        first = await train.register("watcher", fuse(tmp_path / "a", b"a"), {}, root=train_root)
+        second = await train.register("watcher", fuse(tmp_path / "b", b"b"), {}, root=train_root)
         await registry.promote("watcher", second.version, root=train_root)
         return first.version, second.version
 
@@ -137,24 +142,21 @@ def test_status_of_an_unregistered_family_is_empty(monkeypatch: pytest.MonkeyPat
     assert invoke("status", "nobody") == {"name": "nobody", "running": None, "current": None, "versions": []}
 
 
-def test_register_records_a_pointer_and_promotes_on_demand(tmp_path: Path, train_root: Path) -> None:
-    fused = tmp_path / "fused"
-    fused.mkdir()
+def test_register_copies_the_model_in_and_promotes_on_demand(tmp_path: Path, train_root: Path) -> None:
+    fused = fuse(tmp_path / "scratch", b"weights-manual")
 
     record = invoke("register", "watcher", str(fused), "--promote")
 
     promoted = anyio.run(lambda: registry.current("watcher", root=train_root))
     assert record["promoted"] is True
     assert promoted is not None and promoted.version == record["version"]
-    assert promoted.metadata["mlx_path"] == str(fused.resolve())
+    assert promoted.metadata["source_mlx_path"] == str(fused.resolve())
     assert promoted.metadata["source"] == "manual"
+    assert (train.model_path(promoted) / WEIGHTS).read_bytes() == b"weights-manual"
 
 
 def test_register_without_promote_leaves_current_unset(tmp_path: Path, train_root: Path) -> None:
-    fused = tmp_path / "fused"
-    fused.mkdir()
-
-    record = invoke("register", "watcher", str(fused))
+    record = invoke("register", "watcher", str(fuse(tmp_path / "scratch", b"weights-manual")))
 
     assert record["promoted"] is False
     assert anyio.run(lambda: registry.current("watcher", root=train_root)) is None

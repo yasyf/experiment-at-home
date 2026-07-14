@@ -22,9 +22,8 @@ EXAMPLES = 8
 
 
 @pytest.fixture(autouse=True)
-def settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ATHOME_TRAIN_MLX_LM_VERSION", VERSION)
-    monkeypatch.setenv("ATHOME_TRAIN_WORK_ROOT", str(tmp_path / "runs"))
     monkeypatch.setenv("ATHOME_TRAIN_LOCAL_VAL_FRACTION", str(VAL_FRACTION))
     load.cache_clear()
 
@@ -71,7 +70,8 @@ def spec(corpus: LocalJsonlRef, **overrides: object) -> TrainSpec:
 
 
 def run_dir(tmp_path: Path) -> Path:
-    return tmp_path / "runs" / "watcher"
+    """The private work directory ``athome.train.run`` mints for one run and hands the backend."""
+    return tmp_path / "runs" / "watcher" / "20260714-120000-0f1e2d3c"
 
 
 def test_local_trains_sft_and_never_dpo() -> None:
@@ -102,7 +102,7 @@ def test_available_only_on_an_arm64_mac_that_can_launch_the_sidecar(
 async def test_train_writes_the_seeded_mlx_chat_split(
     commands: list[Sequence[str]], corpus: LocalJsonlRef, sink: RunSink, tmp_path: Path
 ) -> None:
-    await LocalBackend.from_settings().train(spec(corpus), sink=sink)
+    await LocalBackend.from_settings().train(spec(corpus), sink=sink, work_dir=run_dir(tmp_path))
 
     data = run_dir(tmp_path) / "data"
     splits = {
@@ -121,7 +121,7 @@ async def test_train_writes_the_seeded_mlx_chat_split(
 async def test_train_runs_the_pinned_mlx_lm_lora_sidecar(
     commands: list[Sequence[str]], corpus: LocalJsonlRef, sink: RunSink, tmp_path: Path
 ) -> None:
-    await LocalBackend.from_settings().train(spec(corpus), sink=sink)
+    await LocalBackend.from_settings().train(spec(corpus), sink=sink, work_dir=run_dir(tmp_path))
 
     assert commands[0] == (
         "uvx",
@@ -164,7 +164,9 @@ async def test_train_runs_the_pinned_mlx_lm_lora_sidecar(
 async def test_the_lora_shape_rides_the_config_file_mlx_lm_has_no_flags_for(
     commands: list[Sequence[str]], corpus: LocalJsonlRef, sink: RunSink, tmp_path: Path
 ) -> None:
-    await LocalBackend.from_settings().train(spec(corpus, lora=LoraSpec(rank=8, alpha=32, dropout=0.05)), sink=sink)
+    await LocalBackend.from_settings().train(
+        spec(corpus, lora=LoraSpec(rank=8, alpha=32, dropout=0.05)), sink=sink, work_dir=run_dir(tmp_path)
+    )
 
     assert json.loads((run_dir(tmp_path) / "lora.yaml").read_text()) == {
         "lora_parameters": {"rank": 8, "scale": 4.0, "dropout": 0.05, "keys": list(STD_MODULES)}
@@ -188,7 +190,7 @@ async def test_the_lora_toggles_filter_the_keys_mlx_lm_wraps(
     lora: LoraSpec,
     expected: list[str],
 ) -> None:
-    await LocalBackend.from_settings().train(spec(corpus, lora=lora), sink=sink)
+    await LocalBackend.from_settings().train(spec(corpus, lora=lora), sink=sink, work_dir=run_dir(tmp_path))
 
     assert json.loads((run_dir(tmp_path) / "lora.yaml").read_text())["lora_parameters"]["keys"] == expected
 
@@ -202,22 +204,26 @@ async def test_the_lora_toggles_filter_the_keys_mlx_lm_wraps(
     ids=["unembed-is-inexpressible", "no-trainable-module"],
 )
 async def test_a_lora_shape_mlx_lm_cannot_express_raises_before_anything_runs(
-    commands: list[Sequence[str]], corpus: LocalJsonlRef, sink: RunSink, lora: LoraSpec, match: str
+    commands: list[Sequence[str]], corpus: LocalJsonlRef, sink: RunSink, tmp_path: Path, lora: LoraSpec, match: str
 ) -> None:
     with pytest.raises(UnsupportedLoraShape, match=match):
-        await LocalBackend.from_settings().train(spec(corpus, lora=lora), sink=sink)
+        await LocalBackend.from_settings().train(spec(corpus, lora=lora), sink=sink, work_dir=run_dir(tmp_path))
 
     assert commands == []
     assert not sink.path.exists()
 
 
 async def test_grad_checkpoint_off_drops_the_flag(
-    commands: list[Sequence[str]], corpus: LocalJsonlRef, sink: RunSink, monkeypatch: pytest.MonkeyPatch
+    commands: list[Sequence[str]],
+    corpus: LocalJsonlRef,
+    sink: RunSink,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("ATHOME_TRAIN_LOCAL_GRAD_CHECKPOINT", "false")
     load.cache_clear()
 
-    await LocalBackend.from_settings().train(spec(corpus), sink=sink)
+    await LocalBackend.from_settings().train(spec(corpus), sink=sink, work_dir=run_dir(tmp_path))
 
     assert "--grad-checkpoint" not in commands[0]
 
@@ -225,7 +231,7 @@ async def test_grad_checkpoint_off_drops_the_flag(
 async def test_the_fused_model_is_the_checkpoints_serve_path(
     commands: list[Sequence[str]], corpus: LocalJsonlRef, sink: RunSink, tmp_path: Path
 ) -> None:
-    checkpoint = await LocalBackend.from_settings().train(spec(corpus), sink=sink)
+    checkpoint = await LocalBackend.from_settings().train(spec(corpus), sink=sink, work_dir=run_dir(tmp_path))
 
     assert commands[1] == (
         "uvx",
@@ -247,14 +253,18 @@ async def test_the_fused_model_is_the_checkpoints_serve_path(
     assert (checkpoint.base, checkpoint.backend, checkpoint.method, checkpoint.step) == (BASE, "local", "sft", 120)
 
 
-async def test_local_training_is_free(commands: list[Sequence[str]], corpus: LocalJsonlRef, sink: RunSink) -> None:
-    assert (await LocalBackend.from_settings().train(spec(corpus), sink=sink)).train_cost_usd == 0.0
+async def test_local_training_is_free(
+    commands: list[Sequence[str]], corpus: LocalJsonlRef, sink: RunSink, tmp_path: Path
+) -> None:
+    trained = await LocalBackend.from_settings().train(spec(corpus), sink=sink, work_dir=run_dir(tmp_path))
+
+    assert trained.train_cost_usd == 0.0
 
 
 async def test_train_journals_every_stage(
     commands: list[Sequence[str]], corpus: LocalJsonlRef, sink: RunSink, tmp_path: Path
 ) -> None:
-    await LocalBackend.from_settings().train(spec(corpus), sink=sink)
+    await LocalBackend.from_settings().train(spec(corpus), sink=sink, work_dir=run_dir(tmp_path))
 
     records = [json.loads(line) for line in sink.path.read_text().splitlines()]
     assert [record["stage"] for record in records] == ["data", "train", "fused"]

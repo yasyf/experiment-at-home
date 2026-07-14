@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import shlex
 import signal
@@ -26,6 +27,7 @@ RECIPES: tuple[Recipe, ...] = ("rapid-mlx", "mlx-vlm", "llama-server")
 HEALTH_TIMEOUT_S = 1.0
 READY_TIMEOUT_S = 120.0
 READY_POLL_S = 1.0
+IDENTITY_CHARS = 8
 RECIPE_CHOICE = click.Choice(list(RECIPES))
 
 
@@ -187,14 +189,24 @@ class ManagedServer:
         return self.port if self.port is not None else settings_for(self.recipe).port
 
     @property
+    def identity(self) -> str:
+        """What distinguishes an overridden server: the port it listens on and the model it serves.
+
+        The model belongs in the identity, not just the port: two runs that land on one port
+        would otherwise share a run name and a launchd label, and each would tear down the
+        other's process while verifying it served the wrong model.
+        """
+        return f"{self.served_port}-{hashlib.sha256(str(self.served_model).encode()).hexdigest()[:IDENTITY_CHARS]}"
+
+    @property
     def run_name(self) -> str:
         """The detach run name owning this server's process."""
-        return detach_name(self.recipe) if self.model is None else f"{detach_name(self.recipe)}-{self.served_port}"
+        return detach_name(self.recipe) if self.model is None else f"{detach_name(self.recipe)}-{self.identity}"
 
     @property
     def label(self) -> str:
         """The launchd label owning this server's agent."""
-        return agent_label(self.recipe) if self.model is None else f"{agent_label(self.recipe)}-{self.served_port}"
+        return agent_label(self.recipe) if self.model is None else f"{agent_label(self.recipe)}-{self.identity}"
 
     def handle(self, *, pid: int | None = None) -> ServerHandle:
         port = self.served_port

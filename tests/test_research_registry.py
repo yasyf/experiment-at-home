@@ -9,6 +9,7 @@ from athome import registry, train
 from athome.config import load
 from athome.errors import AthomeError
 from athome.research import registry as research_registry
+from athome.research.errors import ResearchError
 from athome.research.registry import (
     DIGEST_CHARS,
     METADATA_NAME,
@@ -24,6 +25,7 @@ from athome.research.registry import (
     versions,
 )
 from athome.train.spec import TrainSettings
+from tests.test_train_run import fuse
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -66,6 +68,20 @@ def test_registry_error_is_an_athome_error() -> None:
     assert issubclass(RegistryError, AthomeError)
 
 
+def test_registry_error_is_still_a_research_error() -> None:
+    # HIERARCHY: promoting the registry out of athome.research re-parented RegistryError onto
+    # AthomeError, so released `except ResearchError` around a registry call stopped catching.
+    assert issubclass(RegistryError, ResearchError)
+    assert issubclass(registry.RegistryError, ResearchError)
+
+
+async def test_an_except_research_error_still_catches_a_registry_failure(roots: tuple[Path, Path]) -> None:
+    with pytest.raises(ResearchError):
+        await register("toy", {}, {})
+    with pytest.raises(ResearchError):
+        await promote("toy", "v999")
+
+
 def test_the_research_root_default_is_unchanged() -> None:
     assert RegistrySettings().registry_root == Path.home() / ".athome/research/registry"
 
@@ -89,12 +105,12 @@ async def test_research_writes_to_its_configured_root_without_an_explicit_root(r
     assert [version.version for version in await versions("toy")] == [info.version]
 
 
-async def test_the_research_and_train_roots_are_isolated(roots: tuple[Path, Path]) -> None:
+async def test_the_research_and_train_roots_are_isolated(roots: tuple[Path, Path], tmp_path: Path) -> None:
     research, trained = roots
     assert load(TrainSettings).registry_root == trained
 
     researched = await register("watcher", {"m": b"research"}, {})
-    fused = await train.register("watcher", Path("/runs/watcher/fused"), {}, root=trained)
+    fused = await train.register("watcher", fuse(tmp_path / "scratch", b"weights"), {}, root=trained)
 
     assert researched.path.parent.parent == research
     assert fused.path.parent.parent == trained

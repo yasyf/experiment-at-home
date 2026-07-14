@@ -30,7 +30,7 @@ def fake_backend(backend_name: BackendName, *, present: bool, methods: frozenset
         def from_settings(cls) -> Fake:
             return cls()
 
-        async def train(self, spec: TrainSpec, *, sink: RunSink) -> Checkpoint:
+        async def train(self, spec: TrainSpec, *, sink: RunSink, work_dir: Path) -> Checkpoint:
             raise AssertionError("select must not train")
 
     return Fake
@@ -129,7 +129,7 @@ def test_selection_never_constructs_the_backends_it_passes_over(monkeypatch: pyt
             constructed.append(cls.name)
             return cls()
 
-        async def train(self, spec: TrainSpec, *, sink: RunSink) -> Checkpoint:
+        async def train(self, spec: TrainSpec, *, sink: RunSink, work_dir: Path) -> Checkpoint:
             raise AssertionError("select must not train")
 
     install(monkeypatch, tinker(), Counting)
