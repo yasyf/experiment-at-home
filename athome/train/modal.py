@@ -219,7 +219,7 @@ def train_image(settings: ModalTrainSettings, base: BaseModelSpec) -> object:
     return (
         modal.Image.debian_slim(python_version=PYTHON)
         .uv_sync()
-        .pip_install(
+        .uv_pip_install(
             *(f"{package}=={version}" for package, version in pinned_versions(settings).items()), "huggingface_hub"
         )
         .env({"HF_HUB_CACHE": HF_HUB_CACHE})

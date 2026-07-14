@@ -644,7 +644,7 @@ async def test_the_image_pins_the_trl_stack_and_bakes_the_base_at_its_revision(
     await train(tmp_path, train_spec(tmp_path))
 
     steps = {name: (args, kwargs) for name, args, kwargs in remote.image}
-    assert steps["pip_install"][0] == (
+    assert steps["uv_pip_install"][0] == (
         "trl==0.21.0",
         "peft==0.17.0",
         "torch==2.6.0",
@@ -654,7 +654,7 @@ async def test_the_image_pins_the_trl_stack_and_bakes_the_base_at_its_revision(
     )
     assert steps["add_local_python_source"] == (("athome",), {"copy": True})
     assert steps["run_function"] == ((train_modal.download_base,), {"args": (BASE.hf, BASE.hf_revision)})
-    assert list(steps) == ["debian_slim", "uv_sync", "pip_install", "env", "add_local_python_source", "run_function"]
+    assert list(steps) == ["debian_slim", "uv_sync", "uv_pip_install", "env", "add_local_python_source", "run_function"]
 
 
 async def test_the_checkpoint_is_the_fused_mlx_model_the_sidecar_produced(
