@@ -367,6 +367,94 @@ async def test_client_targets_recipe_endpoint() -> None:
     await client.close()
 
 
+def test_command_for_overrides_the_model_and_port_without_touching_the_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_rapid_mlx(monkeypatch)
+    assert command_for("rapid-mlx", model="/runs/watcher/fused", port=8410) == (
+        "uvx",
+        "--from",
+        "rapid-mlx==0.10.9",
+        "rapid-mlx",
+        "serve",
+        "/runs/watcher/fused",
+        "--port",
+        "8410",
+    )
+    assert load(serve.RapidMlxSettings).model == "mlx-community/Qwen3-4bit"
+    assert load(serve.RapidMlxSettings).port == 8400
+    assert command_for("rapid-mlx") == command_for("rapid-mlx", model=None, port=None)
+
+
+def test_command_for_refuses_an_override_on_llama_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    configure_llama_server(monkeypatch)
+    with pytest.raises(ServeError, match="no model or port override"):
+        command_for("llama-server", model="/runs/watcher/fused")
+
+
+def test_an_overridden_server_is_a_distinct_process_from_the_configured_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_rapid_mlx(monkeypatch)
+    configured = ManagedServer("rapid-mlx")
+    override = ManagedServer("rapid-mlx", model="/runs/watcher/fused", port=8410)
+
+    assert (configured.served_model, configured.served_port) == ("mlx-community/Qwen3-4bit", 8400)
+    assert (override.served_model, override.served_port) == ("/runs/watcher/fused", 8410)
+    assert (configured.run_name, configured.label) == ("serve-rapid-mlx", "com.athome.serve-rapid-mlx")
+    assert (override.run_name, override.label) == ("serve-rapid-mlx-8410", "com.athome.serve-rapid-mlx-8410")
+    assert override.handle().base_url == "http://127.0.0.1:8410/v1"
+
+
+async def test_ensure_spawns_the_overridden_model_under_its_own_run_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    configure_rapid_mlx(monkeypatch)
+    captured: dict[str, object] = {}
+
+    async def fake_launch(command: object, *, name: str) -> DetachedRun:
+        captured["command"] = tuple(command)  # type: ignore[arg-type]
+        captured["name"] = name
+        return DetachedRun(name=name, pid=1234, log_path=Path("/tmp/x.log"))
+
+    monkeypatch.setattr(ManagedServer, "health", health_sequence(False, True))
+    mock_models(monkeypatch, "/runs/watcher/fused")
+    monkeypatch.setattr(serve.detach, "launch", fake_launch)
+
+    handle = await ManagedServer("rapid-mlx", model="/runs/watcher/fused", port=8410).ensure()
+
+    assert captured["command"] == command_for("rapid-mlx", model="/runs/watcher/fused", port=8410)
+    assert captured["name"] == "serve-rapid-mlx-8410"
+    assert handle.port == 8410
+    assert handle.base_url == "http://127.0.0.1:8410/v1"
+
+
+async def test_ensure_rejects_an_overridden_port_serving_another_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    configure_rapid_mlx(monkeypatch)
+
+    async def fail_launch(command: object, *, name: str) -> DetachedRun:
+        raise AssertionError("must not spawn over a port serving a different model")
+
+    monkeypatch.setattr(ManagedServer, "health", health_sequence(True))
+    mock_models(monkeypatch, "mlx-community/Qwen3-4bit")
+    monkeypatch.setattr(serve.detach, "launch", fail_launch)
+
+    with pytest.raises(ServeError, match="/runs/watcher/fused"):
+        await ManagedServer("rapid-mlx", model="/runs/watcher/fused", port=8410).ensure()
+
+
+async def test_stopping_an_overridden_server_leaves_the_configured_one_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_rapid_mlx(monkeypatch)
+    killed: list[int] = []
+    monkeypatch.setattr(serve.launchd, "installed", lambda **_: ["com.athome.serve-rapid-mlx"])
+    monkeypatch.setattr(serve.detach, "running", lambda name: 4242 if name == "serve-rapid-mlx-8410" else 7777)
+    monkeypatch.setattr(serve, "kill_group", killed.append)
+
+    await ManagedServer("rapid-mlx", model="/runs/watcher/fused", port=8410).stop()
+
+    assert killed == [4242]
+
+
 @pytest.mark.live
 async def test_rapid_mlx_live_smoke(monkeypatch: pytest.MonkeyPatch) -> None:
     configure_rapid_mlx(monkeypatch)

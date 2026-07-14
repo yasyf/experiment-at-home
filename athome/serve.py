@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import shlex
 import signal
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, ClassVar, Literal
 
 import anyio
@@ -92,7 +92,8 @@ def settings_for(recipe: Recipe) -> RecipeSettings:
             return load(LlamaServerSettings)
 
 
-def command_for(recipe: Recipe) -> tuple[str, ...]:
+def command_for(recipe: Recipe, *, model: str | None = None, port: int | None = None) -> tuple[str, ...]:
+    """The recipe's command vector; ``model`` and ``port`` override its configured pair."""
     match recipe:
         case "rapid-mlx":
             settings = load(RapidMlxSettings)
@@ -102,9 +103,9 @@ def command_for(recipe: Recipe) -> tuple[str, ...]:
                 f"rapid-mlx=={settings.version}",
                 "rapid-mlx",
                 "serve",
-                settings.model,
+                model or settings.model,
                 "--port",
-                str(settings.port),
+                str(port or settings.port),
             )
         case "mlx-vlm":
             settings = load(MlxVlmSettings)
@@ -114,11 +115,13 @@ def command_for(recipe: Recipe) -> tuple[str, ...]:
                 f"mlx-vlm=={settings.version}",
                 "mlx_vlm.server",
                 "--model",
-                settings.model,
+                model or settings.model,
                 "--port",
-                str(settings.port),
+                str(port or settings.port),
             )
         case "llama-server":
+            if model is not None or port is not None:
+                raise ServeError("llama-server is a full command string; it takes no model or port override")
             return tuple(shlex.split(load(LlamaServerSettings).command))
 
 
@@ -158,20 +161,48 @@ def kill_group(pid: int) -> None:
 class ManagedServer:
     """A recipe-configured OpenAI-compatible local server with lifecycle + health.
 
+    ``model`` and ``port`` override the recipe's configured pair for one server — serving an
+    arbitrary artifact (a freshly fused MLX directory, say) without touching the process-global
+    settings. An overridden server is a distinct managed process: it carries its own detach run
+    name and launchd label, so it neither adopts nor tears down the config-driven one.
+
     Example:
         >>> server = ManagedServer("rapid-mlx")
         >>> handle = await server.ensure()
+        >>> fused = ManagedServer("rapid-mlx", model="/runs/watcher/fused", port=8410)
     """
 
     recipe: Recipe
+    model: str | None = field(default=None, kw_only=True)
+    port: int | None = field(default=None, kw_only=True)
+
+    @property
+    def served_model(self) -> str | None:
+        """The model this server serves: the override, else the recipe's configured model."""
+        return self.model if self.model is not None else configured_model(self.recipe)
+
+    @property
+    def served_port(self) -> int:
+        """The port this server listens on: the override, else the recipe's configured port."""
+        return self.port if self.port is not None else settings_for(self.recipe).port
+
+    @property
+    def run_name(self) -> str:
+        """The detach run name owning this server's process."""
+        return detach_name(self.recipe) if self.model is None else f"{detach_name(self.recipe)}-{self.served_port}"
+
+    @property
+    def label(self) -> str:
+        """The launchd label owning this server's agent."""
+        return agent_label(self.recipe) if self.model is None else f"{agent_label(self.recipe)}-{self.served_port}"
 
     def handle(self, *, pid: int | None = None) -> ServerHandle:
-        port = settings_for(self.recipe).port
+        port = self.served_port
         return ServerHandle(recipe=self.recipe, port=port, pid=pid, base_url=f"http://127.0.0.1:{port}/v1")
 
     async def health(self) -> bool:
         """Return ``True`` when ``GET /v1/models`` answers 2xx within the health timeout."""
-        url = f"http://127.0.0.1:{settings_for(self.recipe).port}/v1/models"
+        url = f"http://127.0.0.1:{self.served_port}/v1/models"
         async with health_client() as client:
             try:
                 response = await client.get(url)
@@ -180,14 +211,14 @@ class ManagedServer:
         return response.is_success
 
     async def verify_served_model(self) -> None:
-        """Raise :class:`ServeError` unless ``GET /v1/models`` lists this recipe's configured model.
+        """Raise :class:`ServeError` unless ``GET /v1/models`` lists the model this server serves.
 
         This is an identity check, not authentication: a hostile process holding the port could
         spoof the model id, and trusting a localhost endpoint is inherent to the design.
         """
-        if (want := configured_model(self.recipe)) is None:
+        if (want := self.served_model) is None:
             return
-        port = settings_for(self.recipe).port
+        port = self.served_port
         async with health_client() as client:
             response = await client.get(f"http://127.0.0.1:{port}/v1/models")
         if want not in (served := [model["id"] for model in response.json()["data"]]):
@@ -198,8 +229,9 @@ class ManagedServer:
         while True:
             healthy = await self.health()
             if anyio.current_time() >= deadline:
-                port = settings_for(self.recipe).port
-                raise HealthTimeout(f"{self.recipe} not healthy on port {port} after {READY_TIMEOUT_S:.0f}s")
+                raise HealthTimeout(
+                    f"{self.recipe} not healthy on port {self.served_port} after {READY_TIMEOUT_S:.0f}s"
+                )
             if healthy:
                 await self.verify_served_model()
                 return
@@ -225,21 +257,21 @@ class ManagedServer:
         """
         if await self.health():
             await self.verify_served_model()
-            return self.handle(pid=detach.running(detach_name(self.recipe)))
-        command = command_for(self.recipe)
+            return self.handle(pid=detach.running(self.run_name))
+        command = command_for(self.recipe, model=self.model, port=self.port)
         pid: int | None = None
         try:
             if persistent:
                 await launchd.install(
                     AgentSpec(
-                        label=agent_label(self.recipe),
+                        label=self.label,
                         command=command,
                         schedule=KeepAlive(),
-                        log_name=detach_name(self.recipe),
+                        log_name=self.run_name,
                     )
                 )
             else:
-                pid = (await detach.launch(command, name=detach_name(self.recipe))).pid
+                pid = (await detach.launch(command, name=self.run_name)).pid
             await self.wait_healthy()
         except BaseException:
             with anyio.CancelScope(shield=True):
@@ -253,12 +285,12 @@ class ManagedServer:
         The two teardowns run independently: a launchd uninstall failure never skips the
         detached-process kill.
         """
-        if agent_label(self.recipe) in launchd.installed():
+        if self.label in launchd.installed():
             try:
-                await launchd.uninstall(agent_label(self.recipe))
+                await launchd.uninstall(self.label)
             except LaunchdError:
                 pass
-        if (pid := detach.running(detach_name(self.recipe))) is not None:
+        if (pid := detach.running(self.run_name)) is not None:
             try:
                 kill_group(pid)
             except ProcessLookupError:

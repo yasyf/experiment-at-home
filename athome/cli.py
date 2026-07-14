@@ -108,6 +108,7 @@ main = click.version_option(package_name="experiment-at-home")(
             "bakeoff": ("athome.bakeoff:cli", "Run an A/B/N endpoint bake-off from a spec module."),
             "hf": ("athome.hf:cli", "Pull and push pinned Hugging Face snapshots."),
             "research": ("athome.research.cli:cli", "Run and inspect overnight autoresearch loops."),
+            "train": ("athome.train.cli:cli", "Fine-tune a LoRA, bake it off, and register the artifact."),
         },
     )
 )

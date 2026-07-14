@@ -140,6 +140,33 @@ reference:
     desc: The shared aiosqlite scaffold.
     contents:
       - store.Store
+  - title: Registry
+    desc: Content-addressed artifact versions with an atomic current promotion.
+    contents:
+      - registry.VersionInfo
+      - registry.versions
+      - registry.current
+      - registry.register
+      - registry.promote
+      - registry.RegistryError
+  - title: Train
+    desc: LoRA fine-tuning over tinker, local mlx-lm, or modal.
+    contents:
+      - train.TrainSpec
+      - train.TrainResult
+      - train.Checkpoint
+      - train.BaseModelSpec
+      - train.Hyperparams
+      - train.LoraSpec
+      - train.HfDatasetRef
+      - train.LocalJsonlRef
+      - train.TrainSettings
+      - train.TrainBackend
+      - train.run
+      - train.evaluate
+      - train.register
+      - train.select
+      - train.NoBackendAvailable
   - title: OCR types
     desc: Protocols for token- and document-level OCR engines.
     contents:

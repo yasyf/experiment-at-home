@@ -34,6 +34,15 @@ modal = ["modal>=0.66"]
 hf = ["huggingface-hub>=0.26"]
 embed = ["numpy>=2", "sentence-transformers>=3"]
 research = ["numpy>=2"]
+# mlx / mlx-lm run in a uvx sidecar, and trl / peft / transformers only exist inside
+# the Modal image — neither belongs in the installed dependency set.
+train = ["tinker>=0.22", "datasets>=4", "modal>=0.66"]
+# Tinker DPO only. Its custom loss runs locally: `forward_backward_custom` returns
+# logprobs, and torch computes the log-sigmoid margin and backprops it into the
+# per-token weights. Modal DPO needs nothing here (torch lives in the Modal image),
+# and SFT needs nothing here at all — so torch stays out of `train` rather than
+# putting a multi-hundred-MB wheel in front of every user who only wants SFT.
+train-dpo = ["torch>=2.6"]
 dev = [
     "pytest>=8.0",
     "ruff>=0.8",

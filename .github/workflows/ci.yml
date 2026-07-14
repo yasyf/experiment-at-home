@@ -25,11 +25,13 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache-dependency-glob: uv.lock
 
-      - name: Sync (dev + llm)
+      - name: Sync (dev + llm + train-dpo)
         # The `llm` extra brings spawnllm so the research-judge suite runs with real
-        # coverage. Other extras (ocr's ocrmac is macOS-only; modal/hf/serve are mocked)
-        # stay out — their tests skip or mock. The free-threaded job below stays dev-only.
-        run: uv sync --extra dev --extra llm
+        # coverage. `train-dpo` brings torch, without which tinker's DPO loss — the whole
+        # custom-loss path — silently skips and ships unverified. Other extras (ocr's
+        # ocrmac is macOS-only; modal/hf/serve are mocked) stay out — their tests skip or
+        # mock. The free-threaded job below stays dev-only: torch has no 3.14t wheels.
+        run: uv sync --extra dev --extra llm --extra train-dpo
 
       - name: Type check (ty, warnings only)
         continue-on-error: true

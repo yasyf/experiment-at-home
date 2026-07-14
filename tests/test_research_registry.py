@@ -1,198 +1,129 @@
 from __future__ import annotations
 
-import hashlib
-import itertools
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-import anyio
 import pytest
 
-from athome.research import registry
+from athome import registry, train
+from athome.config import load
+from athome.errors import AthomeError
+from athome.research import registry as research_registry
 from athome.research.registry import (
     DIGEST_CHARS,
+    METADATA_NAME,
     STAGING_PREFIX,
+    VERSION_PATTERN,
     RegistryError,
+    RegistrySettings,
     VersionInfo,
     current,
     promote,
     register,
+    registry_root,
     versions,
 )
+from athome.train.spec import TrainSettings
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Iterator
 
 
-def content_digest(files: dict[str, bytes]) -> str:
-    hasher = hashlib.sha256()
-    for filename in sorted(files):
-        hasher.update(filename.encode())
-        hasher.update(b"\0")
-        hasher.update(files[filename])
-        hasher.update(b"\0")
-    return hasher.hexdigest()[:DIGEST_CHARS]
+@pytest.fixture
+def roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[Path, Path]]:
+    research, trained = tmp_path / "research-registry", tmp_path / "train-registry"
+    monkeypatch.setenv("ATHOME_RESEARCH_REGISTRY_ROOT", str(research))
+    monkeypatch.setenv("ATHOME_TRAIN_REGISTRY_ROOT", str(trained))
+    load.cache_clear()
+    yield research, trained
+    load.cache_clear()
 
 
-class Barrier:
-    """A minimal count-gated async barrier: every waiter blocks until ``n`` have arrived."""
-
-    def __init__(self, n: int) -> None:
-        self.n = n
-        self.count = 0
-        self.event = anyio.Event()
-
-    async def wait(self) -> None:
-        self.count += 1
-        if self.count >= self.n:
-            self.event.set()
-        await self.event.wait()
+def test_the_shim_re_exports_the_promoted_registry() -> None:
+    assert RegistryError is registry.RegistryError
+    assert VersionInfo is registry.VersionInfo
+    assert (DIGEST_CHARS, STAGING_PREFIX, METADATA_NAME, VERSION_PATTERN) == (
+        registry.DIGEST_CHARS,
+        registry.STAGING_PREFIX,
+        registry.METADATA_NAME,
+        registry.VERSION_PATTERN,
+    )
 
 
-async def promote_one(name: str, version: str, root: Path) -> None:
-    await promote(name, version, root=root)
+def test_the_research_package_still_exports_the_registry_surface() -> None:
+    import athome.research as research
+
+    assert (research.RegistryError, research.VersionInfo) == (RegistryError, VersionInfo)
+    assert (research.register, research.promote, research.versions, research.current) == (
+        register,
+        promote,
+        versions,
+        current,
+    )
 
 
-async def test_register_writes_a_content_addressed_version(tmp_path: Path) -> None:
-    info = await register("toy", {"model.bin": b"weights"}, {"metric": 0.9}, root=tmp_path)
-    assert info.name == "toy"
-    assert info.number == 1
-    era, date, digest = info.version.split("-")
-    assert era == "v001"
-    assert len(date) == 8 and date.isdigit()
-    assert len(digest) == 12
-    assert (info.path / "model.bin").read_bytes() == b"weights"
-    assert info.metadata["metric"] == 0.9
-    assert info.metadata["name"] == "toy"
-    assert info.metadata["version"] == info.version
+def test_registry_error_is_an_athome_error() -> None:
+    assert issubclass(RegistryError, AthomeError)
 
 
-async def test_content_addressing_reflects_the_bytes(tmp_path: Path) -> None:
-    a = await register("toy", {"m": b"same"}, {}, root=tmp_path)
-    b = await register("other", {"m": b"same"}, {}, root=tmp_path)
-    assert a.version.split("-")[2] == b.version.split("-")[2]
+def test_the_research_root_default_is_unchanged() -> None:
+    assert RegistrySettings().registry_root == Path.home() / ".athome/research/registry"
 
 
-async def test_path_source_is_read_once_so_digest_matches_stored_bytes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # DIGEST TOCTOU: reading a path source twice (digest, then write) lets it mutate between
-    # reads and store bytes that disagree with the version digest.
-    src = tmp_path / "weights.bin"
-    src.write_bytes(b"placeholder")
-    reads = itertools.count()
-
-    async def mutating_read(self: anyio.Path) -> bytes:
-        return f"content-{next(reads)}".encode()
-
-    monkeypatch.setattr(anyio.Path, "read_bytes", mutating_read)
-
-    info = await register("toy", {"m": src}, {}, root=tmp_path)
-
-    stored = (info.path / "m").read_bytes()
-    assert info.version.split("-")[2] == content_digest({"m": stored})
+def test_registry_root_falls_back_to_the_research_section(roots: tuple[Path, Path]) -> None:
+    research, _ = roots
+    assert registry_root() == research
+    assert registry_root(Path("/explicit")) == Path("/explicit")
 
 
-async def test_versions_are_ordered_and_register_never_promotes(tmp_path: Path) -> None:
-    await register("toy", {"m": b"a"}, {}, root=tmp_path)
-    await register("toy", {"m": b"b"}, {}, root=tmp_path)
-    assert [v.number for v in await versions("toy", root=tmp_path)] == [1, 2]
-    assert await current("toy", root=tmp_path) is None
+async def test_research_writes_to_its_configured_root_without_an_explicit_root(roots: tuple[Path, Path]) -> None:
+    research, trained = roots
+    info = await register("toy", {"m": b"a"}, {"metric": 0.5})
+    assert info.path.parent.parent == research
+    assert (info.path / METADATA_NAME).exists()
+    assert not trained.exists()
+
+    await promote("toy", info.version)
+    promoted = await current("toy")
+    assert promoted is not None and promoted.version == info.version
+    assert [version.version for version in await versions("toy")] == [info.version]
 
 
-async def test_register_refuses_an_empty_version(tmp_path: Path) -> None:
+async def test_the_research_and_train_roots_are_isolated(roots: tuple[Path, Path]) -> None:
+    research, trained = roots
+    assert load(TrainSettings).registry_root == trained
+
+    researched = await register("watcher", {"m": b"research"}, {})
+    fused = await train.register("watcher", Path("/runs/watcher/fused"), {}, root=trained)
+
+    assert researched.path.parent.parent == research
+    assert fused.path.parent.parent == trained
+    assert [version.version for version in await versions("watcher")] == [researched.version]
+    assert [version.version for version in await registry.versions("watcher", root=trained)] == [fused.version]
+
+    await promote("watcher", researched.version)
+    assert await registry.current("watcher", root=trained) is None
+    assert (await current("watcher")).version == researched.version  # type: ignore[union-attr]
+
+
+async def test_the_shim_delegates_to_the_promoted_registry(roots: tuple[Path, Path], tmp_path: Path) -> None:
+    calls: list[Path] = []
+    real_register = registry.register
+
+    async def recording_register(name: str, files: object, metadata: object, *, root: Path) -> VersionInfo:
+        calls.append(root)
+        return await real_register(name, files, metadata, root=root)  # type: ignore[arg-type]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(research_registry.registry, "register", recording_register)
+        await register("toy", {"m": b"a"}, {})
+        await register("toy", {"m": b"b"}, {}, root=tmp_path / "explicit")
+
+    assert calls == [roots[0], tmp_path / "explicit"]
+
+
+async def test_the_shim_still_raises_registry_error(roots: tuple[Path, Path]) -> None:
     with pytest.raises(RegistryError):
-        await register("toy", {}, {}, root=tmp_path)
-
-
-async def test_promote_is_an_atomic_symlink_swap(tmp_path: Path) -> None:
-    v1 = await register("toy", {"m": b"a"}, {}, root=tmp_path)
-    v2 = await register("toy", {"m": b"b"}, {}, root=tmp_path)
-
-    await promote("toy", v1.version, root=tmp_path)
-    promoted = await current("toy", root=tmp_path)
-    assert promoted is not None and promoted.version == v1.version
-
-    await promote("toy", "v002", root=tmp_path)
-    promoted = await current("toy", root=tmp_path)
-    assert promoted is not None and promoted.version == v2.version
-
-    family = tmp_path / "toy"
-    assert not any(child.name.startswith(STAGING_PREFIX) for child in family.iterdir())
-    assert (family / "current").is_symlink()
-    assert sorted(child.name for child in family.iterdir() if not child.is_symlink()) == [v1.version, v2.version]
-
-
-async def test_concurrent_promotions_do_not_clobber(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # WR4: two promotions of the same family race at the symlink step; a shared staging
-    # name makes one clobber the other, so both must use a unique per-promotion name.
-    v1 = await register("toy", {"m": b"a"}, {}, root=tmp_path)
-    v2 = await register("toy", {"m": b"b"}, {}, root=tmp_path)
-
-    barrier = Barrier(2)
-    real_symlink = anyio.Path.symlink_to
-
-    async def synced_symlink(self: anyio.Path, target: object, *args: object, **kwargs: object) -> None:
-        await barrier.wait()  # force both promotions to collide at the staging symlink
-        return await real_symlink(self, target, *args, **kwargs)
-
-    monkeypatch.setattr(anyio.Path, "symlink_to", synced_symlink)
-
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(promote_one, "toy", v1.version, tmp_path)
-        tg.start_soon(promote_one, "toy", v2.version, tmp_path)
-
-    promoted = await current("toy", root=tmp_path)
-    assert promoted is not None and promoted.version in {v1.version, v2.version}
-    family = tmp_path / "toy"
-    assert (family / "current").is_symlink()
-    assert not any(child.name.startswith(STAGING_PREFIX) for child in family.iterdir())
-    assert sorted(child.name for child in family.iterdir() if not child.is_symlink()) == [v1.version, v2.version]
-
-
-async def test_concurrent_registrations_mint_distinct_numbers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # SINGLE-WRITER: two registrations that read the next number concurrently must not both
-    # mint v001; the family-scoped lock serializes the read-number -> write window.
-    gate = anyio.Event()
-    readers = 0
-    real_versions = registry.versions
-
-    async def gated_versions(name: str, *, root: Path | None = None) -> list[VersionInfo]:
-        nonlocal readers
-        result = await real_versions(name, root=root)
-        readers += 1
-        if readers >= 2:
-            gate.set()  # a second reader arrived: release the first (unserialized) reader
-        else:
-            with anyio.move_on_after(0.25):  # serialized: no second reader comes, so time out
-                await gate.wait()
-        return result
-
-    monkeypatch.setattr(registry, "versions", gated_versions)
-
-    async def register_one(content: bytes) -> None:
-        await register("toy", {"m": content}, {}, root=tmp_path)
-
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(register_one, b"a")
-        tg.start_soon(register_one, b"b")
-
-    eras = sorted(info.version.split("-")[0] for info in await real_versions("toy", root=tmp_path))
-    assert eras == ["v001", "v002"]
-
-
-async def test_promote_resolves_a_bare_version_prefix(tmp_path: Path) -> None:
-    v1 = await register("toy", {"m": b"a"}, {}, root=tmp_path)
-    await promote("toy", "v001", root=tmp_path)
-    promoted = await current("toy", root=tmp_path)
-    assert promoted is not None and promoted.version == v1.version
-
-
-async def test_promote_unknown_version_raises(tmp_path: Path) -> None:
-    await register("toy", {"m": b"a"}, {}, root=tmp_path)
+        await register("toy", {}, {})
     with pytest.raises(RegistryError):
-        await promote("toy", "v999", root=tmp_path)
-
-
-async def test_versions_of_unknown_family_is_empty(tmp_path: Path) -> None:
-    assert await versions("nope", root=tmp_path) == []
-    assert await current("nope", root=tmp_path) is None
+        await promote("toy", "v999")
