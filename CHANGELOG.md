@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-14
+
+### Added
+- `athome.train` — LoRA fine-tuning over three backends, preferred **tinker > local > modal** and picked by availability (`athome train run|status|register`). SFT is first-class on all three; DPO runs on tinker and modal.
+  - Every backend converges on the same artifact: a **fused, standalone 4-bit MLX model**. `rapid-mlx` serves one model and has no adapter flag, so an unfused adapter is unservable — tinker and modal convert their PEFT adapter, local fuses.
+  - Tinker DPO goes through the SDK's custom-loss seam (`forward_backward_custom`): the SDK ships no preference loss, so athome renders chosen/rejected pairs, caches reference-policy logprobs, and backprops a log-sigmoid margin loss in torch. That path — and only that path — needs the new `train-dpo` extra.
+  - `athome.train.run` trains, serves the result, scores it through a bake-off, and writes a `.athome-metric.json` scalar — the same structured metric channel `athome.research` already reads, so pointing an `ExperimentSpec` at `athome train run` turns the overnight loop into a training-recipe search with no new machinery.
+  - Spend caps are hard aborts on both paid backends (tinker per-Mtok, modal per-GPU-hour).
+- `athome.registry` — the content-addressed version-dir + `current`-symlink registry, promoted out of `athome.research` so training and research share one promotion path. `athome.research.registry` keeps its imports and its on-disk root.
+- `ManagedServer.ensure(model=...)` — serve an arbitrary model path without mutating the process-global serve settings, so a freshly trained artifact can be evaluated in place.
+- `Store.open(..., synchronous=)` — callers that need durability can demand `FULL`.
+
+### Fixed
+- **The sidecar wire dropped Apple Vision entirely.** `ocrmac` returns text as `objc.pyobjc_unicode`, a `str` subclass: it passed `validate()`, then the restricted unpickler refused it (`refused builtins.str`), so OCR over a worker failed outright. `validate()` now coerces every primitive to its exact builtin — what the wire accepts is what a frame can carry — for every producer, not just this one. (`bool` is matched before `int`, so it survives as `bool`.)
+- Apple Vision boxes round their true corners instead of origin and size independently; consumers rebuild the far edge as `x + width`, so an independently rounded size drifted that edge off the real box.
+- `Cache.write` cleans its staging directory and marker under a shielded scope, so a cancelled write no longer strands them until the stale-temp sweep (which remains the backstop for process death).
+- `Store.open` arms `busy_timeout` **before** the WAL flip. Converting a brand-new database takes an exclusive lock, so a concurrent open was returning `SQLITE_BUSY` instead of waiting for it.
+
 ## [0.3.2] - 2026-07-14
 
 ### Added
@@ -64,7 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI gate asserting the core imports on Python 3.14 free-threaded with the GIL still disabled.
 - The in-repo `athome` Claude Code plugin (marketplace + `cache`/`overnight` skills).
 
-[Unreleased]: https://github.com/yasyf/experiment-at-home/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/yasyf/experiment-at-home/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/yasyf/experiment-at-home/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/yasyf/experiment-at-home/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/yasyf/experiment-at-home/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/yasyf/experiment-at-home/compare/v0.2.0...v0.3.0
