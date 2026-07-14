@@ -30,7 +30,8 @@ jobs:
         # coverage. `train-dpo` brings torch, without which tinker's DPO loss — the whole
         # custom-loss path — silently skips and ships unverified. Other extras (ocr's
         # ocrmac is macOS-only; modal/hf/serve are mocked) stay out — their tests skip or
-        # mock. The free-threaded job below stays dev-only: torch has no 3.14t wheels.
+        # mock. The free-threaded job below stays dev-only on purpose: its job is to prove
+        # the CORE imports with the GIL off, not to re-run the trainers.
         run: uv sync --extra dev --extra llm --extra train-dpo
 
       - name: Type check (ty, warnings only)
