@@ -6,6 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-07-14
+
+### Added
+- `Arm.client_factory` — an optional zero-argument builder for a bake-off arm's `AsyncOpenAI` client, so a remote or authenticated arm can supply a real API key (and optionally the `athome.llmcache` record-replay transport) instead of the default local client. An arm that omits it behaves exactly as before.
+
 ## [0.3.1] - 2026-07-13
 
 ### Added
@@ -59,7 +64,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI gate asserting the core imports on Python 3.14 free-threaded with the GIL still disabled.
 - The in-repo `athome` Claude Code plugin (marketplace + `cache`/`overnight` skills).
 
-[Unreleased]: https://github.com/yasyf/experiment-at-home/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/yasyf/experiment-at-home/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/yasyf/experiment-at-home/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/yasyf/experiment-at-home/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/yasyf/experiment-at-home/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/yasyf/experiment-at-home/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/yasyf/experiment-at-home/releases/tag/v0.1.0

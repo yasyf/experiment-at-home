@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib
 import random
 import statistics
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, ClassVar
 
 import anyio
@@ -41,6 +41,11 @@ class BakeoffSettings(SectionSettings):
 class Arm:
     """One endpoint under test: a name, an OpenAI-compatible base URL, and a model.
 
+    A remote or authenticated arm supplies ``client_factory``, a zero-argument builder
+    for its ``AsyncOpenAI`` client (a real key, and optionally the record-replay
+    transport from :mod:`athome.llmcache`); by default an arm builds a local client
+    against ``base_url``.
+
     Example:
         >>> Arm(name="rapid-mlx", base_url="http://127.0.0.1:8400/v1", model="Qwen3-4bit")
     """
@@ -48,6 +53,7 @@ class Arm:
     name: str
     base_url: str
     model: str
+    client_factory: Callable[[], AsyncOpenAI] | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +110,7 @@ class Leaderboard:
 def client_for(arm: Arm) -> AsyncOpenAI:
     from openai import AsyncOpenAI
 
-    return AsyncOpenAI(base_url=arm.base_url, api_key="local")
+    return arm.client_factory() if arm.client_factory else AsyncOpenAI(base_url=arm.base_url, api_key="local")
 
 
 async def run_arm(arm: Arm, spec: BakeoffSpec, *, concurrency: int) -> tuple[dict[str, object], ...]:

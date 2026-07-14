@@ -247,6 +247,41 @@ async def test_task_runs_once_per_corpus_item_per_arm(monkeypatch: pytest.Monkey
     assert sum(url == RAPID.base_url for url, _ in calls) == len(CORPUS)
 
 
+def test_client_for_defaults_to_local_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, str] = {}
+
+    class FakeAsyncOpenAI:
+        def __init__(self, *, base_url: str, api_key: str) -> None:
+            captured.update(base_url=base_url, api_key=api_key)
+
+    register_spec_module(monkeypatch, "openai", AsyncOpenAI=FakeAsyncOpenAI)
+    assert isinstance(bakeoff.client_for(LLAMA), FakeAsyncOpenAI)
+    assert captured == {"base_url": LLAMA.base_url, "api_key": "local"}
+
+
+def test_client_for_uses_injected_factory(monkeypatch: pytest.MonkeyPatch) -> None:
+    built = 0
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **_: object) -> None:
+            nonlocal built
+            built += 1
+
+    register_spec_module(monkeypatch, "openai", AsyncOpenAI=FakeAsyncOpenAI)
+    injected = FakeClient("http://cerebras/v1")
+    calls = 0
+
+    def factory() -> FakeClient:
+        nonlocal calls
+        calls += 1
+        return injected
+
+    arm = Arm(name="remote", base_url="http://cerebras/v1", model="m", client_factory=factory)
+    assert bakeoff.client_for(arm) is injected
+    assert calls == 1
+    assert built == 0
+
+
 def test_winner_picker_skips_non_viable_arm() -> None:
     spec = spec_from({}, primary_metric="exact")
     from athome.bakeoff import ArmResult
