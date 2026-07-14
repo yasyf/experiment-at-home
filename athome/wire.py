@@ -61,20 +61,33 @@ def loads(body: bytes) -> Wire:
 
 
 def validate(obj: object) -> Wire:
-    """Structurally verify that ``obj`` is a :data:`Wire` value, returning it unchanged.
+    """Structurally verify that ``obj`` is a :data:`Wire` value, normalized to exact wire types.
 
-    Walks containers recursively. Dict keys must be ``str``. Raises :class:`WireError`
+    Walks containers recursively, coercing every primitive to its exact builtin so the types
+    the wire *accepts* are the types a frame can *carry*: a primitive subclass — ``ocrmac``'s
+    ``objc.pyobjc_unicode``, a NumPy scalar, a ``str`` enum — pickles as a global that
+    :class:`RestrictedUnpickler` then refuses, so a sender that skipped the coercion would
+    encode a frame no receiver can load. Dict keys must be ``str``. Raises :class:`WireError`
     on any other type (a ``set``, a custom object, a non-``str`` mapping key).
     """
     match obj:
-        case None | bool() | int() | float() | str() | bytes():
+        # bool subclasses int, so it must match first or True would narrow to 1.
+        case None | bool():
             return obj
+        case int():
+            return int(obj)
+        case float():
+            return float(obj)
+        case str():
+            return str(obj)
+        case bytes():
+            return bytes(obj)
         case list():
             return [validate(item) for item in obj]
         case tuple():
             return tuple(validate(item) for item in obj)
         case dict() if all(isinstance(key, str) for key in obj):
-            return {key: validate(value) for key, value in obj.items()}
+            return {str(key): validate(value) for key, value in obj.items()}
         case dict():
             raise WireError("wire dict keys must be str")
         case _:

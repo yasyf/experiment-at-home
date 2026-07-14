@@ -22,12 +22,18 @@ APPLE_SPEC = WorkerSpec((sys.executable, "-c", APPLE_BOOTSTRAP))
 def to_box(bbox: tuple[float, float, float, float], upscale: float, offset: tuple[int, int]) -> Box:
     left, top, right, bottom = bbox
     dx, dy = offset
-    return Box(
-        x=round(left / upscale) + dx,
-        y=round(top / upscale) + dy,
-        width=round((right - left) / upscale),
-        height=round((bottom - top) / upscale),
-    )
+    # Round the true corners, never origin and size independently: consumers rebuild the far
+    # edge as x + width, so a separately rounded size drifts that edge off the float box.
+    x, y = round(left / upscale) + dx, round(top / upscale) + dy
+    return Box(x=x, y=y, width=round(right / upscale) + dx - x, height=round(bottom / upscale) + dy - y)
+
+
+def to_token(
+    annotation: tuple[str, float, tuple[float, float, float, float]], upscale: float, offset: tuple[int, int]
+) -> OcrToken:
+    text, confidence, bbox = annotation
+    # ocrmac hands back objc.pyobjc_unicode, a str subclass; OcrToken.text is an exact str.
+    return OcrToken(text=str(text), box=to_box(bbox, upscale, offset), confidence=confidence)
 
 
 def recognize_tokens(image: bytes, region: Box | None, upscale: float) -> tuple[OcrToken, ...]:
@@ -41,8 +47,8 @@ def recognize_tokens(image: bytes, region: Box | None, upscale: float) -> tuple[
     if upscale != 1.0:
         cropped = cropped.resize((round(cropped.width * upscale), round(cropped.height * upscale)), Resampling.LANCZOS)
     return tuple(
-        OcrToken(text=text, box=to_box(bbox, upscale, offset), confidence=confidence)
-        for text, confidence, bbox in ocrmac.OCR(cropped, recognition_level=APPLE_RECOGNITION_LEVEL).recognize(px=True)
+        to_token(annotation, upscale, offset)
+        for annotation in ocrmac.OCR(cropped, recognition_level=APPLE_RECOGNITION_LEVEL).recognize(px=True)
     )
 
 

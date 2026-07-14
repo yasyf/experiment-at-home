@@ -97,6 +97,18 @@ class ReduceGadget:
         return (wire_side_effect, (self.path,))
 
 
+class Weird(str):
+    pass
+
+
+class WeirdInt(int):
+    pass
+
+
+class WeirdFloat(float):
+    pass
+
+
 class OversizedPrefixStream:
     def __init__(self, size: int) -> None:
         self.prefix = size.to_bytes(LENGTH_PREFIX, "big")
@@ -136,6 +148,21 @@ async def running(source: str) -> AsyncIterator[PipeWorker]:
 def test_wire_round_trip_is_identity() -> None:
     for value in (None, True, 7, 3.5, "s", b"bytes", [1, [2]], (1, "a"), {"k": [b"v", None]}):
         assert decode(encode(value)) == value
+
+
+def test_encode_normalizes_primitive_subclasses() -> None:
+    payload = decode(encode({Weird("k"): Weird("HELLO"), "n": WeirdInt(3), "f": WeirdFloat(0.5), "l": [Weird("x")]}))
+    assert payload == {"k": "HELLO", "n": 3, "f": 0.5, "l": ["x"]}
+    assert [type(key) for key in payload] == [str, str, str, str]
+    assert type(payload["k"]) is str
+    assert type(payload["n"]) is int
+    assert type(payload["f"]) is float
+    assert type(payload["l"][0]) is str
+
+
+def test_encode_keeps_bool_out_of_the_int_coercion() -> None:
+    payload = decode(encode({"on": True, "off": False, "n": 1}))
+    assert [type(value) for value in payload.values()] == [bool, bool, int]
 
 
 def test_validate_rejects_non_wire() -> None:

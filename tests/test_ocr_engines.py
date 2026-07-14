@@ -14,10 +14,10 @@ from click.testing import CliRunner
 
 from athome.config import load
 from athome.ocr import vlm
-from athome.ocr.apple import APPLE_SPEC, AppleVision, to_box
+from athome.ocr.apple import APPLE_SPEC, AppleVision, to_box, to_token, token_to_wire
 from athome.ocr.ensemble import DISAGREEMENT_PENALTY, EnsembleTokenOcr, cross_validate, near
 from athome.ocr.merge import LlmMerger, merge_prompt
-from athome.ocr.paddle import PaddleOcr, box_to_wire, digest_hex
+from athome.ocr.paddle import PaddleOcr, box_to_wire, digest_hex, token_from_wire
 from athome.ocr.profiles import (
     OcrError,
     OcrSettings,
@@ -31,6 +31,7 @@ from athome.ocr.profiles import (
 from athome.ocr.types import Box, Document, OcrToken
 from athome.ocr.vlm import image_media_type
 from athome.serve import ServerHandle
+from athome.wire import decode, encode
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -135,18 +136,39 @@ def test_near_is_center_proximity() -> None:
 # ----- apple -----
 
 
+class PyObjcUnicode(str):
+    pass
+
+
 @pytest.mark.parametrize(
     ("bbox", "upscale", "offset", "expected"),
     [
         ((10.0, 20.0, 30.0, 50.0), 1.0, (0, 0), Box(10, 20, 20, 30)),
         ((10.0, 20.0, 30.0, 50.0), 2.0, (5, 7), Box(10, 17, 10, 15)),
+        ((0.0, 0.7, 100.0, 210.281), 1.0, (0, 0), Box(0, 1, 100, 209)),
     ],
-    ids=["native", "upscaled-offset"],
+    ids=["native", "upscaled-offset", "fractional-corners"],
 )
 def test_to_box_descales_and_offsets(
     bbox: tuple[float, float, float, float], upscale: float, offset: tuple[int, int], expected: Box
 ) -> None:
     assert to_box(bbox, upscale, offset) == expected
+
+
+def test_to_box_far_edge_lands_on_the_rounded_float_corner() -> None:
+    box = to_box((0.0, 0.7, 100.0, 210.281), 1.0, (0, 0))
+    assert box.y + box.height == 210
+
+
+def test_to_token_coerces_ocrmac_text_to_exact_str() -> None:
+    tok = to_token((PyObjcUnicode("HELLO"), 0.9, (10.0, 20.0, 30.0, 50.0)), 1.0, (0, 0))
+    assert tok == OcrToken(text="HELLO", box=Box(10, 20, 20, 30), confidence=0.9)
+    assert type(tok.text) is str
+
+
+def test_apple_token_crosses_the_wire() -> None:
+    tok = to_token((PyObjcUnicode("HELLO"), 0.9, (10.0, 20.0, 30.0, 50.0)), 1.0, (0, 0))
+    assert token_from_wire(decode(encode(token_to_wire(tok)))) == tok
 
 
 async def test_apple_routes_tokens_through_worker() -> None:
