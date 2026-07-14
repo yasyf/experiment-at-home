@@ -1,0 +1,156 @@
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from athome.train.spec import BaseModelSpec, LoraSpec
+
+SIDECAR: Path = Path(__file__).resolve()
+PEFT_KEY = re.compile(r"base_model\.model\.(model\.layers\.\d+\.(.+?))\.lora_([AB])\.weight")
+
+
+def uvx(*args: str) -> tuple[str, ...]:
+    """The argv that runs ``args`` inside the pinned mlx-lm environment."""
+    from athome.config import load
+    from athome.train.spec import TrainSettings
+
+    return ("uvx", "--from", f"mlx-lm=={load(TrainSettings).mlx_lm_version}", *args)
+
+
+def mlx_lm_command(*args: str) -> tuple[str, ...]:
+    """The argv that runs an mlx-lm subcommand (``lora``, ``fuse``, ...) in the sidecar environment."""
+    return uvx("python", "-m", "mlx_lm", *args)
+
+
+def sidecar_command(*args: str) -> tuple[str, ...]:
+    """The argv that runs this module's own ``convert`` subcommand in the sidecar environment."""
+    return uvx("python", str(SIDECAR), *args)
+
+
+async def run_process(command: Sequence[str]) -> None:
+    import anyio
+
+    await anyio.run_process(command)
+
+
+async def convert_peft_to_mlx(peft_dir: Path, out_dir: Path, *, base: BaseModelSpec, lora: LoraSpec) -> Path:
+    """Convert a PEFT LoRA adapter into an mlx-lm adapter directory and return it.
+
+    Tinker and Modal both train PEFT adapters, whose ``lora_A``/``lora_B`` matrices are the
+    transpose of mlx-lm's ``lora_a``/``lora_b``; the weights are transposed and the modules
+    outside ``lora.target_modules`` dropped, so :func:`fuse` can merge what is left.
+
+    Args:
+        peft_dir: A directory holding ``adapter_model.safetensors``.
+        out_dir: Where ``adapters.safetensors`` and ``adapter_config.json`` land.
+        base: The base model the adapter was trained over.
+        lora: The adapter's rank, alpha, and target modules.
+
+    Returns:
+        ``out_dir``, an mlx-lm adapter directory.
+    """
+    await run_process(
+        sidecar_command(
+            "convert",
+            "--peft",
+            str(peft_dir),
+            "--out",
+            str(out_dir),
+            "--num-layers",
+            str(base.num_layers),
+            "--rank",
+            str(lora.rank),
+            "--alpha",
+            str(lora.alpha),
+            "--modules",
+            ",".join(lora.target_modules),
+        )
+    )
+    return out_dir
+
+
+async def fuse(adapter_dir: Path, out_dir: Path, *, base: BaseModelSpec) -> Path:
+    """Merge an mlx-lm adapter into its base and return the standalone 4-bit MLX model directory.
+
+    This is the servable artifact: ``rapid-mlx serve`` takes one model and has no adapter
+    flag. Fusing a 4-bit base re-quantizes every merged layer at the base's own bit width,
+    so the saved model is already 4-bit.
+
+    Args:
+        adapter_dir: An mlx-lm adapter directory.
+        out_dir: Where the fused model is saved.
+        base: The base model the adapter was trained over.
+
+    Returns:
+        ``out_dir``, a standalone 4-bit MLX model directory.
+    """
+    await run_process(
+        mlx_lm_command("fuse", "--model", base.mlx, "--adapter-path", str(adapter_dir), "--save-path", str(out_dir))
+    )
+    return out_dir
+
+
+def run_convert(
+    peft_dir: Path, out_dir: Path, *, num_layers: int, rank: int, alpha: int, modules: tuple[str, ...]
+) -> dict[str, object]:
+    import mlx.core as mx
+
+    weights = mx.load(str(peft_dir / "adapter_model.safetensors"))
+    matched = {key: match for key in weights if (match := PEFT_KEY.match(key))}
+    adapter = {
+        f"{match.group(1)}.lora_{'a' if match.group(3) == 'A' else 'b'}": weights[key].T
+        for key, match in matched.items()
+        if match.group(2) in modules
+    }
+    dropped = sorted(
+        {match.group(2) for match in matched.values() if match.group(2) not in modules}
+        | {key.split("base_model.model.")[-1] for key in weights if key not in matched}
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    mx.save_safetensors(str(out_dir / "adapters.safetensors"), adapter)
+    (out_dir / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "fine_tune_type": "lora",
+                "num_layers": num_layers,
+                "lora_parameters": {"rank": rank, "scale": alpha / rank, "dropout": 0.0, "keys": list(modules)},
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return {"n_lora_weights": len(adapter), "dropped": dropped}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="athome-train-sidecar")
+    convert = parser.add_subparsers(dest="command", required=True).add_parser("convert")
+    convert.add_argument("--peft", type=Path, required=True)
+    convert.add_argument("--out", type=Path, required=True)
+    convert.add_argument("--num-layers", type=int, required=True)
+    convert.add_argument("--rank", type=int, required=True)
+    convert.add_argument("--alpha", type=int, required=True)
+    convert.add_argument("--modules", required=True)
+    args = parser.parse_args()
+    print(
+        json.dumps(
+            run_convert(
+                args.peft,
+                args.out,
+                num_layers=args.num_layers,
+                rank=args.rank,
+                alpha=args.alpha,
+                modules=tuple(args.modules.split(",")),
+            )
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
