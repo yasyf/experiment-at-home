@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.machinery
 import importlib.util
+import inspect
 import json
 import math
 import sys
@@ -17,16 +18,18 @@ import pytest
 from athome.config import load
 from athome.llm.spend import SpendExceeded
 from athome.progress import RunSink, load_journal
-from athome.train import data, tinker
-from athome.train.spec import BASE_MODELS, Hyperparams, LocalJsonlRef, TrainSpec
+from athome.train import data, sidecar, tinker
+from athome.train.spec import BASE_MODELS, STD_MODULES, Hyperparams, LocalJsonlRef, LoraSpec, TrainSpec
 from athome.train.tinker import (
     BETA,
     TORCH_HINT,
     TinkerBackend,
     TorchRequired,
     UnservableBase,
+    UnsupportedLoraShape,
     download_adapter,
     dpo_loss,
+    tinker_lora,
 )
 
 if TYPE_CHECKING:
@@ -120,8 +123,10 @@ def logprobs_for(datums: Sequence[FakeDatum]) -> list[dict[str, FakeTensor]]:
 class FakeTraining:
     """Records every call and answers each forward with a flat ``LOGPROB`` per target token."""
 
+    base_model: str
     rank: int
     seed: int
+    toggles: tuple[bool, bool, bool]
     forward_backward: list[tuple[list[FakeDatum], str]] = field(default_factory=list)
     custom: list[CustomCall] = field(default_factory=list)
     forward: list[list[FakeDatum]] = field(default_factory=list)
@@ -159,9 +164,10 @@ class FakeService:
     async def create_lora_training_client_async(
         self, base_model: str, rank: int, seed: int, train_mlp: bool, train_attn: bool, train_unembed: bool
     ) -> FakeTraining:
-        assert base_model == "Qwen/Qwen3-8B"
-        assert (train_mlp, train_attn, train_unembed) == (True, True, False)
-        self.clients.append(FakeTraining(rank=rank, seed=seed))
+        """Tinker's trainer takes a rank and the three toggles — no alpha, dropout, or module list."""
+        self.clients.append(
+            FakeTraining(base_model=base_model, rank=rank, seed=seed, toggles=(train_mlp, train_attn, train_unembed))
+        )
         return self.clients[-1]
 
 
@@ -181,6 +187,7 @@ class FakeTokenizer:
 @pytest.fixture(autouse=True)
 def sdk(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     module = ModuleType("tinker")
+    module.__spec__ = importlib.machinery.ModuleSpec("tinker", None)
     module.Datum = FakeDatum
     module.ModelInput = FakeModelInput
     module.TensorData = FakeTensor
@@ -230,7 +237,7 @@ def converged(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         seen["peft"] = out_dir
         return out_dir
 
-    async def convert(peft_dir: Path, out_dir: Path, *, base: object, lora: object) -> Path:
+    async def convert(peft_dir: Path, out_dir: Path, *, base: object) -> Path:
         seen["convert_from"] = peft_dir
         seen["adapter"] = out_dir
         return out_dir
@@ -298,10 +305,34 @@ def completion_of(datum: FakeDatum) -> str:
     ).decode()
 
 
-def test_supports_both_methods() -> None:
+def hide(monkeypatch: pytest.MonkeyPatch, missing: str) -> None:
+    """Make one module un-importable to ``find_spec``, leaving every other lookup real."""
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *args: None if name == missing else real(name, *args))
+
+
+def test_supports_sft_always_and_the_name_is_stable() -> None:
     assert TinkerBackend.supports("sft")
-    assert TinkerBackend.supports("dpo")
     assert TinkerBackend.name == "tinker"
+
+
+def test_supports_dpo_only_where_torch_can_back_the_custom_loss(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#9 — `supports("dpo")` claimed True without torch, so select() picked tinker and then died."""
+    assert TinkerBackend.supports("dpo")
+
+    hide(monkeypatch, "torch")
+
+    assert not TinkerBackend.supports("dpo")
+    assert TinkerBackend.supports("sft")
+
+
+def test_available_needs_the_sdk_on_the_path_not_just_a_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#9 — credentials alone made select() pick tinker, which then raised ModuleNotFoundError."""
+    assert TinkerBackend.available()
+
+    hide(monkeypatch, "tinker")
+
+    assert not TinkerBackend.available()
 
 
 def test_available_falls_back_to_the_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -323,11 +354,13 @@ def test_from_settings_loads_the_key_out_of_the_env_file(monkeypatch: pytest.Mon
 async def test_sft_runs_cross_entropy_and_one_optim_step_per_step(
     service: FakeService, converged: dict[str, object], tmp_path: Path
 ) -> None:
-    checkpoint = await TinkerBackend.from_settings().train(spec(corpus(tmp_path, method="sft")), sink=sink(tmp_path))
+    checkpoint = await TinkerBackend.from_settings().train(
+        spec(corpus(tmp_path, method="sft")), sink=sink(tmp_path), work_dir=tmp_path / "run"
+    )
 
     training = service.clients[0]
     assert len(service.clients) == 1
-    assert training.rank == 16
+    assert (training.base_model, training.rank, training.toggles) == ("Qwen/Qwen3-8B", 16, (True, True, False))
     assert [loss_fn for _, loss_fn in training.forward_backward] == ["cross_entropy"] * 3
     assert [len(batch) for batch, _ in training.forward_backward] == [2, 2, 2]
     assert training.optim == [FakeAdamParams(learning_rate=2e-4)] * 3
@@ -341,7 +374,9 @@ async def test_sft_journals_loss_tokens_and_running_spend(
 ) -> None:
     run = sink(tmp_path)
 
-    checkpoint = await TinkerBackend.from_settings().train(spec(corpus(tmp_path, method="sft")), sink=run)
+    checkpoint = await TinkerBackend.from_settings().train(
+        spec(corpus(tmp_path, method="sft")), sink=run, work_dir=tmp_path / "run"
+    )
 
     records = load_journal(run.path)
     tokens = [tinker.token_count(batch) for batch, _ in service.clients[0].forward_backward]
@@ -367,7 +402,7 @@ async def test_over_long_examples_never_reach_a_batch(
     )
     request = spec(LocalJsonlRef(path=path), hyperparams=Hyperparams(steps=2, batch_size=1, max_seq_len=32))
 
-    await TinkerBackend.from_settings().train(request, sink=sink(tmp_path))
+    await TinkerBackend.from_settings().train(request, sink=sink(tmp_path), work_dir=tmp_path / "run")
 
     lengths = {datum.model_input.length for batch, _ in service.clients[0].forward_backward for datum in batch}
     assert lengths == {len("<user>q<assistant>ok") - 1}
@@ -381,7 +416,7 @@ async def test_the_spend_cap_aborts_before_any_billable_call(
     request = spec(corpus(tmp_path, method="sft"), hyperparams=Hyperparams(steps=1000, batch_size=4))
 
     with pytest.raises(SpendExceeded, match="exceeds cap"):
-        await TinkerBackend.from_settings().train(request, sink=sink(tmp_path))
+        await TinkerBackend.from_settings().train(request, sink=sink(tmp_path), work_dir=tmp_path / "run")
 
     assert service.clients == []
 
@@ -392,9 +427,73 @@ async def test_the_spec_cap_overrides_the_configured_one(
     request = spec(corpus(tmp_path, method="sft"), max_usd=1e-9)
 
     with pytest.raises(SpendExceeded, match=r"exceeds cap \$0\.0000"):
-        await TinkerBackend.from_settings().train(request, sink=sink(tmp_path))
+        await TinkerBackend.from_settings().train(request, sink=sink(tmp_path), work_dir=tmp_path / "run")
 
     assert service.clients == []
+
+
+async def test_a_zero_cap_spends_nothing_rather_than_the_configured_sixty_dollars(
+    service: FakeService, converged: dict[str, object], tmp_path: Path
+) -> None:
+    """#4 — `spec.max_usd or settings.spend_cap_usd` read a 0.0 cap as unset and authorized $60."""
+    assert load(tinker.TinkerSettings).spend_cap_usd == 60.0
+    request = spec(corpus(tmp_path, method="sft"), max_usd=0.0)
+
+    with pytest.raises(SpendExceeded, match=r"exceeds cap \$0\.0000"):
+        await TinkerBackend.from_settings().train(request, sink=sink(tmp_path), work_dir=tmp_path / "run")
+
+    assert service.clients == []
+    assert not (tmp_path / "run").exists()
+
+
+@pytest.mark.parametrize(
+    ("lora", "match"),
+    [
+        pytest.param(LoraSpec(alpha=64), "alpha=64", id="a-non-default-alpha-tinker-never-sees"),
+        pytest.param(LoraSpec(dropout=0.1), "dropout=0.1", id="a-dropout-tinker-never-sees"),
+        pytest.param(
+            LoraSpec(target_modules=("self_attn.q_proj",)), "cannot narrow", id="a-target-list-tinker-cannot-narrow-to"
+        ),
+        pytest.param(LoraSpec(train_unembed=True), "unembedding", id="an-unembedding-lora-nothing-can-fuse"),
+    ],
+)
+async def test_tinker_refuses_a_shape_it_cannot_train_before_spending(
+    service: FakeService, converged: dict[str, object], tmp_path: Path, lora: LoraSpec, match: str
+) -> None:
+    """#6 — these were accepted, trained as something else, then discarded by the converter."""
+    request = spec(corpus(tmp_path, method="sft"), lora=lora)
+
+    with pytest.raises(UnsupportedLoraShape, match=match):
+        await TinkerBackend.from_settings().train(request, sink=sink(tmp_path), work_dir=tmp_path / "run")
+
+    assert service.clients == []
+
+
+@pytest.mark.parametrize(
+    ("lora", "trained"),
+    [
+        pytest.param(LoraSpec(), STD_MODULES, id="the-default-shape"),
+        pytest.param(LoraSpec(rank=8, train_mlp=False), STD_MODULES[:4], id="mlp-off-narrows-to-attention"),
+        pytest.param(LoraSpec(train_attn=False), STD_MODULES[4:], id="attn-off-narrows-to-mlp"),
+    ],
+)
+def test_tinker_lora_is_exactly_what_the_toggles_select(lora: LoraSpec, trained: tuple[str, ...]) -> None:
+    """#6 — the modules tinker trains for a shape it accepts, which the archive then reports back."""
+    assert tinker_lora(lora) == trained
+
+
+async def test_the_toggles_reach_the_trainer_and_no_requested_shape_reaches_the_fuse(
+    service: FakeService, converged: dict[str, object], tmp_path: Path
+) -> None:
+    """#6 — the shape trained must BE the shape fused: tinker gets the toggles, the converter gets the archive."""
+    request = spec(corpus(tmp_path, method="sft"), lora=LoraSpec(rank=8, train_mlp=False))
+
+    await TinkerBackend.from_settings().train(request, sink=sink(tmp_path), work_dir=tmp_path / "run")
+
+    training = service.clients[0]
+    assert (training.rank, training.toggles) == (8, (False, True, False))
+    assert converged["convert_from"] == tmp_path / "run" / "peft"
+    assert "lora" not in inspect.signature(sidecar.convert_peft_to_mlx).parameters
 
 
 async def test_dpo_scores_against_a_frozen_reference_client(
@@ -402,7 +501,7 @@ async def test_dpo_scores_against_a_frozen_reference_client(
 ) -> None:
     request = spec(corpus(tmp_path, method="dpo"), method="dpo")
 
-    checkpoint = await TinkerBackend.from_settings().train(request, sink=sink(tmp_path))
+    checkpoint = await TinkerBackend.from_settings().train(request, sink=sink(tmp_path), work_dir=tmp_path / "run")
 
     reference, policy = service.clients
     assert (reference.optim, reference.forward_backward, reference.custom) == ([], [], [])
@@ -424,7 +523,7 @@ async def test_dpo_interleaves_chosen_and_rejected_with_their_reference_logprobs
         hyperparams=Hyperparams(steps=1, batch_size=2, max_seq_len=64),
     )
 
-    await TinkerBackend.from_settings().train(request, sink=sink(tmp_path))
+    await TinkerBackend.from_settings().train(request, sink=sink(tmp_path), work_dir=tmp_path / "run")
 
     call = service.clients[1].custom[0]
     assert [completion_of(datum) for datum in call.datums] == ["yes", "no", "yes", "no"]
@@ -439,7 +538,9 @@ async def test_dpo_journals_the_custom_loss_metrics(
 ) -> None:
     run = sink(tmp_path)
 
-    await TinkerBackend.from_settings().train(spec(corpus(tmp_path, method="dpo"), method="dpo"), sink=run)
+    await TinkerBackend.from_settings().train(
+        spec(corpus(tmp_path, method="dpo"), method="dpo"), sink=run, work_dir=tmp_path / "run"
+    )
 
     records = load_journal(run.path)
     assert [record["step"] for record in records] == [1, 2, 3]
@@ -452,7 +553,7 @@ async def test_dpo_charges_the_reference_pass_and_both_custom_passes(
     service: FakeService, converged: dict[str, object], torch_present: None, tmp_path: Path
 ) -> None:
     checkpoint = await TinkerBackend.from_settings().train(
-        spec(corpus(tmp_path, method="dpo"), method="dpo"), sink=sink(tmp_path)
+        spec(corpus(tmp_path, method="dpo"), method="dpo"), sink=sink(tmp_path), work_dir=tmp_path / "run"
     )
 
     reference, policy = service.clients
@@ -462,19 +563,14 @@ async def test_dpo_charges_the_reference_pass_and_both_custom_passes(
     assert checkpoint.train_cost_usd == pytest.approx(billed / 1e6 * 0.40)
 
 
-def hide_torch(monkeypatch: pytest.MonkeyPatch) -> None:
-    real = importlib.util.find_spec
-    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *args: None if name == "torch" else real(name, *args))
-
-
 async def test_dpo_without_torch_names_the_extra_that_installs_it(
     service: FakeService, converged: dict[str, object], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    hide_torch(monkeypatch)
+    hide(monkeypatch, "torch")
     request = spec(corpus(tmp_path, method="dpo"), method="dpo")
 
     with pytest.raises(TorchRequired) as raised:
-        await TinkerBackend.from_settings().train(request, sink=sink(tmp_path))
+        await TinkerBackend.from_settings().train(request, sink=sink(tmp_path), work_dir=tmp_path / "run")
 
     assert str(raised.value) == TORCH_HINT
     assert "experiment-at-home[train-dpo]" in str(raised.value)
@@ -484,9 +580,11 @@ async def test_dpo_without_torch_names_the_extra_that_installs_it(
 async def test_sft_runs_without_torch(
     service: FakeService, converged: dict[str, object], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    hide_torch(monkeypatch)
+    hide(monkeypatch, "torch")
 
-    checkpoint = await TinkerBackend.from_settings().train(spec(corpus(tmp_path, method="sft")), sink=sink(tmp_path))
+    checkpoint = await TinkerBackend.from_settings().train(
+        spec(corpus(tmp_path, method="sft")), sink=sink(tmp_path), work_dir=tmp_path / "run"
+    )
 
     assert len(service.clients[0].forward_backward) == 3
     assert checkpoint.method == "sft"
@@ -544,9 +642,11 @@ def test_the_surrogate_weights_push_chosen_up_and_rejected_down() -> None:
 async def test_the_checkpoint_fuses_the_downloaded_adapter_into_mlx(
     service: FakeService, converged: dict[str, object], tmp_path: Path
 ) -> None:
-    checkpoint = await TinkerBackend.from_settings().train(spec(corpus(tmp_path, method="sft")), sink=sink(tmp_path))
+    checkpoint = await TinkerBackend.from_settings().train(
+        spec(corpus(tmp_path, method="sft")), sink=sink(tmp_path), work_dir=tmp_path / "run"
+    )
 
-    run = tmp_path / "runs" / "watcher"
+    run = tmp_path / "run"
     assert converged["tinker_path"] == "tinker://run/watcher-sft-3"
     assert converged["peft"] == run / "peft"
     assert converged["convert_from"] == run / "peft"
@@ -562,7 +662,7 @@ async def test_a_base_with_no_mlx_lm_counterpart_aborts_before_the_service_clien
     request = spec(corpus(tmp_path, method="sft"), base=BASE_MODELS["qwen3.5-4b"])
 
     with pytest.raises(UnservableBase, match="mlx-lm LoRA counterpart"):
-        await TinkerBackend.from_settings().train(request, sink=sink(tmp_path))
+        await TinkerBackend.from_settings().train(request, sink=sink(tmp_path), work_dir=tmp_path / "run")
 
     assert service.clients == []
 

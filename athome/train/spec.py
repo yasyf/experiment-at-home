@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, NewType
 
 from pydantic import Field, SecretStr
 
 from athome.config import SectionSettings
+from athome.errors import AthomeError
 
 if TYPE_CHECKING:
     from athome.bakeoff import Leaderboard
@@ -28,16 +29,33 @@ STD_MODULES: tuple[str, ...] = (
     "mlp.up_proj",
     "mlp.down_proj",
 )
+ATTN_PREFIX = "self_attn."
+MLP_PREFIX = "mlp."
 SEED = 1729
+
+
+class UnservableBase(AthomeError):
+    """Raised when the spec's base model cannot produce a servable fused MLX artifact."""
+
+
+class UnsupportedLoraShape(AthomeError):
+    """Raised when a :class:`LoraSpec` asks for an adapter the MLX fuse path cannot express."""
 
 
 @dataclass(frozen=True, slots=True)
 class BaseModelSpec:
-    """One base model addressed across every backend.
+    """One base model addressed across every backend, pinned to exact weights.
+
+    Every repo id carries its commit: an unpinned id floats with the hub's head, so two
+    runs could train against different weights — or an adapter trained on one revision
+    could be fused into an independently-updated MLX snapshot — while their fingerprints
+    claimed to be the same run.
 
     Attributes:
         mlx: The 4-bit MLX id used for local serving and PEFT-to-MLX conversion.
         hf: The HuggingFace repo for modal (GPU) training and snapshotting.
+        hf_revision: The commit the ``hf`` weights are pinned to.
+        mlx_revision: The commit the ``mlx`` weights are pinned to.
         tinker: The Tinker base id, or None when Tinker cannot train it.
         num_layers: Layer count, needed to write an mlx-lm ``adapter_config.json``.
         serves_locally: False when the LoRA cannot load into mlx-lm — a split
@@ -47,6 +65,8 @@ class BaseModelSpec:
 
     mlx: MlxModelId
     hf: HfRepoId
+    hf_revision: str
+    mlx_revision: str
     tinker: TinkerModelId | None
     num_layers: int
     serves_locally: bool = True
@@ -56,6 +76,8 @@ BASE_MODELS: dict[str, BaseModelSpec] = {
     "qwen3-8b": BaseModelSpec(
         mlx=MlxModelId("mlx-community/Qwen3-8B-4bit"),
         hf=HfRepoId("Qwen/Qwen3-8B"),
+        hf_revision="b968826d9c46dd6066d109eabc6255188de91218",
+        mlx_revision="545dc4251c05440727734bcd94334791f6ab0192",
         tinker=TinkerModelId("Qwen/Qwen3-8B"),
         num_layers=36,
         serves_locally=True,
@@ -63,6 +85,8 @@ BASE_MODELS: dict[str, BaseModelSpec] = {
     "qwen3.5-4b": BaseModelSpec(
         mlx=MlxModelId("mlx-community/Qwen3.5-4B-4bit"),
         hf=HfRepoId("Qwen/Qwen3.5-4B"),
+        hf_revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+        mlx_revision="0e7ffd5c629ef7719d4cbc04069232580bfa9d9c",
         tinker=TinkerModelId("Qwen/Qwen3.5-4B"),
         num_layers=32,
         serves_locally=False,
@@ -114,6 +138,51 @@ class LoraSpec:
     train_unembed: bool = False
 
 
+def lora_keys(lora: LoraSpec) -> tuple[str, ...]:
+    """The modules an adapter actually wraps: ``target_modules`` filtered by the LoRA toggles.
+
+    Every backend converges on a fused mlx-lm artifact, so every backend is bound by what
+    mlx-lm can express — which makes this the one shape rule, not a per-backend one.
+
+    Args:
+        lora: The requested LoRA shape.
+
+    Returns:
+        The subset of ``target_modules`` the toggles select, in the spec's order.
+
+    Raises:
+        UnsupportedLoraShape: ``train_unembed`` is set, or the toggles leave nothing to
+            train. mlx-lm reaches the unembedding through a base-dependent module path —
+            ``lm_head``, which a base that ties its embeddings does not have at all — and
+            :class:`BaseModelSpec` does not carry it, so no backend can fuse an
+            unembedding LoRA: training one only burns money on weights the PEFT-to-MLX
+            conversion would drop.
+    """
+    if lora.train_unembed:
+        raise UnsupportedLoraShape(
+            "no backend can fuse an unembedding LoRA: mlx-lm reaches the unembedding through a "
+            "base-dependent module path (`lm_head`, absent on a base that ties its embeddings) and "
+            "BaseModelSpec does not carry it, so the conversion would drop the tensor it trained."
+        )
+    prefixes = tuple(
+        prefix for prefix, trains in ((ATTN_PREFIX, lora.train_attn), (MLP_PREFIX, lora.train_mlp)) if trains
+    )
+    if not (keys := tuple(key for key in lora.target_modules if key.startswith(prefixes))):
+        raise UnsupportedLoraShape(
+            f"nothing to train: train_attn={lora.train_attn}, train_mlp={lora.train_mlp} "
+            f"leave no trainable module in {lora.target_modules}"
+        )
+    return keys
+
+
+def std_lora_keys(lora: LoraSpec) -> tuple[str, ...]:
+    """The standard modules ``lora``'s toggles select, ignoring its ``target_modules``.
+
+    What a backend that takes only toggles — Tinker — trains for this spec.
+    """
+    return lora_keys(replace(lora, target_modules=STD_MODULES))
+
+
 @dataclass(frozen=True, slots=True)
 class Hyperparams:
     """The optimization knobs shared by every backend."""
@@ -149,6 +218,15 @@ class TrainSpec:
     lora: LoraSpec = field(default_factory=LoraSpec)
     backend: BackendName | None = None
     max_usd: float | None = None
+
+
+def spend_cap(spec: TrainSpec, default: float) -> float:
+    """The dollar cap binding this run: the spec's ``max_usd`` when it set one, else ``default``.
+
+    Only ``None`` means "unset". ``max_usd=0.0`` is an explicit "spend nothing" and binds as
+    such — a falsy-zero fallback here would silently authorize the whole configured cap.
+    """
+    return default if spec.max_usd is None else spec.max_usd
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,7 +304,14 @@ class LocalTrainSettings(SectionSettings):
 
 
 class ModalTrainSettings(SectionSettings):
-    """The Modal GPU trainer's image pins, GPU class, and spend cap, bound to ``[train.modal]``."""
+    """The Modal GPU trainer's image pins, GPU class, and spend cap, bound to ``[train.modal]``.
+
+    The pins are one co-installable set — TRL 0.21 requires ``transformers>=4.55``, so a run
+    that pins them apart cannot even build its image — and ``datasets`` is pinned rather than
+    floating because the training corpus crosses the wire as a pickled
+    :class:`datasets.Dataset`, which an unpinned image would unpickle under whatever version
+    the build happened to resolve.
+    """
 
     section: ClassVar[tuple[str, ...]] = ("train", "modal")
     app_name: str = "athome-train"
@@ -235,6 +320,7 @@ class ModalTrainSettings(SectionSettings):
     spend_cap_usd: float = 60.0
     hf_repo_prefix: str = "athome-train"
     trl_version: str = "0.21.0"
-    peft_version: str = "0.14.0"
+    peft_version: str = "0.17.0"
     torch_version: str = "2.6.0"
-    transformers_version: str = "4.48.0"
+    transformers_version: str = "4.55.4"
+    datasets_version: str = "5.0.0"

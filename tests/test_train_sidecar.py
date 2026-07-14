@@ -10,8 +10,16 @@ import pytest
 
 from athome.config import load
 from athome.train import sidecar
-from athome.train.sidecar import SIDECAR, convert_peft_to_mlx, fuse, mlx_lm_command, run_convert, sidecar_command
-from athome.train.spec import BASE_MODELS, STD_MODULES, LoraSpec
+from athome.train.sidecar import (
+    PEFT_CONFIG,
+    SIDECAR,
+    convert_peft_to_mlx,
+    fuse,
+    mlx_lm_command,
+    run_convert,
+    sidecar_command,
+)
+from athome.train.spec import BASE_MODELS, STD_MODULES
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -19,6 +27,12 @@ if TYPE_CHECKING:
 
 BASE = BASE_MODELS["qwen3-8b"]
 VERSION = "0.31.3"
+FUSABLE: dict[str, str] = {
+    "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": "q_a",
+    "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight": "q_b",
+    "base_model.model.model.layers.1.mlp.up_proj.lora_A.weight": "up_a",
+    "base_model.model.model.layers.1.mlp.up_proj.lora_B.weight": "up_b",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +42,15 @@ class FakeArray:
     @property
     def T(self) -> FakeArray:  # noqa: N802 — mlx's transpose accessor
         return FakeArray(f"{self.label}.T")
+
+
+@dataclass(frozen=True, slots=True)
+class Archive:
+    """A PEFT adapter on disk: its ``adapter_config.json``, and the tensors it trained."""
+
+    peft_dir: Path
+    out_dir: Path
+    saved: dict[str, dict[str, FakeArray]]
 
 
 @pytest.fixture
@@ -42,22 +65,29 @@ def commands(monkeypatch: pytest.MonkeyPatch) -> list[Sequence[str]]:
 
 
 @pytest.fixture
-def saved(monkeypatch: pytest.MonkeyPatch) -> dict[str, dict[str, FakeArray]]:
-    written: dict[str, dict[str, FakeArray]] = {}
+def archive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Archive:
+    """Writes a PEFT archive whose config and weights are the *trained* shape, not a requested one."""
+    state = Archive(tmp_path / "peft", tmp_path / "adapter", {})
+    state.peft_dir.mkdir()
+    weights: dict[str, FakeArray] = {key: FakeArray(label) for key, label in FUSABLE.items()}
     core = ModuleType("mlx.core")
-    core.load = lambda path: {
-        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": FakeArray("q_a"),
-        "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight": FakeArray("q_b"),
-        "base_model.model.model.layers.1.mlp.up_proj.lora_A.weight": FakeArray("up_a"),
-        "base_model.model.model.layers.0.linear_attn.in_proj_qkv.lora_A.weight": FakeArray("qkv_a"),
-        "base_model.model.unembed_tokens.weight": FakeArray("unembed"),
-    }
-    core.save_safetensors = lambda path, weights: written.__setitem__(path, weights)
+    core.load = lambda path: weights
+    core.save_safetensors = lambda path, tensors: state.saved.__setitem__(path, tensors)
     package = ModuleType("mlx")
     package.core = core
     monkeypatch.setitem(sys.modules, "mlx", package)
     monkeypatch.setitem(sys.modules, "mlx.core", core)
-    return written
+    return state
+
+
+def write_config(archive: Archive, **overrides: object) -> None:
+    (archive.peft_dir / PEFT_CONFIG).write_text(
+        json.dumps({"r": 16, "lora_alpha": 32, "lora_dropout": 0.0} | overrides)
+    )
+
+
+def add_weight(archive: Archive, key: str) -> None:
+    sys.modules["mlx.core"].load = lambda path: {k: FakeArray(v) for k, v in FUSABLE.items()} | {key: FakeArray("x")}
 
 
 @pytest.fixture(autouse=True)
@@ -72,10 +102,11 @@ def test_the_sidecar_runs_in_the_pinned_mlx_lm_environment() -> None:
     assert SIDECAR.name == "sidecar.py"
 
 
-async def test_convert_peft_to_mlx_passes_the_adapter_shape_to_the_sidecar(
+async def test_convert_never_passes_a_requested_shape_to_the_sidecar(
     commands: list[Sequence[str]], tmp_path: Path
 ) -> None:
-    out = await convert_peft_to_mlx(tmp_path / "peft", tmp_path / "adapter", base=BASE, lora=LoraSpec())
+    """#6 — the fused shape is read off the archive, so no rank/alpha/modules can be imposed on it."""
+    out = await convert_peft_to_mlx(tmp_path / "peft", tmp_path / "adapter", base=BASE)
 
     assert out == tmp_path / "adapter"
     assert commands == [
@@ -92,14 +123,9 @@ async def test_convert_peft_to_mlx_passes_the_adapter_shape_to_the_sidecar(
             str(tmp_path / "adapter"),
             "--num-layers",
             "36",
-            "--rank",
-            "16",
-            "--alpha",
-            "32",
-            "--modules",
-            ",".join(STD_MODULES),
         )
     ]
+    assert not {"--rank", "--alpha", "--modules"} & set(commands[0])
 
 
 async def test_fuse_saves_a_standalone_model_from_the_base_and_the_adapter(
@@ -128,24 +154,78 @@ async def test_fuse_saves_a_standalone_model_from_the_base_and_the_adapter(
     assert "--dequantize" not in commands[0]
 
 
-def test_convert_transposes_the_standard_modules_and_drops_the_rest(
-    saved: dict[str, dict[str, FakeArray]], tmp_path: Path
-) -> None:
-    report = run_convert(tmp_path / "peft", tmp_path / "adapter", num_layers=36, rank=16, alpha=32, modules=STD_MODULES)
+def test_convert_transposes_every_trained_lora_matrix(archive: Archive) -> None:
+    write_config(archive)
 
-    assert saved[str(tmp_path / "adapter" / "adapters.safetensors")] == {
+    report = run_convert(archive.peft_dir, archive.out_dir, num_layers=36)
+
+    assert archive.saved[str(archive.out_dir / "adapters.safetensors")] == {
         "model.layers.0.self_attn.q_proj.lora_a": FakeArray("q_a.T"),
         "model.layers.0.self_attn.q_proj.lora_b": FakeArray("q_b.T"),
         "model.layers.1.mlp.up_proj.lora_a": FakeArray("up_a.T"),
+        "model.layers.1.mlp.up_proj.lora_b": FakeArray("up_b.T"),
     }
-    assert report == {"n_lora_weights": 3, "dropped": ["linear_attn.in_proj_qkv", "unembed_tokens.weight"]}
+    assert report == {
+        "n_lora_weights": 4,
+        "rank": 16,
+        "alpha": 32,
+        "keys": ["mlp.up_proj", "self_attn.q_proj"],
+    }
 
 
-def test_convert_writes_the_adapter_config_mlx_lm_reads(saved: dict[str, dict[str, FakeArray]], tmp_path: Path) -> None:
-    run_convert(tmp_path / "peft", tmp_path / "adapter", num_layers=36, rank=16, alpha=32, modules=STD_MODULES)
+@pytest.mark.parametrize(
+    ("rank", "alpha", "dropout", "scale"),
+    [
+        pytest.param(16, 32, 0.0, 2.0, id="the-default-scale"),
+        pytest.param(8, 8, 0.05, 1.0, id="a-non-default-alpha-reinterprets-the-adapter"),
+        pytest.param(32, 128, 0.1, 4.0, id="a-high-alpha-archive"),
+    ],
+)
+def test_the_fused_config_is_the_archives_own_not_a_requested_one(
+    archive: Archive, rank: int, alpha: int, dropout: float, scale: float
+) -> None:
+    """#6 — the converter used to write the *requested* alpha/rank, rescaling weights it never trained."""
+    write_config(archive, r=rank, lora_alpha=alpha, lora_dropout=dropout)
 
-    assert json.loads((tmp_path / "adapter" / "adapter_config.json").read_text()) == {
+    report = run_convert(archive.peft_dir, archive.out_dir, num_layers=36)
+
+    assert json.loads((archive.out_dir / "adapter_config.json").read_text()) == {
         "fine_tune_type": "lora",
         "num_layers": 36,
-        "lora_parameters": {"rank": 16, "scale": 2.0, "dropout": 0.0, "keys": list(STD_MODULES)},
+        "lora_parameters": {
+            "rank": rank,
+            "scale": scale,
+            "dropout": dropout,
+            "keys": ["mlp.up_proj", "self_attn.q_proj"],
+        },
     }
+    assert (report["rank"], report["alpha"]) == (rank, alpha)
+
+
+def test_the_written_keys_are_the_modules_the_archive_actually_carries(archive: Archive) -> None:
+    """#5/#6 — a toggled-off module is absent from the archive, so it is absent from the fused keys."""
+    write_config(archive)
+
+    run_convert(archive.peft_dir, archive.out_dir, num_layers=36)
+
+    keys = json.loads((archive.out_dir / "adapter_config.json").read_text())["lora_parameters"]["keys"]
+    assert keys == ["mlp.up_proj", "self_attn.q_proj"]
+    assert set(keys) < set(STD_MODULES)
+
+
+@pytest.mark.parametrize(
+    "unfusable",
+    [
+        pytest.param("base_model.model.unembed_tokens.weight", id="an-unembedding-tensor"),
+        pytest.param("base_model.model.lm_head.weight", id="a-saved-lm-head"),
+    ],
+)
+def test_a_tensor_that_is_not_a_lora_matrix_raises_instead_of_being_dropped(archive: Archive, unfusable: str) -> None:
+    """#6 — silently dropping a trained tensor spends money on weights that never reach the artifact."""
+    write_config(archive)
+    add_weight(archive, unfusable)
+
+    with pytest.raises(ValueError, match="cannot fuse 1 trained tensor"):
+        run_convert(archive.peft_dir, archive.out_dir, num_layers=36)
+
+    assert archive.saved == {}

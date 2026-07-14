@@ -16,7 +16,16 @@ from athome.errors import AthomeError
 from athome.llm.spend import SpendGuard
 from athome.train import data, sidecar
 from athome.train.backend import TINKER_ENV
-from athome.train.spec import Checkpoint, TinkerSettings, TrainSettings
+from athome.train.spec import (
+    Checkpoint,
+    LoraSpec,
+    TinkerSettings,
+    UnservableBase,
+    UnsupportedLoraShape,
+    lora_keys,
+    spend_cap,
+    std_lora_keys,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -36,10 +45,6 @@ TORCH_HINT = (
     "tinker DPO needs torch locally (its custom loss backprops in-process): "
     "install `experiment-at-home[train-dpo]`. SFT needs no torch, and modal DPO runs torch in the Modal image."
 )
-
-
-class UnservableBase(AthomeError):
-    """Raised when the spec's base model cannot produce a servable Tinker artifact."""
 
 
 class TorchRequired(AthomeError):
@@ -71,6 +76,39 @@ def tinker_model(base: BaseModelSpec) -> TinkerModelId:
     if not base.serves_locally:
         raise UnservableBase(f"{base.mlx} has no mlx-lm LoRA counterpart, so a Tinker adapter cannot be fused into it")
     return base.tinker
+
+
+def tinker_lora(lora: LoraSpec) -> tuple[str, ...]:
+    """The modules Tinker will train for ``lora``, or a refusal if it cannot train that shape.
+
+    Tinker's trainer takes a rank and the three toggles — nothing else. It picks the alpha, the
+    dropout, and the exact module list itself, so a request that names its own is not a request
+    Tinker can carry out; accepting it would train one adapter and fuse it as another. What
+    Tinker did choose is read back off the archive at conversion time.
+
+    Args:
+        lora: The requested LoRA shape.
+
+    Returns:
+        The modules Tinker trains: every standard module the toggles select.
+
+    Raises:
+        UnsupportedLoraShape: The request names an alpha, a dropout, or a target list Tinker
+            cannot honor. Modal takes all three; local takes them too.
+    """
+    if (lora.alpha, lora.dropout) != ((default := LoraSpec()).alpha, default.dropout):
+        raise UnsupportedLoraShape(
+            f"tinker chooses the adapter's alpha and dropout itself — its trainer takes only a rank and the "
+            f"train_mlp/train_attn/train_unembed toggles — so alpha={lora.alpha}, dropout={lora.dropout} cannot "
+            f"be honored. Train that shape on modal or local."
+        )
+    if (requested := lora_keys(lora)) != (trained := std_lora_keys(lora)):
+        raise UnsupportedLoraShape(
+            f"tinker trains every standard module its toggles select ({', '.join(trained)}); it cannot narrow "
+            f"to {', '.join(requested)}, and the modules it trained anyway would be dropped by the fuse. "
+            f"Train that target list on modal or local."
+        )
+    return trained
 
 
 def batches[T](pool: Sequence[T], *, size: int, steps: int, seed: int) -> list[tuple[T, ...]]:
@@ -195,13 +233,28 @@ class TinkerBackend:
 
     @staticmethod
     def available() -> bool:
-        """Whether a Tinker API key is in the environment or in ``~/.athome/tinker.env``."""
-        return "TINKER_API_KEY" in os.environ or TINKER_ENV.exists()
+        """Whether the Tinker SDK is installed and keyed: a key in the env, or ``~/.athome/tinker.env``.
+
+        The SDK is half of it. Selection treats an available backend as one that can actually run,
+        so claiming availability without ``tinker`` on the path picks this backend and then dies
+        importing it, instead of falling through to one that would have worked.
+        """
+        return importlib.util.find_spec("tinker") is not None and (
+            "TINKER_API_KEY" in os.environ or TINKER_ENV.exists()
+        )
 
     @staticmethod
     def supports(method: Method) -> bool:
-        """Tinker trains both SFT and DPO."""
-        return method in {"sft", "dpo"}
+        """Whether Tinker trains ``method`` *here*: SFT always, DPO only where torch can back it.
+
+        Tinker has no named preference loss, so DPO runs through ``forward_backward_custom`` and
+        :func:`dpo_loss` backprops it in-process — without torch there is nothing to run it with.
+        """
+        match method:
+            case "sft":
+                return True
+            case "dpo":
+                return importlib.util.find_spec("torch") is not None
 
     @classmethod
     def from_settings(cls) -> TinkerBackend:
@@ -209,25 +262,28 @@ class TinkerBackend:
         load_key()
         return cls(load(TinkerSettings))
 
-    async def train(self, spec: TrainSpec, *, sink: RunSink) -> Checkpoint:
+    async def train(self, spec: TrainSpec, *, sink: RunSink, work_dir: Path) -> Checkpoint:
         """Train ``spec`` on Tinker and fuse the resulting adapter into a servable MLX model.
 
         Args:
             spec: The fine-tuning request: base, dataset, hyperparams, method, LoRA, spend cap.
             sink: The run journal; one record lands per step with its loss, tokens, and spend.
+            work_dir: This run's own directory; the adapter and the fused model are written under it.
 
         Returns:
             The checkpoint, whose ``mlx_path`` is the fused standalone 4-bit MLX model.
 
         Raises:
             UnservableBase: The base has no Tinker id, or no mlx-lm counterpart to fuse into.
+            UnsupportedLoraShape: The LoRA shape asks for something Tinker cannot train.
             TorchRequired: The method is ``dpo`` and torch is not installed locally.
             SpendExceeded: The projected run cost crosses the spend cap.
         """
         import tinker
 
         model = tinker_model(spec.base)
-        guard = SpendGuard(max_usd=spec.max_usd or self.settings.spend_cap_usd)
+        tinker_lora(spec.lora)
+        guard = SpendGuard(max_usd=spend_cap(spec, self.settings.spend_cap_usd))
         service = tinker.ServiceClient(api_key=self.settings.api_key.get_secret_value())
         match spec.method:
             case "sft":
@@ -235,7 +291,9 @@ class TinkerBackend:
             case "dpo":
                 client = await self.run_dpo(service, spec, model=model, guard=guard, sink=sink)
         saved = await client.save_weights_for_sampler_async(name=f"{spec.name}-{spec.method}-{spec.hyperparams.steps}")
-        return await self.converge(service, spec, (await saved.result_async()).path, cost=guard.spent)
+        return await self.converge(
+            service, spec, (await saved.result_async()).path, cost=guard.spent, work_dir=work_dir
+        )
 
     async def lora_client(
         self, service: tinker.ServiceClient, spec: TrainSpec, *, model: TinkerModelId
@@ -353,16 +411,17 @@ class TinkerBackend:
         ]
         return list(zip(scores[0::2], scores[1::2], strict=True))
 
-    async def converge(self, service: tinker.ServiceClient, spec: TrainSpec, path: str, *, cost: float) -> Checkpoint:
-        run = load(TrainSettings).work_root / spec.name
-        peft = await download_adapter(service, path, run / "peft")
-        adapter = await sidecar.convert_peft_to_mlx(peft, run / "adapter", base=spec.base, lora=spec.lora)
+    async def converge(
+        self, service: tinker.ServiceClient, spec: TrainSpec, path: str, *, cost: float, work_dir: Path
+    ) -> Checkpoint:
+        peft = await download_adapter(service, path, work_dir / "peft")
+        adapter = await sidecar.convert_peft_to_mlx(peft, work_dir / "adapter", base=spec.base)
         return Checkpoint(
             base=spec.base,
             backend="tinker",
             method=spec.method,
             step=spec.hyperparams.steps,
-            mlx_path=await sidecar.fuse(adapter, run / "mlx", base=spec.base),
+            mlx_path=await sidecar.fuse(adapter, work_dir / "mlx", base=spec.base),
             adapter_dir=adapter,
             train_cost_usd=cost,
         )
