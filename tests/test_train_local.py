@@ -8,8 +8,16 @@ import pytest
 from athome.config import load
 from athome.progress import RunSink
 from athome.train import local, sidecar
-from athome.train.local import LocalBackend, UnsupportedLoraShape
-from athome.train.spec import BASE_MODELS, STD_MODULES, Hyperparams, LocalJsonlRef, LoraSpec, TrainSpec
+from athome.train.local import LocalBackend
+from athome.train.spec import (
+    BASE_MODELS,
+    STD_MODULES,
+    Hyperparams,
+    LocalJsonlRef,
+    LoraSpec,
+    TrainSpec,
+    UnsupportedLoraShape,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence

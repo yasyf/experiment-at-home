@@ -165,8 +165,14 @@ reference:
       - train.run
       - train.evaluate
       - train.register
+      - train.model_path
       - train.select
+      - train.lora_keys
+      - train.std_lora_keys
+      - train.spend_cap
       - train.NoBackendAvailable
+      - train.UnservableBase
+      - train.UnsupportedLoraShape
   - title: OCR types
     desc: Protocols for token- and document-level OCR engines.
     contents:

@@ -45,6 +45,11 @@ from athome.train.spec import (
     TrainResult,
     TrainSettings,
     TrainSpec,
+    UnservableBase,
+    UnsupportedLoraShape,
+    lora_keys,
+    spend_cap,
+    std_lora_keys,
 )
 
 if TYPE_CHECKING:

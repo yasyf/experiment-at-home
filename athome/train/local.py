@@ -8,10 +8,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
 from athome.config import load
-from athome.errors import AthomeError
 from athome.train import sidecar
 from athome.train.data import normalize, render_mlx_jsonl
-from athome.train.spec import Checkpoint, LocalTrainSettings
+from athome.train.spec import Checkpoint, LocalTrainSettings, lora_keys
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -24,40 +23,6 @@ ADAPTER_DIR = "adapter"
 FUSED_DIR = "fused"
 LORA_CONFIG = "lora.yaml"
 OPTIMIZER = "adamw"
-ATTN_PREFIX = "self_attn."
-MLP_PREFIX = "mlp."
-
-
-class UnsupportedLoraShape(AthomeError):
-    """Raised when a ``LoraSpec`` asks for an adapter mlx-lm cannot express."""
-
-
-def lora_keys(lora: LoraSpec) -> tuple[str, ...]:
-    """The modules mlx-lm wraps: ``target_modules`` filtered by the spec's LoRA toggles.
-
-    Raises:
-        UnsupportedLoraShape: ``train_unembed`` is set, or both ``train_attn`` and
-            ``train_mlp`` are off. mlx-lm reaches the unembedding through a
-            base-dependent module path — ``lm_head``, which a base that ties its
-            embeddings does not have at all — and
-            :class:`~athome.train.spec.BaseModelSpec` does not carry it, so a guessed
-            key would match nothing and train the unembedding silently not at all.
-    """
-    if lora.train_unembed:
-        raise UnsupportedLoraShape(
-            "mlx-lm cannot LoRA the unembedding: its module path is base-dependent "
-            "(`lm_head`, absent on a base that ties its embeddings) and BaseModelSpec does not carry it. "
-            "Train a train_unembed=True spec on tinker or modal."
-        )
-    prefixes = tuple(
-        prefix for prefix, trains in ((ATTN_PREFIX, lora.train_attn), (MLP_PREFIX, lora.train_mlp)) if trains
-    )
-    if not (keys := tuple(key for key in lora.target_modules if key.startswith(prefixes))):
-        raise UnsupportedLoraShape(
-            f"nothing to train: train_attn={lora.train_attn}, train_mlp={lora.train_mlp} "
-            f"leave no trainable module in {lora.target_modules}"
-        )
-    return keys
 
 
 def lora_config(lora: LoraSpec, path: Path) -> Path:
