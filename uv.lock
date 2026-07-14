@@ -707,8 +707,10 @@ serve = [
 ]
 train = [
     { name = "datasets" },
+    { name = "jinja2" },
     { name = "modal" },
     { name = "tinker" },
+    { name = "transformers" },
 ]
 train-dpo = [
     { name = "torch" },
@@ -729,6 +731,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "httpx", marker = "extra == 'serve'", specifier = ">=0.28" },
     { name = "huggingface-hub", marker = "extra == 'hf'", specifier = ">=0.26" },
+    { name = "jinja2", marker = "extra == 'train'", specifier = ">=3.1" },
     { name = "loguru", specifier = ">=0.7" },
     { name = "modal", marker = "extra == 'modal'", specifier = ">=0.66" },
     { name = "modal", marker = "extra == 'train'", specifier = ">=0.66" },
@@ -745,6 +748,7 @@ requires-dist = [
     { name = "spawnllm", marker = "extra == 'llm'", specifier = ">=0.6.1" },
     { name = "tinker", marker = "extra == 'train'", specifier = ">=0.22" },
     { name = "torch", marker = "extra == 'train-dpo'", specifier = ">=2.6" },
+    { name = "transformers", marker = "extra == 'train'", specifier = ">=4.42" },
 ]
 provides-extras = ["serve", "llm", "ocr", "modal", "hf", "embed", "research", "train", "train-dpo", "dev"]
 
