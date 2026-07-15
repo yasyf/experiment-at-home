@@ -41,6 +41,7 @@ from athome.train.spec import (
     LoraSpec,
     Method,
     ModalTrainSettings,
+    TinkerPrice,
     TinkerSettings,
     TrainResult,
     TrainSettings,

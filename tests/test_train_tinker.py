@@ -19,7 +19,15 @@ from athome.config import load
 from athome.llm.spend import SpendExceeded
 from athome.progress import RunSink, load_journal
 from athome.train import data, sidecar, tinker
-from athome.train.spec import BASE_MODELS, STD_MODULES, Hyperparams, LocalJsonlRef, LoraSpec, TrainSpec
+from athome.train.spec import (
+    BASE_MODELS,
+    STD_MODULES,
+    Hyperparams,
+    LocalJsonlRef,
+    LoraSpec,
+    TinkerModelId,
+    TrainSpec,
+)
 from athome.train.tinker import (
     BETA,
     TORCH_HINT,
@@ -319,9 +327,7 @@ def show(monkeypatch: pytest.MonkeyPatch, present: str) -> None:
     """
     real = importlib.util.find_spec
     spec = importlib.machinery.ModuleSpec(present, None)
-    monkeypatch.setattr(
-        importlib.util, "find_spec", lambda name, *args: spec if name == present else real(name, *args)
-    )
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *args: spec if name == present else real(name, *args))
 
 
 def test_supports_sft_always_and_the_name_is_stable() -> None:
@@ -364,6 +370,23 @@ def test_from_settings_loads_the_key_out_of_the_env_file(monkeypatch: pytest.Mon
     load.cache_clear()
 
     assert TinkerBackend.from_settings().settings.api_key.get_secret_value() == "sk-from-file"
+
+
+def test_cost_bills_each_token_class_at_its_own_rate() -> None:
+    backend = TinkerBackend.from_settings()
+    model = TinkerModelId("Qwen/Qwen3-8B")
+
+    assert backend.cost(model=model, prefill=2_000_000) == pytest.approx(0.26)
+    assert backend.cost(model=model, sample=500_000) == pytest.approx(0.20)
+    assert backend.cost(model=model, train=250_000) == pytest.approx(0.10)
+    assert backend.cost(model=model, prefill=2_000_000, sample=500_000, train=250_000) == pytest.approx(0.56)
+
+
+def test_cost_prices_each_base_model_off_its_own_sheet() -> None:
+    backend = TinkerBackend.from_settings()
+
+    assert backend.cost(model=TinkerModelId("Qwen/Qwen3.5-4B"), prefill=1_000_000) == pytest.approx(0.22)
+    assert backend.cost(model=TinkerModelId("Qwen/Qwen3.5-4B"), train=1_000_000) == pytest.approx(0.67)
 
 
 async def test_sft_runs_cross_entropy_and_one_optim_step_per_step(
@@ -572,10 +595,9 @@ async def test_dpo_charges_the_reference_pass_and_both_custom_passes(
     )
 
     reference, policy = service.clients
-    billed = tinker.token_count(reference.forward[0]) + 2 * sum(
-        tinker.token_count(call.datums) for call in policy.custom
-    )
-    assert checkpoint.train_cost_usd == pytest.approx(billed / 1e6 * 0.40)
+    prefilled = tinker.token_count(reference.forward[0])
+    trained = 2 * sum(tinker.token_count(call.datums) for call in policy.custom)
+    assert checkpoint.train_cost_usd == pytest.approx((prefilled * 0.13 + trained * 0.40) / 1e6)
 
 
 async def test_dpo_without_torch_names_the_extra_that_installs_it(
