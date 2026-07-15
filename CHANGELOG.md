@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `athome.embed.VoyageEmbedBackend` — the Voyage AI `/embeddings` API as an `EmbedBackend`, behind the new `embed-voyage` extra (`voyageai`, `numpy`). Dual-budget batching caps each request by both item count (`batch_texts`, ≤256) and total characters (`batch_chars`, ≤240k); batches run concurrently under a `concurrency` semaphore and the vectors are reassembled in input order. `input_type` (`query`/`document`) and `normalize` are per-instance construction state, so a consumer builds one document backend and one query backend. `VoyageSettings` binds `[embed.voyage]` / `ATHOME_EMBED_VOYAGE_*` and reads the canonical `VOYAGE_API_KEY`.
+
 ## [0.4.0] - 2026-07-14
 
 ### Added

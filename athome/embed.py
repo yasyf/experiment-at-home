@@ -4,10 +4,11 @@ import functools
 import hashlib
 import io
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, ClassVar, Protocol
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol
 
 import httpx
-from anyio import Lock, to_thread
+from anyio import Lock, Semaphore, create_task_group, to_thread
+from pydantic import Field, SecretStr
 
 from athome.cache import Cache
 from athome.config import SectionSettings, load
@@ -40,6 +41,25 @@ class EmbedSettings(SectionSettings):
 
     section: ClassVar[tuple[str, ...]] = ("embed",)
     api_key: str = "local"
+
+
+class VoyageSettings(SectionSettings):
+    """The ``[embed.voyage]`` section: the Voyage AI key, model, and batching budgets.
+
+    Bound to ``ATHOME_EMBED_VOYAGE_*``; ``api_key`` reads the canonical ``VOYAGE_API_KEY``
+    so a consumer's existing convention works unchanged. ``batch_texts`` and ``batch_chars``
+    cap each request by item count and total characters, and ``concurrency`` bounds the
+    in-flight requests per :meth:`VoyageEmbedBackend.embed` call.
+    """
+
+    section: ClassVar[tuple[str, ...]] = ("embed", "voyage")
+    api_key: SecretStr = Field(validation_alias="VOYAGE_API_KEY")
+    model: str = "voyage-4-large"
+    max_retries: int = 3
+    timeout: float = 120
+    batch_texts: int = 256
+    batch_chars: int = 240_000
+    concurrency: int = 16
 
 
 def text_digest(text: str) -> str:
@@ -144,6 +164,79 @@ class LocalBackend:
             ),
             dtype=np.float32,
         )
+
+
+def pack_batches(texts: Sequence[str], *, max_texts: int, max_chars: int) -> list[list[str]]:
+    batches: list[list[str]] = []
+    chars = 0
+    for text in texts:
+        if batches and len(batches[-1]) < max_texts and chars + len(text) <= max_chars:
+            batches[-1].append(text)
+            chars += len(text)
+        else:
+            batches.append([text])
+            chars = len(text)
+    return batches
+
+
+@dataclass(frozen=True, slots=True)
+class VoyageEmbedBackend:
+    """The Voyage AI ``/embeddings`` API as an embedding backend (lazy import, ``embed-voyage`` extra).
+
+    Packs ``texts`` into dual-budget batches — each capped by both ``settings.batch_texts`` items and
+    ``settings.batch_chars`` characters — embeds the batches concurrently under ``settings.concurrency``,
+    and reassembles the vectors in the original input order. ``input_type`` and ``normalize`` are
+    construction state: build one instance for documents and a separate one for queries.
+
+    Example:
+        >>> await VoyageEmbedBackend.from_settings(input_type="query").embed(["hi"])
+    """
+
+    settings: VoyageSettings
+    input_type: Literal["query", "document"] = "document"
+    normalize: bool = True
+
+    async def embed(self, texts: Sequence[str]) -> np.ndarray:
+        import numpy as np
+        from voyageai import AsyncClient
+        from voyageai.error import VoyageError
+
+        if not texts:
+            return np.zeros((0, 0), dtype=np.float32)
+        client = AsyncClient(
+            api_key=self.settings.api_key.get_secret_value(),
+            max_retries=self.settings.max_retries,
+            timeout=self.settings.timeout,
+        )
+        batches = pack_batches(texts, max_texts=self.settings.batch_texts, max_chars=self.settings.batch_chars)
+        blocks: list[np.ndarray | None] = [None] * len(batches)
+        limiter = Semaphore(self.settings.concurrency)
+
+        async def embed_batch(index: int, batch: list[str]) -> None:
+            async with limiter:
+                try:
+                    result = await client.embed(batch, model=self.settings.model, input_type=self.input_type)
+                except VoyageError as error:
+                    raise EmbedError(f"voyage embeddings failed: {error}") from error
+            blocks[index] = np.asarray(result.embeddings, dtype=np.float32)
+
+        try:
+            async with create_task_group() as group:
+                for index, batch in enumerate(batches):
+                    group.start_soon(embed_batch, index, batch)
+        except BaseExceptionGroup as failures:
+            raise failures.exceptions[0]
+        matrix = np.concatenate(blocks)
+        if not self.normalize:
+            return matrix
+        return matrix / np.maximum(np.linalg.norm(matrix, axis=1, keepdims=True), 1e-12)
+
+    @classmethod
+    def from_settings(
+        cls, *, input_type: Literal["query", "document"] = "document", normalize: bool = True
+    ) -> VoyageEmbedBackend:
+        """Build a backend from :class:`VoyageSettings`, loaded from the config file and environment."""
+        return cls(load(VoyageSettings), input_type=input_type, normalize=normalize)
 
 
 @dataclass(frozen=True, slots=True)

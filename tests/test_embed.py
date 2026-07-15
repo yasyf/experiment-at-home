@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sys
+from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING
 
 import anyio
@@ -9,10 +11,11 @@ import numpy as np
 import pytest
 
 from athome import embed
-from athome.embed import ApiBackend, EmbedError, EmbedIndex, LocalBackend
+from athome.config import load
+from athome.embed import ApiBackend, EmbedError, EmbedIndex, LocalBackend, VoyageEmbedBackend
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterator, Sequence
 
 
 class FakeBackend:
@@ -134,3 +137,105 @@ async def test_local_backend_embeds() -> None:
     result = await LocalBackend().embed(["hello world"])
     assert result.shape[0] == 1
     assert result.dtype == np.dtype("float32")
+
+
+class VoyageRecorder:
+    def __init__(self) -> None:
+        self.batches: list[list[str]] = []
+        self.input_types: list[str] = []
+        self.models: list[str] = []
+        self.vectors: dict[str, list[float]] = {}
+        self.client_kwargs: dict[str, object] = {}
+        self.fail = False
+        self.delay: Callable[[int], float] = lambda index: 0.0
+
+
+@pytest.fixture
+def fake_voyage(monkeypatch: pytest.MonkeyPatch) -> Iterator[VoyageRecorder]:
+    monkeypatch.setenv("VOYAGE_API_KEY", "vk")
+    load.cache_clear()
+    recorder = VoyageRecorder()
+
+    class VoyageError(Exception):
+        pass
+
+    class AsyncClient:
+        def __init__(self, **kwargs: object) -> None:
+            recorder.client_kwargs = kwargs
+
+        async def embed(self, texts: list[str], *, model: str, input_type: str) -> SimpleNamespace:
+            index = len(recorder.batches)
+            recorder.batches.append(list(texts))
+            recorder.input_types.append(input_type)
+            recorder.models.append(model)
+            await anyio.sleep(recorder.delay(index))
+            if recorder.fail:
+                raise VoyageError("voyage is down")
+            return SimpleNamespace(embeddings=[recorder.vectors[text] for text in texts])
+
+    module = ModuleType("voyageai")
+    module.AsyncClient = AsyncClient
+    error_module = ModuleType("voyageai.error")
+    error_module.VoyageError = VoyageError
+    module.error = error_module
+    monkeypatch.setitem(sys.modules, "voyageai", module)
+    monkeypatch.setitem(sys.modules, "voyageai.error", error_module)
+    yield recorder
+
+
+async def test_voyage_batches_by_item_count(fake_voyage: VoyageRecorder) -> None:
+    fake_voyage.vectors = {f"t{n}": [float(n), 0.0] for n in range(257)}
+    await VoyageEmbedBackend.from_settings().embed([f"t{n}" for n in range(257)])
+    assert [len(batch) for batch in fake_voyage.batches] == [256, 1]
+
+
+async def test_voyage_batches_by_char_budget(fake_voyage: VoyageRecorder) -> None:
+    texts = ["a" * 100_000, "b" * 100_000, "c" * 100_000]
+    fake_voyage.vectors = {text: [1.0, 0.0] for text in texts}
+    await VoyageEmbedBackend.from_settings().embed(texts)
+    assert [len(batch) for batch in fake_voyage.batches] == [2, 1]
+
+
+async def test_voyage_reassembles_vectors_in_input_order(
+    fake_voyage: VoyageRecorder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ATHOME_EMBED_VOYAGE_BATCH_TEXTS", "1")
+    load.cache_clear()
+    texts = ["p", "q", "r", "s"]
+    fake_voyage.vectors = {
+        "p": [1.0, 0.0, 0.0, 0.0],
+        "q": [0.0, 1.0, 0.0, 0.0],
+        "r": [0.0, 0.0, 1.0, 0.0],
+        "s": [0.0, 0.0, 0.0, 1.0],
+    }
+    fake_voyage.delay = lambda index: 0.02 * (len(texts) - index)  # later batches finish first
+    result = await VoyageEmbedBackend.from_settings(normalize=False).embed(texts)
+    assert len(fake_voyage.batches) == len(texts)  # batch_texts=1 => one batch per text
+    assert result.tolist() == [fake_voyage.vectors[text] for text in texts]
+
+
+@pytest.mark.parametrize("input_type", ["query", "document"])
+async def test_voyage_input_type_reaches_client(fake_voyage: VoyageRecorder, input_type: str) -> None:
+    fake_voyage.vectors = {"hi": [1.0, 0.0]}
+    await VoyageEmbedBackend.from_settings(input_type=input_type).embed(["hi"])
+    assert fake_voyage.input_types == [input_type]
+    assert fake_voyage.models == ["voyage-4-large"]
+
+
+@pytest.mark.parametrize(
+    "normalize, expected",
+    [(False, [3.0, 4.0]), (True, [0.6, 0.8])],
+    ids=["raw", "unit-norm"],
+)
+async def test_voyage_normalize_flag(fake_voyage: VoyageRecorder, normalize: bool, expected: list[float]) -> None:
+    fake_voyage.vectors = {"a": [3.0, 4.0]}
+    result = await VoyageEmbedBackend.from_settings(normalize=normalize).embed(["a"])
+    assert result.dtype == np.dtype("float32")
+    assert np.allclose(result, [expected])
+
+
+async def test_voyage_wraps_client_failure_in_embed_error(fake_voyage: VoyageRecorder) -> None:
+    fake_voyage.vectors = {"a": [1.0, 0.0]}
+    fake_voyage.fail = True
+    with pytest.raises(EmbedError):
+        await VoyageEmbedBackend.from_settings().embed(["a"])

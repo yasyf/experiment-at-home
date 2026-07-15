@@ -33,6 +33,7 @@ ocr = ["ocrmac>=1.0"]
 modal = ["modal>=0.66"]
 hf = ["huggingface-hub>=0.26"]
 embed = ["numpy>=2", "sentence-transformers>=3"]
+embed-voyage = ["voyageai>=0.3.7", "numpy>=2"]
 research = ["numpy>=2"]
 # mlx / mlx-lm run in a uvx sidecar, and trl / peft only exist inside the Modal
 # image — none of those belong in the installed set. transformers does: the tinker

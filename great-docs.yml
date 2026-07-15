@@ -140,6 +140,17 @@ reference:
     desc: The shared aiosqlite scaffold.
     contents:
       - store.Store
+  - title: Embed
+    desc: Batch text-embedding backends and a digest-keyed incremental index with MMR rerank.
+    contents:
+      - embed.EmbedBackend
+      - embed.ApiBackend
+      - embed.LocalBackend
+      - embed.VoyageEmbedBackend
+      - embed.EmbedIndex
+      - embed.EmbedSettings
+      - embed.VoyageSettings
+      - embed.EmbedError
   - title: Registry
     desc: Content-addressed artifact versions with an atomic current promotion.
     contents:
