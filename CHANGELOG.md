@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - `athome.embed.VoyageEmbedBackend` — the Voyage AI `/embeddings` API as an `EmbedBackend`, behind the new `embed-voyage` extra (`voyageai`, `numpy`). Dual-budget batching caps each request by both item count (`batch_texts`, ≤256) and total characters (`batch_chars`, ≤240k); batches run concurrently under a `concurrency` semaphore and the vectors are reassembled in input order. `input_type` (`query`/`document`) and `normalize` are per-instance construction state, so a consumer builds one document backend and one query backend. `VoyageSettings` binds `[embed.voyage]` / `ATHOME_EMBED_VOYAGE_*` and reads the canonical `VOYAGE_API_KEY`.
+- `athome.registry.components` / `rollback` / `prune` — generic registry verbs. `components` lists the artifact families under a root; `rollback` repoints `current` to the version registered before the current promotion (raising when none exists); `prune` deletes all but the newest `keep` versions while always retaining the one `current` points to. `rollback` and `prune` serialise under the family lock, and `prune` unfreezes each version directory before removing it.
 
 ## [0.4.0] - 2026-07-14
 

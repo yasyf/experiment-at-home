@@ -15,9 +15,12 @@ from athome.registry import (
     VERSION_STAGING_PREFIX,
     RegistryError,
     VersionInfo,
+    components,
     current,
     promote,
+    prune,
     register,
+    rollback,
     versions,
 )
 
@@ -243,3 +246,76 @@ async def test_promote_unknown_version_raises(tmp_path: Path) -> None:
 async def test_versions_of_unknown_family_is_empty(tmp_path: Path) -> None:
     assert await versions("nope", root=tmp_path) == []
     assert await current("nope", root=tmp_path) is None
+
+
+async def test_components_lists_registered_families_sorted(tmp_path: Path) -> None:
+    await register("zeta", {"m": b"a"}, {}, root=tmp_path)
+    await register("alpha", {"m": b"b"}, {}, root=tmp_path)
+    await register("alpha", {"m": b"c"}, {}, root=tmp_path)
+    # The per-family <name>.lock files are regular files, not directories, so they stay out.
+    assert await components(tmp_path) == ("alpha", "zeta")
+
+
+async def test_components_of_missing_root_is_empty(tmp_path: Path) -> None:
+    assert await components(tmp_path / "nope") == ()
+
+
+async def test_rollback_repoints_current_to_prior_version(tmp_path: Path) -> None:
+    await register("toy", {"m": b"a"}, {}, root=tmp_path)
+    v2 = await register("toy", {"m": b"b"}, {}, root=tmp_path)
+    v3 = await register("toy", {"m": b"c"}, {}, root=tmp_path)
+    await promote("toy", v3.version, root=tmp_path)
+
+    rolled = await rollback("toy", root=tmp_path)
+
+    assert rolled.version == v2.version
+    promoted = await current("toy", root=tmp_path)
+    assert promoted is not None and promoted.version == v2.version
+
+
+async def test_rollback_from_earliest_version_raises(tmp_path: Path) -> None:
+    v1 = await register("toy", {"m": b"a"}, {}, root=tmp_path)
+    await register("toy", {"m": b"b"}, {}, root=tmp_path)
+    await promote("toy", v1.version, root=tmp_path)
+    with pytest.raises(RegistryError):
+        await rollback("toy", root=tmp_path)
+
+
+async def test_rollback_without_promotion_raises(tmp_path: Path) -> None:
+    await register("toy", {"m": b"a"}, {}, root=tmp_path)
+    with pytest.raises(RegistryError):
+        await rollback("toy", root=tmp_path)
+
+
+async def test_prune_keeps_newest_and_removes_the_rest(tmp_path: Path) -> None:
+    for content in (b"a", b"b", b"c", b"d", b"e"):
+        await register("toy", {"m": content}, {}, root=tmp_path)
+
+    removed = await prune("toy", keep=2, root=tmp_path)
+
+    # Removed versions are frozen read-only on disk, so a passing rmtree proves the unfreeze.
+    assert [info.number for info in removed] == [1, 2, 3]
+    assert not any(info.path.exists() for info in removed)
+    assert [info.number for info in await versions("toy", root=tmp_path)] == [4, 5]
+
+
+async def test_prune_never_deletes_the_current_version(tmp_path: Path) -> None:
+    v1 = await register("toy", {"m": b"a"}, {}, root=tmp_path)
+    for content in (b"b", b"c", b"d"):
+        await register("toy", {"m": content}, {}, root=tmp_path)
+    await promote("toy", v1.version, root=tmp_path)  # current is the oldest version
+
+    removed = await prune("toy", keep=1, root=tmp_path)
+
+    assert v1.version not in {info.version for info in removed}
+    surviving = {info.number for info in await versions("toy", root=tmp_path)}
+    assert surviving == {1, 4}  # current (outside the keep=1 window) plus the newest
+    promoted = await current("toy", root=tmp_path)
+    assert promoted is not None and promoted.version == v1.version
+
+
+async def test_prune_keep_larger_than_count_removes_nothing(tmp_path: Path) -> None:
+    await register("toy", {"m": b"a"}, {}, root=tmp_path)
+    await register("toy", {"m": b"b"}, {}, root=tmp_path)
+    assert await prune("toy", keep=5, root=tmp_path) == ()
+    assert [info.number for info in await versions("toy", root=tmp_path)] == [1, 2]

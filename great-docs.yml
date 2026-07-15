@@ -159,6 +159,9 @@ reference:
       - registry.current
       - registry.register
       - registry.promote
+      - registry.rollback
+      - registry.prune
+      - registry.components
       - registry.RegistryError
   - title: Train
     desc: LoRA fine-tuning over tinker, local mlx-lm, or modal.
