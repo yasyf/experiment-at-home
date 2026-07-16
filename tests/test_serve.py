@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import anyio
 import httpx
 import pytest
+from click.testing import CliRunner
 
 from athome import serve
 from athome.config import load
@@ -390,6 +392,16 @@ def test_command_for_refuses_an_override_on_llama_server(monkeypatch: pytest.Mon
     configure_llama_server(monkeypatch)
     with pytest.raises(ServeError, match="no model or port override"):
         command_for("llama-server", model="/runs/watcher/fused")
+
+
+def test_the_cli_defaults_every_recipe_argument_to_rapid_mlx(monkeypatch: pytest.MonkeyPatch) -> None:
+    configure_rapid_mlx(monkeypatch)
+    mock_health(monkeypatch, 200)
+
+    result = CliRunner().invoke(serve.cli, ["status", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {"recipe": "rapid-mlx", "healthy": True}
 
 
 def test_an_overridden_server_is_a_distinct_process_from_the_configured_one(

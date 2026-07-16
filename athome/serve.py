@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 type Recipe = Literal["rapid-mlx", "mlx-vlm", "llama-server"]
 
 RECIPES: tuple[Recipe, ...] = ("rapid-mlx", "mlx-vlm", "llama-server")
+DEFAULT_RECIPE: Recipe = "rapid-mlx"
 HEALTH_TIMEOUT_S = 1.0
 READY_TIMEOUT_S = 120.0
 READY_POLL_S = 1.0
@@ -347,31 +348,31 @@ def cli() -> None:
 
 
 @cli.command("up")
-@click.argument("recipe", type=RECIPE_CHOICE)
+@click.argument("recipe", type=RECIPE_CHOICE, default=DEFAULT_RECIPE)
 @click.option("--persistent", is_flag=True, help="Install a launchd KeepAlive agent instead of a detached run.")
 @json_option
 @coro
 async def up_command(recipe: str, persistent: bool, as_json: bool) -> None:
-    """Start RECIPE and wait for it to report healthy."""
+    """Start RECIPE (default rapid-mlx) and wait for it to report healthy."""
     emit(asdict(await up(recipe, persistent=persistent)), as_json=as_json)
 
 
 @cli.command("down")
-@click.argument("recipe", type=RECIPE_CHOICE)
+@click.argument("recipe", type=RECIPE_CHOICE, default=DEFAULT_RECIPE)
 @json_option
 @coro
 async def down_command(recipe: str, as_json: bool) -> None:
-    """Stop RECIPE."""
+    """Stop RECIPE (default rapid-mlx)."""
     await down(recipe)
     emit({"stopped": recipe}, as_json=as_json)
 
 
 @cli.command("status")
-@click.argument("recipe", type=RECIPE_CHOICE)
+@click.argument("recipe", type=RECIPE_CHOICE, default=DEFAULT_RECIPE)
 @json_option
 @coro
 async def status_command(recipe: str, as_json: bool) -> None:
-    """Print RECIPE's current health."""
+    """Print RECIPE's current health (default rapid-mlx)."""
     emit({"recipe": recipe, "healthy": await ManagedServer(recipe).health()}, as_json=as_json)
 
 
