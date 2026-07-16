@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -11,6 +12,9 @@ if TYPE_CHECKING:
     from athome.research.spec import ExperimentSpec
 
 RECENT_UNITS = 10
+
+HISTORY_LINE_MAX = 240
+NEWLINE_PLACEHOLDER = "⏎"
 
 BUDGET_LOW_WARNING = (
     "## Budget is nearly exhausted\n"
@@ -27,8 +31,18 @@ def show_metric(value: float | None) -> str:
     return "unscored" if value is None else str(value)
 
 
+def sanitize_history(text: str) -> str:
+    clean = "".join(
+        NEWLINE_PLACEHOLDER if ch in "\r\n" else " " if unicodedata.category(ch) == "Cc" else "'" if ch == "`" else ch
+        for ch in text
+    )
+    return clean if len(clean) <= HISTORY_LINE_MAX else f"{clean[: HISTORY_LINE_MAX - 1]}…"
+
+
 def history_line(row: JournalRow) -> str:
-    return f"unit {row.unit} [{row.verdict.value}] metric={show_metric(row.metric)} — {row.description}"
+    return sanitize_history(
+        f"unit {row.unit} [{row.verdict.value}] metric={show_metric(row.metric)} — {row.description}"
+    )
 
 
 def render_history(memory: Memory) -> str:

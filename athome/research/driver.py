@@ -32,6 +32,15 @@ class CostError(ResearchError):
     """A run log carried no valid ``total_cost_usd`` envelope (missing, non-number, or out of range)."""
 
 
+class MetricShapeError(ResearchError):
+    """A candidate metric file reported a value of the wrong shape for the metric key.
+
+    The message names only the offending value's type and the metric key, never the
+    candidate-controlled value itself, so it stays safe to journal and render into the
+    next proposal's contract.
+    """
+
+
 class Driver(Protocol):
     """A proposer that edits the mutable files in a plain candidate directory.
 
@@ -51,7 +60,19 @@ async def read_reported_metric(spec: ExperimentSpec, workdir: Path) -> float | N
     metric_file = anyio.Path(workdir) / spec.metric_file
     if not await metric_file.exists():
         return None
-    return float(json.loads(await metric_file.read_text())[spec.metric_key])
+    return reported_metric(json.loads(await metric_file.read_text()), spec.metric_key)
+
+
+def reported_metric(payload: object, key: str) -> float:
+    if not (isinstance(payload, dict) and key in payload):
+        raise MetricShapeError(f"reported metric file must be a JSON object with a {key!r} field")
+    match payload[key]:
+        case bool() as value:
+            raise MetricShapeError(f"reported {key!r} must be a real number, not {type(value).__name__}")
+        case int() | float() as value if isfinite(value):
+            return float(value)
+        case value:
+            raise MetricShapeError(f"reported {key!r} must be a finite real number, not {type(value).__name__}")
 
 
 def describe_change(label: str, spec: ExperimentSpec, changes: Sequence[TreeChange], reported: float | None) -> str:
