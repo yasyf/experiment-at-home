@@ -3,28 +3,41 @@
 A greedy keep/discard night must never journal a flaky network as failed research
 directions — one bad night would poison every future contract-memory and retro round.
 So a unit failure is split two ways. A *candidate* fault (an immutable-boundary
-violation, a metric of the wrong shape, a proposal timeout, a scorer that computed a
-bad number) is journaled as CRASH/DISCARD exactly as before and the loop continues.
-An *infra* fault (an OS or git-subprocess error, a connection reset, or a scorer that
-writes no metric while its withheld run log matches an :data:`INFRA_MARKERS` entry)
-is never journaled: the same unit index is retried up to :data:`MAX_INFRA_RETRIES`
-times, and if it keeps failing the run aborts loudly with :class:`InfraFailure`.
+violation, a metric of the wrong shape, a proposal timeout, git rejecting the
+candidate-controlled tree, or a scorer that computed a bad number) is journaled as
+CRASH/DISCARD exactly as before and the loop continues. An *infra* fault (an OS or
+harness-side git error on the incumbent, a connection reset, or a scorer that writes no
+metric while its withheld run log matches an :data:`INFRA_MARKERS` entry) is never
+journaled: the same unit index is retried up to :data:`MAX_INFRA_RETRIES` times, and if
+it keeps failing the run aborts loudly with :class:`InfraFailure`.
+
+Origin is what separates the two: git operating on candidate-controlled state (staging
+or committing the proposal's tree) is a *candidate* fault via :class:`CandidateFault` —
+a candidate that swaps a mutable file for a FIFO must journal CRASH and let the loop
+continue, not burn every retry and abort the run — while git on the trusted incumbent
+(``archive``/``read-tree`` of committed content) stays infra.
 
 Forgeability bound: candidate code inside ``metric_command`` can print an infra marker
-to its run log, but that buys it at most :data:`MAX_INFRA_RETRIES` deterministic
-re-scores of the same immutable commit — its mutable edits are frozen by the scoring
-boundary and re-scoring is deterministic — with the wall-clock budget still bounding
-every attempt and the retry count hard-capped. It can never manufacture a journaled
-row, so it cannot forge a keep, a discard, or contract-memory feedback; the worst it
-achieves is burning its own unit's budget before the run aborts. Worthless.
+to its run log, but a marker only fires *after* the proposal has been committed, so the
+retry re-scores that same immutable commit — it never re-proposes — and re-scoring is
+deterministic. Every attempt's proposal spend is accounted exactly once (the journaled
+outcome carries its own attempt's cost; a retried or aborted attempt records its cost in
+the sidecar), and every budget summation sums both, so the marker buys neither free
+dollars nor free wall-clock: the retry count is hard-capped, ``max_usd`` still counts the
+spend, and the run aborts. It can never manufacture a journaled row — no forged keep,
+discard, or contract-memory feedback — so the worst it achieves is burning its own unit's
+budget before the run aborts. Worthless.
 """
 
 from __future__ import annotations
 
+import json
+import os
 from subprocess import CalledProcessError
 from typing import TYPE_CHECKING, Literal
 
-from athome.progress import append_line, load_journal
+from loguru import logger
+
 from athome.research.errors import ResearchError
 
 if TYPE_CHECKING:
@@ -60,6 +73,14 @@ class InfraFailure(ResearchError):
     """
 
 
+class CandidateFault(ResearchError):
+    """Git rejected the candidate-controlled tree (e.g. a FIFO swapped into a mutable path).
+
+    A candidate fault, not machine trouble: it is journaled as a CRASH and the loop
+    continues, never consuming an infra retry or aborting the run.
+    """
+
+
 def infra_log(log: bytes) -> bool:
     text = log.decode("utf-8", "replace").casefold()
     return any(marker in text for marker in INFRA_MARKERS)
@@ -67,15 +88,44 @@ def infra_log(log: bytes) -> bool:
 
 def classify(exc: BaseException) -> Literal["infra", "candidate"]:
     match exc:
+        case CandidateFault():
+            return "candidate"
         case InfraFailure() | OSError() | CalledProcessError():
             return "infra"
         case _:
             return "candidate"
 
 
-async def record_infra_event(path: Path, *, unit: int, attempt: int, reason: str) -> None:
-    await append_line(path, {"unit": unit, "attempt": attempt, "reason": reason})
+async def record_infra_event(path: Path, *, unit: int, attempt: int, reason: str, cost: float) -> None:
+    payload = (json.dumps({"unit": unit, "attempt": attempt, "reason": reason, "cost": cost}) + "\n").encode()
+    fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        if (size := os.fstat(fd).st_size) and os.pread(fd, 1, size - 1) != b"\n":
+            os.write(fd, b"\n")  # heal a torn prior line so this record never concatenates onto it
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(fd, payload[offset:])
+    finally:
+        os.close(fd)
+
+
+def infra_events(path: Path) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    return [record for line in path.read_text().splitlines() if isinstance(record := parse_event(line, path), dict)]
+
+
+def parse_event(line: str, path: Path) -> dict[str, object] | None:
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        logger.warning("skipping malformed infra sidecar line in {}", path)
+        return None
 
 
 def infra_retries(path: Path) -> int:
-    return len(load_journal(path))
+    return len(infra_events(path))
+
+
+def infra_cost(path: Path) -> float:
+    return sum(float(event.get("cost", 0.0)) for event in infra_events(path))

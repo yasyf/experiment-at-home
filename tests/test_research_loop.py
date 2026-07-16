@@ -704,9 +704,9 @@ async def test_measure_rejects_a_fifo_metric_file_without_blocking(tmp_path: Pat
     spec = make_spec(budget=Budget(max_units=1))
 
     with anyio.fail_after(5.0):  # a blocking FIFO read would hang here forever
-        metric, _log = await measure(spec, tmp_path)
+        measurement = await measure(spec, tmp_path)
 
-    assert metric is None
+    assert measurement.metric is None and measurement.produced is False
 
 
 # --- Budget + process control + crash resilience.
@@ -1059,8 +1059,8 @@ def write_infra_candidate(workdir: Path) -> None:
 
 
 async def test_infra_marked_scorer_is_retried_then_aborts(tmp_path: Path) -> None:
-    # An infra marker with no metric is machine trouble: retry MAX_INFRA_RETRIES times, journal
-    # nothing, record the retries in the sidecar, then abort loudly — never a fake DISCARD.
+    # An infra marker with no metric is machine trouble: score the same commit MAX_INFRA_RETRIES+1
+    # times, journal nothing, record every attempt in the sidecar, then abort — never a fake DISCARD.
     counter = tmp_path / "scorer-runs"
     (repo_dir := tmp_path / "repo").mkdir()
     repo = special_repo(repo_dir, score_py=infra_score_py(counter))
@@ -1070,9 +1070,9 @@ async def test_infra_marked_scorer_is_retried_then_aborts(tmp_path: Path) -> Non
 
     assert journal_rows(repo) == []  # infra never touches the row journal
     records = infra_events(repo)
-    assert [record["attempt"] for record in records] == list(range(MAX_INFRA_RETRIES))  # one per retry
+    assert [record["attempt"] for record in records] == list(range(MAX_INFRA_RETRIES + 1))  # every attempt
     assert all(record["unit"] == 0 for record in records)
-    assert len(counter.read_text()) == MAX_INFRA_RETRIES + 1  # one initial score + MAX_INFRA_RETRIES retries
+    assert len(counter.read_text()) == MAX_INFRA_RETRIES + 1  # re-scored the same commit, never re-proposed
 
 
 async def test_plain_exit1_scorer_is_a_crash_not_infra(tmp_path: Path) -> None:
@@ -1109,3 +1109,61 @@ async def test_resume_after_infra_abort_reruns_the_same_unit_index(tmp_path: Pat
     assert [row.unit for row in rows] == [0]  # resumed at the un-journaled unit index
     assert rows[0].verdict is Verdict.KEEP and rows[0].metric == 0.5
     assert result.kept == 1
+
+
+async def test_infra_abort_bills_the_proposal_cost_once_for_resume(tmp_path: Path) -> None:
+    # Findings #1+#2: a paid proposal that fails infra at scoring re-scores the SAME commit, so its
+    # $0.60 is billed once (not per re-propose); the aborted spend survives in the sidecar for resume.
+    counter = tmp_path / "scorer-runs"
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = special_repo(repo_dir, score_py=infra_score_py(counter))
+
+    with pytest.raises(InfraFailure):
+        await run(
+            make_spec(budget=Budget(max_units=2, max_usd=0.7)),
+            driver=HostileDriver(write_infra_candidate, cost=0.6),
+            repo=repo,
+        )
+
+    assert journal_rows(repo) == []
+    assert sum(record["cost"] for record in infra_events(repo)) == pytest.approx(0.6)  # billed once, not 3×
+
+    # Resume: the sidecar's $0.60 is counted, so a fresh $0.60 KEEP crosses the $0.70 cap and aborts.
+    with pytest.raises(BudgetExhausted):
+        await run(
+            make_spec(budget=Budget(max_units=2, max_usd=0.7)),
+            driver=CostDriver(iter([loss_proposal(0.4)]), cost=0.6),
+            repo=repo,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SequenceDriver:
+    """Replays a scripted sequence of raw candidate-dir mutations, one per proposal."""
+
+    actions: Iterator[Callable[[Path], None]]
+    label: str = "seq"
+    cost: float = 0.0
+
+    async def propose(self, contract: str, workdir: Path) -> float:
+        next(self.actions)(Path(workdir))
+        return self.cost
+
+
+async def test_fifo_in_a_mutable_path_is_a_candidate_crash(tmp_path: Path) -> None:
+    # Finding #3: git rejecting the candidate's own tree (a FIFO swapped into a mutable path) is a
+    # candidate fault — CRASH, loop continues — not an infra abort that burns retries.
+    repo = toy_repo(tmp_path)
+
+    def plant_fifo(workdir: Path) -> None:
+        (workdir / "train.py").unlink()
+        os.mkfifo(workdir / "train.py")
+
+    driver = SequenceDriver(iter([plant_fifo, lambda workdir: (workdir / "train.py").write_text("LOSS = 0.4\n")]))
+    result = await run(make_spec(budget=Budget(max_units=2)), driver=driver, repo=repo)
+
+    rows = journal_rows(repo)
+    assert [row.verdict for row in rows] == [Verdict.CRASH, Verdict.KEEP]  # candidate crash, loop continued
+    assert "CandidateFault" in rows[0].description
+    assert rows[1].metric == 0.4 and result.kept == 1
+    assert infra_events(repo) == []  # never treated as infra

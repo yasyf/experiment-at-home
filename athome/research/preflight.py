@@ -113,13 +113,13 @@ async def preflight(
     elif cached is not None and cached.commit == incumbent and cached.spec_digest == digest:
         baseline = checked_metric(cached.metric, probe="cached baseline")
     else:
-        metric, _log = await score_commit(
+        measured = await score_commit(
             spec,
             repo=repo,
             score_dir=scratch_dir / "baseline",
             commit=incumbent,
         )
-        baseline = checked_metric(metric, probe="baseline")
+        baseline = checked_metric(measured.metric, probe="baseline")
         await atomic_write_text(
             anyio.Path(baseline_path),
             json.dumps({"commit": incumbent, "metric": baseline, "spec_digest": digest}),
@@ -130,13 +130,13 @@ async def preflight(
         checks.extend(("stability: skipped (resume)", "reachability: skipped (resume)"))
         return PreflightReport(checks=tuple(checks), baseline=baseline)
 
-    repeated, _log = await score_commit(
+    repeated = await score_commit(
         spec,
         repo=repo,
         score_dir=scratch_dir / "stability",
         commit=incumbent,
     )
-    stable = checked_metric(repeated, probe="stability")
+    stable = checked_metric(repeated.metric, probe="stability")
     within_tolerance = stable == baseline if baseline == 0 else abs(stable - baseline) / abs(baseline) <= STABILITY_RTOL
     if not within_tolerance:
         raise PreflightFailure(
@@ -159,8 +159,8 @@ async def preflight(
         raise PreflightFailure(
             f"known_good_dir {spec.known_good_dir!r} could not be copied for reachability: {error}"
         ) from error
-    reachable, _log = await measure(spec, reachability_dir)
-    reachable_metric = checked_metric(reachable, probe="reachability")
+    reachable = await measure(spec, reachability_dir)
+    reachable_metric = checked_metric(reachable.metric, probe="reachability")
     if not monotone_gate(reachable_metric, baseline, direction=spec.direction):
         raise PreflightFailure(
             f"known-good metric {reachable_metric} does not strictly beat frozen baseline {baseline} "

@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from subprocess import PIPE, STDOUT
+from subprocess import PIPE, STDOUT, CalledProcessError
 from typing import TYPE_CHECKING, Literal
 
 import anyio
@@ -24,7 +24,15 @@ from athome.research.common import Hasher
 from athome.research.contract import Memory, build_contract
 from athome.research.driver import describe_change, read_reported_metric
 from athome.research.errors import ResearchError
-from athome.research.failures import MAX_INFRA_RETRIES, InfraFailure, classify, infra_log, record_infra_event
+from athome.research.failures import (
+    MAX_INFRA_RETRIES,
+    CandidateFault,
+    InfraFailure,
+    classify,
+    infra_cost,
+    infra_log,
+    record_infra_event,
+)
 from athome.research.gate import immutable_violations, monotone_gate, parse_diff_tree
 from athome.research.journal import Journal, JournalRow, Verdict
 from athome.research.spec import BudgetExhausted, ConcurrentRun, PoisonedJournal, ProposalTimeout, finite_number
@@ -67,6 +75,20 @@ class Baseline:
     commit: str
     metric: float | None
     spec_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class Measurement:
+    metric: float | None
+    log: bytes
+    produced: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Candidate:
+    commit: str
+    description: str
+    cost: float
 
 
 class InvalidBaseline(ResearchError):
@@ -129,13 +151,13 @@ async def regular_file(path: anyio.Path) -> bool:
     return stat.S_ISREG(info.st_mode)
 
 
-async def measure(spec: ExperimentSpec, workdir: Path) -> tuple[float | None, bytes]:
+async def measure(spec: ExperimentSpec, workdir: Path) -> Measurement:
     metric_path = anyio.Path(workdir) / spec.metric_file
     await metric_path.unlink(missing_ok=True)
     returncode, log = await run_metric(spec.metric_command, workdir, hard_kill_s=spec.budget.hard_kill_s)
     if returncode != 0 or not await regular_file(metric_path):
-        return None, log
-    return finite_metric(await metric_path.read_text(), spec.metric_key), log
+        return Measurement(metric=None, log=log, produced=False)
+    return Measurement(finite_metric(await metric_path.read_text(), spec.metric_key), log, produced=True)
 
 
 def decide(metric: float | None, incumbent: float | None, *, direction: Literal["min", "max"]) -> Verdict:
@@ -148,7 +170,7 @@ def decide(metric: float | None, incumbent: float | None, *, direction: Literal[
             return Verdict.DISCARD
 
 
-async def score_commit(spec: ExperimentSpec, *, repo: Path, score_dir: Path, commit: str) -> tuple[float | None, bytes]:
+async def score_commit(spec: ExperimentSpec, *, repo: Path, score_dir: Path, commit: str) -> Measurement:
     await extract_tree(repo, commit, score_dir)
     return await measure(spec, score_dir)
 
@@ -170,55 +192,74 @@ async def read_baseline(path: anyio.Path) -> Baseline | None:
         raise InvalidBaseline(path) from error
 
 
-async def evaluate_unit(
+async def stage_candidate(
     spec: ExperimentSpec,
     *,
     repo: Path,
     workdir: Path,
-    score_dir: Path,
     index: Path,
     incumbent: str,
-    incumbent_metric: float | None,
-    contract: str,
-    driver: Driver,
-) -> UnitOutcome:
-    await extract_tree(repo, incumbent, workdir)
-    cost = await driver.propose(contract, workdir)
-    reported = await read_reported_metric(spec, workdir)
-    await (anyio.Path(workdir) / spec.metric_file).unlink(missing_ok=True)
-    await run_git(repo, "read-tree", incumbent, index=index)
-    await run_git(repo, "add", "-A", index=index, work_tree=workdir)
-    changes = parse_diff_tree(
-        await run_git(repo, "diff-index", "--cached", "--no-renames", "-r", "-z", "--raw", incumbent, index=index)
-    )
-    description = describe_change(driver.label, spec, changes, reported)
+    label: str,
+    cost: float,
+    reported: float | None,
+) -> UnitOutcome | Candidate:
+    try:
+        await run_git(repo, "read-tree", incumbent, index=index)
+        await run_git(repo, "add", "-A", index=index, work_tree=workdir)
+        changes = parse_diff_tree(
+            await run_git(repo, "diff-index", "--cached", "--no-renames", "-r", "-z", "--raw", incumbent, index=index)
+        )
+    except CalledProcessError as exc:
+        raise CandidateFault(f"git rejected the staged candidate tree: {exc}") from exc
+    description = describe_change(label, spec, changes, reported)
     if not changes:
         return UnitOutcome(Verdict.CRASH, None, incumbent, f"{description} | empty proposal, nothing to commit", cost)
     if violations := immutable_violations(changes, mutable=spec.mutable_paths, immutable=spec.immutable_paths):
         reason = f"{description} | ImmutableViolation: {sorted(violations)}"
         return UnitOutcome(Verdict.DISCARD, None, incumbent, reason, cost)
-    tree = (await run_git(repo, "write-tree", index=index)).strip()
-    commit = (
-        await run_git(
-            repo,
-            "-c",
-            "user.name=athome",
-            "-c",
-            "user.email=athome@localhost",
-            "commit-tree",
-            tree,
-            "-p",
-            incumbent,
-            "-m",
-            description,
-            index=index,
-        )
-    ).strip()
-    metric, log = await score_commit(spec, repo=repo, score_dir=score_dir, commit=commit)
-    if metric is None and not await regular_file(anyio.Path(score_dir) / spec.metric_file) and infra_log(log):
+    try:
+        tree = (await run_git(repo, "write-tree", index=index)).strip()
+        commit = (
+            await run_git(
+                repo,
+                "-c",
+                "user.name=athome",
+                "-c",
+                "user.email=athome@localhost",
+                "commit-tree",
+                tree,
+                "-p",
+                incumbent,
+                "-m",
+                description,
+                index=index,
+            )
+        ).strip()
+    except CalledProcessError as exc:
+        raise CandidateFault(f"git rejected the candidate commit: {exc}") from exc
+    return Candidate(commit=commit, description=description, cost=cost)
+
+
+async def score_candidate(
+    spec: ExperimentSpec,
+    *,
+    repo: Path,
+    score_dir: Path,
+    candidate: Candidate,
+    incumbent_metric: float | None,
+    cost: float,
+) -> UnitOutcome:
+    measurement = await score_commit(spec, repo=repo, score_dir=score_dir, commit=candidate.commit)
+    if measurement.metric is None and not measurement.produced and infra_log(measurement.log):
         raise InfraFailure("scorer produced no metric file and its run log matched an infra marker")
-    logger.debug("unit metric log ({} bytes) captured, withheld from the next contract", len(log))
-    return UnitOutcome(decide(metric, incumbent_metric, direction=spec.direction), metric, commit, description, cost)
+    logger.debug("unit metric log ({} bytes) captured, withheld from the next contract", len(measurement.log))
+    return UnitOutcome(
+        decide(measurement.metric, incumbent_metric, direction=spec.direction),
+        measurement.metric,
+        candidate.commit,
+        candidate.description,
+        cost,
+    )
 
 
 def budget_low(budget: Budget, *, unit: int, elapsed: float) -> bool:
@@ -276,23 +317,45 @@ async def run_unit(
     events: Path,
     deadline: float | None,
 ) -> UnitOutcome | None:
+    committed: Candidate | None = None
+    billed = False
     for attempt in range(MAX_INFRA_RETRIES + 1):
         remaining = None if deadline is None else deadline - time.monotonic()
         if remaining is not None and remaining <= 0:
             return None
+        cost = 0.0
         infra: BaseException | None = None
         with anyio.move_on_after(remaining):
             try:
-                return await evaluate_unit(
+                if committed is not None:
+                    candidate = committed  # a prior attempt already built it: re-score the same commit
+                else:
+                    workdir = worktrees / f"unit-{unit}-{attempt}"
+                    await extract_tree(repo, incumbent, workdir)
+                    cost = await driver.propose(contract, workdir)
+                    reported = await read_reported_metric(spec, workdir)
+                    await (anyio.Path(workdir) / spec.metric_file).unlink(missing_ok=True)
+                    match await stage_candidate(
+                        spec,
+                        repo=repo,
+                        workdir=workdir,
+                        index=worktrees / f"unit-{unit}-{attempt}.index",
+                        incumbent=incumbent,
+                        label=driver.label,
+                        cost=cost,
+                        reported=reported,
+                    ):
+                        case UnitOutcome() as terminal:
+                            return terminal  # empty proposal or immutable violation: journaled with its cost
+                        case Candidate() as candidate:
+                            committed = candidate
+                return await score_candidate(
                     spec,
                     repo=repo,
-                    workdir=worktrees / f"unit-{unit}-{attempt}",
                     score_dir=worktrees / f"score-{unit}-{attempt}",
-                    index=worktrees / f"unit-{unit}-{attempt}.index",
-                    incumbent=incumbent,
+                    candidate=candidate,
                     incumbent_metric=incumbent_metric,
-                    contract=contract,
-                    driver=driver,
+                    cost=0.0 if billed else candidate.cost,
                 )
             except ProposalTimeout as exc:
                 # A hung proposal killed on timeout still counts its recovered spend.
@@ -301,18 +364,21 @@ async def run_unit(
             except Exception as exc:
                 match classify(exc):
                     case "candidate":
-                        # The overnight contract: a candidate-caused crash is journaled and the
-                        # loop continues, it never aborts the run (BudgetExhausted still propagates).
+                        # Candidate crash: journaled with its proposal cost; the loop continues.
                         logger.warning("unit {} crashed: {!r}", unit, exc)
-                        return UnitOutcome(Verdict.CRASH, None, incumbent, f"crash: {exc!r}", 0.0)
+                        crash_cost = committed.cost if committed is not None else cost
+                        return UnitOutcome(Verdict.CRASH, None, incumbent, f"crash: {exc!r}", crash_cost)
                     case "infra":
                         infra = exc
         if infra is None:
             return None  # the unit blew past the remaining wall budget and was cancelled
+        # A committed candidate re-scores (bill its cost once); a pre-commit failure re-proposes.
+        attempt_cost = (committed.cost if not billed else 0.0) if committed is not None else cost
+        billed = billed or committed is not None
+        await record_infra_event(events, unit=unit, attempt=attempt, reason=repr(infra), cost=attempt_cost)
+        logger.warning("unit {} infra failure, attempt {}/{}: {!r}", unit, attempt, MAX_INFRA_RETRIES, infra)
         if attempt == MAX_INFRA_RETRIES:
             raise InfraFailure(f"unit {unit} aborted after {MAX_INFRA_RETRIES} infra retries") from infra
-        await record_infra_event(events, unit=unit, attempt=attempt, reason=repr(infra))
-        logger.warning("unit {} infra failure, retry {}/{}: {!r}", unit, attempt + 1, MAX_INFRA_RETRIES, infra)
 
 
 async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_notes: bool = False) -> LoopResult:
@@ -339,11 +405,16 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
     incumbent, best-so-far, and the most recent units with their verdicts and discard
     reasons), never the withheld run log. A strict monotone improvement is kept (branch
     advanced, incumbent updated); anything else discards, and a candidate-caused crash or
-    over-time unit is journaled and the loop continues. An infrastructure failure — an OS or
-    git-subprocess error, or a scorer that writes no metric while its withheld run log matches
-    an infra marker — is never journaled: the same unit index is retried up to
-    ``MAX_INFRA_RETRIES`` times and, if it keeps failing, the run aborts loudly with
-    :class:`InfraFailure`, so one flaky night is never recorded as failed research directions.
+    over-time unit is journaled and the loop continues — including git rejecting the
+    candidate's own tree (a FIFO swapped into a mutable path), which is a candidate fault, not
+    machine trouble. An infrastructure failure — an OS or harness-side git error on the
+    incumbent, or a scorer that writes no metric while its withheld run log matches an infra
+    marker — is never journaled: the same unit index is retried up to ``MAX_INFRA_RETRIES``
+    times (a committed candidate re-scores that immutable commit rather than re-proposing) and,
+    if it keeps failing, the run aborts loudly with :class:`InfraFailure`, so one flaky night is
+    never recorded as failed research directions. Every attempt's proposal spend is accounted —
+    the journaled outcome carries its own cost, a retried or aborted attempt records its cost in
+    the sidecar — and ``max_usd`` sums both.
     Spend is measured per unit — including the spend recovered from a hung unit killed on
     timeout — and the run aborts when it crosses ``max_usd``; work is bounded within a
     unit by the remaining wall budget. A per-experiment ``flock`` serializes concurrent
@@ -378,7 +449,7 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
         branch = f"{EXPERIMENT_BRANCH_PREFIX}/{spec.name}"
         incumbent, incumbent_metric = await resume(repo, branch, journal, direction=spec.direction)
         resumed = bool(journal.rows())
-        spent = sum(row.resources.get("usd", 0.0) for row in journal.rows())
+        spent = sum(row.resources.get("usd", 0.0) for row in journal.rows()) + infra_cost(events)
 
         worktrees = Path(tempfile.mkdtemp(prefix=f"athome-{spec.name}-")).resolve()
         try:
@@ -434,7 +505,7 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
                 if outcome.verdict is Verdict.KEEP:
                     await run_git(repo, "branch", "-f", branch, outcome.commit)
                     incumbent, incumbent_metric = outcome.commit, outcome.metric
-                spent += outcome.cost
+                spent = sum(row.resources.get("usd", 0.0) for row in journal.rows()) + infra_cost(events)
                 if spec.budget.max_usd is not None and spent > spec.budget.max_usd:
                     raise BudgetExhausted(
                         f"spend ${spent:.4f} crossed max_usd ${spec.budget.max_usd:.4f} at unit {unit}"
