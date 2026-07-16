@@ -46,6 +46,7 @@ def summary_record(report: nightly.MorningReport) -> dict[str, object]:
         "units": report.units,
         "kept": report.kept,
         "crashes": report.crashes,
+        "infra_retries": report.infra_retries,
         "best": asdict(report.best) if report.best is not None else None,
     }
 

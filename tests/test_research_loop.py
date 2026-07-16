@@ -15,6 +15,7 @@ import pytest
 
 from athome.research.contract import Memory, build_contract
 from athome.research.driver import StubDriver, StubProposal
+from athome.research.failures import MAX_INFRA_RETRIES, InfraFailure
 from athome.research.journal import Journal, JournalRow, Verdict
 from athome.research.loop import baseline_digest, experiment_lock, measure, run, run_metric
 from athome.research.preflight import PreflightFailure
@@ -1006,3 +1007,84 @@ async def test_baseline_rescored_when_spec_digest_changes(tmp_path: Path) -> Non
         "metric": 1.0,
         "spec_digest": baseline_digest(spec),
     }
+
+
+# --- A3: infra-vs-candidate failure split (sidecar retry events, never journaled).
+
+
+def infra_score_py(counter: Path) -> str:
+    # Fails infra (marker, exit 1, no metric) only on the INFRA sentinel, tallying each such run.
+    return textwrap.dedent(f"""
+        import json, pathlib, sys
+        train = pathlib.Path("train.py").read_text()
+        if "INFRA" in train:
+            with pathlib.Path({str(counter)!r}).open("a") as fh:
+                fh.write("x")
+            print("connection reset by peer", file=sys.stderr)
+            sys.exit(1)
+        namespace = {{}}
+        exec(train, namespace)
+        pathlib.Path(".athome-metric.json").write_text(json.dumps({{"loss": namespace["LOSS"]}}))
+    """).strip()
+
+
+def infra_events(repo: Path) -> list[dict[str, object]]:
+    events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
+    return [json.loads(line) for line in events.read_text().splitlines()] if events.exists() else []
+
+
+def write_infra_candidate(workdir: Path) -> None:
+    (workdir / "train.py").write_text("LOSS = 0.5\n# INFRA\n")
+
+
+async def test_infra_marked_scorer_is_retried_then_aborts(tmp_path: Path) -> None:
+    # An infra marker with no metric is machine trouble: retry MAX_INFRA_RETRIES times, journal
+    # nothing, record the retries in the sidecar, then abort loudly — never a fake DISCARD.
+    counter = tmp_path / "scorer-runs"
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = special_repo(repo_dir, score_py=infra_score_py(counter))
+
+    with pytest.raises(InfraFailure):
+        await run(make_spec(budget=Budget(max_units=2)), driver=HostileDriver(write_infra_candidate), repo=repo)
+
+    assert journal_rows(repo) == []  # infra never touches the row journal
+    records = infra_events(repo)
+    assert [record["attempt"] for record in records] == list(range(MAX_INFRA_RETRIES))  # one per retry
+    assert all(record["unit"] == 0 for record in records)
+    assert len(counter.read_text()) == MAX_INFRA_RETRIES + 1  # one initial score + MAX_INFRA_RETRIES retries
+
+
+async def test_plain_exit1_scorer_is_a_crash_not_infra(tmp_path: Path) -> None:
+    # Regression guard: a nonzero exit with NO infra marker journals CRASH and writes no sidecar.
+    repo = toy_repo(tmp_path)
+    driver = StubDriver(iter([loss_proposal("undefined_symbol")]))
+
+    result = await run(make_spec(budget=Budget(max_units=1)), driver=driver, repo=repo)
+
+    (row,) = journal_rows(repo)
+    assert row.verdict is Verdict.CRASH and row.metric is None
+    assert result.kept == 0
+    assert infra_events(repo) == []  # no infra sidecar for a candidate crash
+
+
+async def test_resume_after_infra_abort_reruns_the_same_unit_index(tmp_path: Path) -> None:
+    # An infra abort journals nothing, so resume stays put: the second run (no marker) scores
+    # cleanly and journals that very unit index (0), never unit 1+.
+    counter = tmp_path / "scorer-runs"
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = special_repo(repo_dir, score_py=infra_score_py(counter))
+
+    with pytest.raises(InfraFailure):
+        await run(make_spec(budget=Budget(max_units=2)), driver=HostileDriver(write_infra_candidate), repo=repo)
+    assert journal_rows(repo) == []
+
+    result = await run(
+        make_spec(budget=Budget(max_units=1)),
+        driver=HostileDriver(lambda workdir: (workdir / "train.py").write_text("LOSS = 0.5\n")),
+        repo=repo,
+    )
+
+    rows = journal_rows(repo)
+    assert [row.unit for row in rows] == [0]  # resumed at the un-journaled unit index
+    assert rows[0].verdict is Verdict.KEEP and rows[0].metric == 0.5
+    assert result.kept == 1

@@ -108,6 +108,24 @@ async def test_report_summarizes_the_journal(tmp_path: Path) -> None:
     assert (report.experiment, report.units, report.kept, report.crashes) == ("toy", 3, 1, 1)
     assert report.best is not None and report.best.metric == 0.5
     assert len(report.rows) == 3
+    assert report.infra_retries == 0  # no infra sidecar for this clean run
+
+
+async def test_report_counts_infra_retries_from_the_sidecar(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    spec = await drive(repo, StubProposal({"train.py": "LOSS = 0.5\n"}))
+    events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
+    events.write_text(
+        json.dumps({"unit": 1, "attempt": 0, "reason": "OSError('reset')"})
+        + "\n"
+        + json.dumps({"unit": 1, "attempt": 1, "reason": "OSError('reset')"})
+        + "\n"
+    )
+
+    report = await nightly.report(spec, repo=repo)
+
+    assert report.infra_retries == 2  # both sidecar retry records counted
+    assert report.units == 1  # the journal itself is untouched by infra events
 
 
 async def test_install_wires_the_agent_from_the_spec(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

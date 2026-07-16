@@ -24,6 +24,7 @@ from athome.research.common import Hasher
 from athome.research.contract import Memory, build_contract
 from athome.research.driver import describe_change, read_reported_metric
 from athome.research.errors import ResearchError
+from athome.research.failures import MAX_INFRA_RETRIES, InfraFailure, classify, infra_log, record_infra_event
 from athome.research.gate import immutable_violations, monotone_gate, parse_diff_tree
 from athome.research.journal import Journal, JournalRow, Verdict
 from athome.research.spec import BudgetExhausted, ConcurrentRun, PoisonedJournal, ProposalTimeout, finite_number
@@ -214,6 +215,8 @@ async def evaluate_unit(
         )
     ).strip()
     metric, log = await score_commit(spec, repo=repo, score_dir=score_dir, commit=commit)
+    if metric is None and not await regular_file(anyio.Path(score_dir) / spec.metric_file) and infra_log(log):
+        raise InfraFailure("scorer produced no metric file and its run log matched an infra marker")
     logger.debug("unit metric log ({} bytes) captured, withheld from the next contract", len(log))
     return UnitOutcome(decide(metric, incumbent_metric, direction=spec.direction), metric, commit, description, cost)
 
@@ -260,6 +263,58 @@ async def resume(
     return tip, None
 
 
+async def run_unit(
+    spec: ExperimentSpec,
+    *,
+    unit: int,
+    repo: Path,
+    worktrees: Path,
+    incumbent: str,
+    incumbent_metric: float | None,
+    contract: str,
+    driver: Driver,
+    events: Path,
+    deadline: float | None,
+) -> UnitOutcome | None:
+    for attempt in range(MAX_INFRA_RETRIES + 1):
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            return None
+        infra: BaseException | None = None
+        with anyio.move_on_after(remaining):
+            try:
+                return await evaluate_unit(
+                    spec,
+                    repo=repo,
+                    workdir=worktrees / f"unit-{unit}-{attempt}",
+                    score_dir=worktrees / f"score-{unit}-{attempt}",
+                    index=worktrees / f"unit-{unit}-{attempt}.index",
+                    incumbent=incumbent,
+                    incumbent_metric=incumbent_metric,
+                    contract=contract,
+                    driver=driver,
+                )
+            except ProposalTimeout as exc:
+                # A hung proposal killed on timeout still counts its recovered spend.
+                logger.warning("unit {} proposal timed out: {}", unit, exc)
+                return UnitOutcome(Verdict.CRASH, None, incumbent, f"proposal timeout: {exc}", exc.cost)
+            except Exception as exc:
+                match classify(exc):
+                    case "candidate":
+                        # The overnight contract: a candidate-caused crash is journaled and the
+                        # loop continues, it never aborts the run (BudgetExhausted still propagates).
+                        logger.warning("unit {} crashed: {!r}", unit, exc)
+                        return UnitOutcome(Verdict.CRASH, None, incumbent, f"crash: {exc!r}", 0.0)
+                    case "infra":
+                        infra = exc
+        if infra is None:
+            return None  # the unit blew past the remaining wall budget and was cancelled
+        if attempt == MAX_INFRA_RETRIES:
+            raise InfraFailure(f"unit {unit} aborted after {MAX_INFRA_RETRIES} infra retries") from infra
+        await record_infra_event(events, unit=unit, attempt=attempt, reason=repr(infra))
+        logger.warning("unit {} infra failure, retry {}/{}: {!r}", unit, attempt + 1, MAX_INFRA_RETRIES, infra)
+
+
 async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path) -> LoopResult:
     """Runs the greedy keep/discard loop in throwaway plain checkouts until the budget is spent.
 
@@ -283,8 +338,12 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path) -> LoopResult
     auto-kept. Each contract threads a harness-authored ``## History`` (baseline, current
     incumbent, best-so-far, and the most recent units with their verdicts and discard
     reasons), never the withheld run log. A strict monotone improvement is kept (branch
-    advanced, incumbent updated); anything else discards, and a crash or over-time unit is
-    journaled and the loop continues.
+    advanced, incumbent updated); anything else discards, and a candidate-caused crash or
+    over-time unit is journaled and the loop continues. An infrastructure failure — an OS or
+    git-subprocess error, or a scorer that writes no metric while its withheld run log matches
+    an infra marker — is never journaled: the same unit index is retried up to
+    ``MAX_INFRA_RETRIES`` times and, if it keeps failing, the run aborts loudly with
+    :class:`InfraFailure`, so one flaky night is never recorded as failed research directions.
     Spend is measured per unit — including the spend recovered from a hung unit killed on
     timeout — and the run aborts when it crosses ``max_usd``; work is bounded within a
     unit by the remaining wall budget. A per-experiment ``flock`` serializes concurrent
@@ -303,6 +362,8 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path) -> LoopResult
         BudgetExhausted: Cumulative spend crossed ``spec.budget.max_usd``.
         ConcurrentRun: Another live run holds the per-experiment lock.
         PoisonedJournal: The resumed journal carried a non-finite metric or bad spend.
+        InfraFailure: A unit hit machine trouble that outlasted ``MAX_INFRA_RETRIES`` retries;
+            the unit is never journaled, so a restart resumes the same unit index.
     """
     from athome.research.preflight import preflight
 
@@ -311,6 +372,7 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path) -> LoopResult
     await athome_dir.mkdir(parents=True, exist_ok=True)
     async with experiment_lock(Path(athome_dir) / f"{spec.name}.lock"):
         journal = Journal.open(Path(athome_dir) / f"{spec.name}.jsonl")
+        events = Path(athome_dir) / f"{spec.name}.events.jsonl"
         validate_journal(journal.rows())
         branch = f"{EXPERIMENT_BRANCH_PREFIX}/{spec.name}"
         incumbent, incumbent_metric = await resume(repo, branch, journal, direction=spec.direction)
@@ -331,11 +393,11 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path) -> LoopResult
                 incumbent_metric = report.baseline
             baseline = report.baseline
             started = time.monotonic()
+            deadline = None if spec.budget.max_wall_s is None else started + spec.budget.max_wall_s
             for unit in range(journal.resume_unit(), spec.budget.max_units):
                 elapsed = time.monotonic() - started
                 if spec.budget.max_wall_s is not None and elapsed >= spec.budget.max_wall_s:
                     break
-                remaining = None if spec.budget.max_wall_s is None else spec.budget.max_wall_s - elapsed
                 unit_started = time.monotonic()
                 contract = build_contract(
                     spec,
@@ -344,29 +406,18 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path) -> LoopResult
                         journal, baseline=baseline, incumbent=incumbent_metric, direction=spec.direction
                     ),
                 )
-                outcome: UnitOutcome | None = None
-                with anyio.move_on_after(remaining):
-                    try:
-                        outcome = await evaluate_unit(
-                            spec,
-                            repo=repo,
-                            workdir=worktrees / f"unit-{unit}",
-                            score_dir=worktrees / f"score-{unit}",
-                            index=worktrees / f"unit-{unit}.index",
-                            incumbent=incumbent,
-                            incumbent_metric=incumbent_metric,
-                            contract=contract,
-                            driver=driver,
-                        )
-                    except ProposalTimeout as exc:
-                        # A hung proposal killed on timeout still counts its recovered spend.
-                        logger.warning("unit {} proposal timed out: {}", unit, exc)
-                        outcome = UnitOutcome(Verdict.CRASH, None, incumbent, f"proposal timeout: {exc}", exc.cost)
-                    except Exception as exc:
-                        # The overnight contract: a candidate-caused crash is journaled and the
-                        # loop continues, it never aborts the run (BudgetExhausted still propagates).
-                        logger.warning("unit {} crashed: {!r}", unit, exc)
-                        outcome = UnitOutcome(Verdict.CRASH, None, incumbent, f"crash: {exc!r}", 0.0)
+                outcome = await run_unit(
+                    spec,
+                    unit=unit,
+                    repo=repo,
+                    worktrees=worktrees,
+                    incumbent=incumbent,
+                    incumbent_metric=incumbent_metric,
+                    contract=contract,
+                    driver=driver,
+                    events=events,
+                    deadline=deadline,
+                )
                 if outcome is None:
                     break  # the unit blew past the remaining wall budget and was cancelled
                 await journal.append(

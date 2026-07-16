@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from athome import launchd
+from athome.research import failures
 from athome.research.journal import Journal, Verdict
 from athome.research.loop import run_git
 from athome.research.spec import ExperimentSpec
@@ -27,6 +28,7 @@ class MorningReport:
         crashes: How many candidates crashed.
         best: The best kept row for the metric direction, or ``None`` if nothing was kept.
         rows: Every journaled unit, in order.
+        infra_retries: How many infra retries the sidecar recorded (``0`` when absent).
     """
 
     experiment: str
@@ -35,6 +37,7 @@ class MorningReport:
     crashes: int
     best: JournalRow | None
     rows: tuple[JournalRow, ...]
+    infra_retries: int
 
 
 async def repo_root(spec_path: Path) -> Path:
@@ -76,7 +79,8 @@ async def report(spec: ExperimentSpec, *, repo: Path) -> MorningReport:
         spec: The experiment whose journal and metric direction are summarized.
         repo: The git repository the loop ran against.
     """
-    journal = Journal.open(await journal_path(repo, spec.name))
+    path = await journal_path(repo, spec.name)
+    journal = Journal.open(path)
     rows = journal.rows()
     return MorningReport(
         experiment=spec.name,
@@ -85,4 +89,5 @@ async def report(spec: ExperimentSpec, *, repo: Path) -> MorningReport:
         crashes=sum(row.verdict is Verdict.CRASH for row in rows),
         best=journal.best(spec.direction),
         rows=tuple(rows),
+        infra_retries=failures.infra_retries(path.with_name(f"{spec.name}.events.jsonl")),
     )
