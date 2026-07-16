@@ -822,11 +822,31 @@ async def test_driver_cost_is_validated_before_journaling(tmp_path: Path, cost: 
     assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
 
 
-def test_driver_cost_validation_is_total_over_numeric_input() -> None:
+@pytest.mark.parametrize("error", [ValueError, TypeError, KeyError])
+def test_driver_cost_validation_is_total_over_numeric_input(error: type[Exception]) -> None:
+    class ExplodingFloat(float):
+        def __float__(self) -> float:
+            raise error("conversion failed")
+
     with pytest.raises(AccountingIntegrityError):
         validate_driver_cost(0, 10**1000)
+    with pytest.raises(AccountingIntegrityError):
+        validate_driver_cost(0, ExplodingFloat(0.25))
 
     assert validate_driver_cost(0, 0.25) == 0.25
+
+
+def test_unreadable_cost_journal_uses_accounting_taxonomy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "toy.jsonl"
+    path.write_text("{}\n")
+
+    def fail_read_text(target: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        raise OSError(f"cannot read {target}")
+
+    monkeypatch.setattr(Path, "read_text", fail_read_text)
+
+    with pytest.raises(AccountingIntegrityError):
+        Journal.open(path)
 
 
 async def test_invalid_driver_cost_aborts_before_an_infra_retry_sidecar(tmp_path: Path) -> None:

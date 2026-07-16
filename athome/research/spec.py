@@ -6,7 +6,7 @@ from math import isfinite
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Literal
 
-from athome.research.errors import ResearchError
+from athome.research.errors import AccountingIntegrityError, ResearchError
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -33,8 +33,8 @@ class UnconfinedPath(ResearchError):
     """A spec path escapes the work directory (absolute, ``..`` traversal, or empty)."""
 
 
-class PoisonedJournal(ResearchError):
-    """A resumed journal carried a non-finite metric or an invalid spend value."""
+class PoisonedJournal(AccountingIntegrityError):
+    """A resumed journal was unreadable, malformed, or carried an invalid metric or spend."""
 
 
 class ConcurrentRun(ResearchError):
@@ -60,7 +60,8 @@ def finite_number(value: object) -> bool:
         case int() | float():
             try:
                 coerced = float(value)
-            except OverflowError:
+            except Exception:
+                # This total predicate treats every conversion failure as non-finite.
                 return False
             return isfinite(coerced)
         case _:

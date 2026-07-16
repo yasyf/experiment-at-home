@@ -163,6 +163,8 @@ def test_missing_and_unknown_sidecar_kinds_are_skipped(tmp_path: Path) -> None:
         pytest.param(b"true", id="true"),
         pytest.param(b"false", id="false"),
         pytest.param(b'"nope"', id="string"),
+        pytest.param(b"9" * 1000, id="overflowing-integer"),
+        pytest.param(b"9" * 10000, id="json-integer-limit"),
     ],
 )
 def test_invalid_sidecar_costs_are_skipped(tmp_path: Path, cost: bytes) -> None:
@@ -174,3 +176,16 @@ def test_invalid_sidecar_costs_are_skipped(tmp_path: Path, cost: bytes) -> None:
     )
 
     assert infra_cost(events) == pytest.approx(0.4)
+
+
+def test_unreadable_sidecar_cost_uses_accounting_taxonomy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    events = tmp_path / "toy.events.jsonl"
+    events.write_text('{"kind":"retry","cost":0.4}\n')
+
+    def fail_read_bytes(path: Path) -> bytes:
+        raise OSError(f"cannot read {path}")
+
+    monkeypatch.setattr(type(events), "read_bytes", fail_read_bytes)
+
+    with pytest.raises(AccountingIntegrityError):
+        infra_cost(events)

@@ -36,6 +36,9 @@ delete the latch file. The sidecar is reporting evidence, not the restart author
 the latch write itself fails I/O, the doubly-degraded F3 residue still aborts loudly, as
 do unreadable billing evidence or a detached process that cannot be stopped; check and
 reconcile the ledger before resuming.
+
+Accepted limitation: if the latch write fails I/O while the sidecar breadcrumb succeeds,
+a restart is not blocked because reconciliation never clears append-only sidecar history.
 """
 
 from __future__ import annotations
@@ -162,7 +165,7 @@ def infra_events(path: Path) -> list[dict[str, object]]:
 def parse_event(line: bytes, path: Path) -> dict[str, object] | None:
     try:
         record = json.loads(line.decode())
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, ValueError):
         logger.warning("skipping malformed infra sidecar line in {}", path)
         return None
     match record:
@@ -181,12 +184,24 @@ def accounting_aborts(path: Path) -> int:
     return sum(event["kind"] == "accounting_abort" for event in infra_events(path))
 
 
+def sidecar_cost(value: object) -> float | None:
+    match value:
+        case bool():
+            return None
+        case int() | float():
+            try:
+                cost = float(value)
+            except Exception:
+                # This parser is total so malformed sidecar rows are skipped independently.
+                return None
+            return cost if isfinite(cost) and cost >= 0 else None
+        case _:
+            return None
+
+
 def infra_cost(path: Path) -> float:
-    return sum(
-        float(cost)
-        for event in infra_events(path)
-        if isinstance(cost := event.get("cost"), (int, float))
-        and not isinstance(cost, bool)
-        and isfinite(cost)
-        and cost >= 0
-    )
+    try:
+        events = infra_events(path)
+    except OSError as exc:
+        raise AccountingIntegrityError(f"could not read infra spend sidecar {path}") from exc
+    return sum(cost for event in events if (cost := sidecar_cost(event.get("cost"))) is not None)

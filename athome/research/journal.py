@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from json import JSONDecodeError
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import anyio
 
 from athome.progress import RunSink, load_journal
+from athome.research.spec import PoisonedJournal
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -85,7 +87,12 @@ class Journal:
 
     @classmethod
     def open(cls, path: Path, *, mirror_cc_notes: bool = False) -> Journal:
-        return cls(RunSink.open(path), mirror_cc_notes, [JournalRow.from_record(rec) for rec in load_journal(path)])
+        try:
+            sink = RunSink.open(path)
+            rows = [JournalRow.from_record(record) for record in load_journal(path)]
+        except (OSError, UnicodeDecodeError, JSONDecodeError, AttributeError, KeyError, TypeError, ValueError) as exc:
+            raise PoisonedJournal(f"research journal at {path} is unreadable or malformed") from exc
+        return cls(sink, mirror_cc_notes, rows)
 
     async def append(self, row: JournalRow) -> None:
         await self.sink.append(row.to_record())

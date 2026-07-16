@@ -119,7 +119,7 @@ def json_objects(text: str) -> Iterator[dict[str, object]]:
     while index != -1:
         try:
             obj, end = decoder.raw_decode(text, index)
-        except json.JSONDecodeError:
+        except ValueError:
             index = text.find("{", index + 1)
             continue
         if isinstance(obj, dict):
@@ -136,13 +136,20 @@ def envelope_cost(text: str) -> float:
         case int() | float() as value:
             try:
                 cost = float(value)
-            except OverflowError as exc:
+            except Exception as exc:
                 raise CostError("total_cost_usd must be finite and non-negative") from exc
             if isfinite(cost) and cost >= 0:
                 return cost
             raise CostError("total_cost_usd must be finite and non-negative")
         case value:
             raise CostError(f"total_cost_usd must be finite and non-negative, got {value!r}")
+
+
+async def read_cost_log(run: DetachedRun) -> str:
+    try:
+        return await anyio.Path(run.log_path).read_text()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CostError("could not read detached proposal log; billing state is unknown") from exc
 
 
 def claude_cli_version(output: bytes) -> tuple[int, ...]:
@@ -314,11 +321,7 @@ class ClaudeCodeDriver:
             await anyio.sleep(self.poll)
 
     async def captured_cost(self, run: DetachedRun) -> float:
-        return envelope_cost(await anyio.Path(run.log_path).read_text())
+        return envelope_cost(await read_cost_log(run))
 
     async def recovered_cost(self, run: DetachedRun) -> float:
-        try:
-            text = await anyio.Path(run.log_path).read_text()
-        except (OSError, UnicodeDecodeError) as exc:
-            raise CostError("could not read detached proposal log; billing state is unknown") from exc
-        return envelope_cost(text)
+        return envelope_cost(await read_cost_log(run))

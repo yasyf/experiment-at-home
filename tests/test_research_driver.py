@@ -122,6 +122,16 @@ FAKE_CLAUDE_INVALID_UTF8_THEN_HANGS = textwrap.dedent(
     """
 ).strip()
 
+FAKE_CLAUDE_INVALID_UTF8 = textwrap.dedent(
+    """
+    import json, pathlib, sys
+    pathlib.Path("train.py").write_text("LOSS = 0.2\\n")
+    print(json.dumps({"type": "result", "total_cost_usd": 0.99}), flush=True)
+    sys.stdout.buffer.write(b"\\xff\\xfe")
+    sys.stdout.flush()
+    """
+).strip()
+
 
 def git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()
@@ -216,6 +226,14 @@ def make_run_log_unreadable(monkeypatch: pytest.MonkeyPatch) -> None:
         return await original(path, encoding=encoding, errors=errors)
 
     monkeypatch.setattr(anyio.Path, "read_text", read_text)
+
+
+def exploding_float(error: type[Exception]) -> float:
+    class ExplodingFloat(float):
+        def __float__(self) -> float:
+            raise error("conversion failed")
+
+    return ExplodingFloat(0.5)
 
 
 async def test_propose_edits_the_candidate_dir_and_reports_cost(tmp_path: Path) -> None:
@@ -459,6 +477,45 @@ async def test_captured_cost_uses_the_last_complete_json_object_not_a_regex(tmp_
 
 
 @pytest.mark.parametrize(
+    ("body", "read_fails"),
+    [
+        pytest.param(FAKE_CLAUDE_INVALID_UTF8, False, id="invalid-utf8"),
+        pytest.param(FAKE_CLAUDE_COST, True, id="read-oserror"),
+    ],
+)
+async def test_successful_proposal_cost_read_failure_aborts_accounting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body: str,
+    read_fails: bool,
+) -> None:
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = toy_repo(repo_dir)
+    if read_fails:
+        make_run_log_unreadable(monkeypatch)
+    spec = make_spec(budget=Budget(max_units=1))
+    driver = ClaudeCodeDriver(spec, command=fake_claude(tmp_path, body), poll=0.02, timeout_s=2.0)
+
+    with anyio.fail_after(5.0):
+        with pytest.raises(AccountingIntegrityError):
+            await run(spec, driver=driver, repo=repo)
+
+    assert journal_rows(repo) == []
+    assert_accounting_abort_recorded(repo)
+
+
+@pytest.mark.parametrize("error", [ValueError, TypeError, KeyError])
+def test_envelope_cost_rejects_numeric_conversion_failures(
+    monkeypatch: pytest.MonkeyPatch, error: type[Exception]
+) -> None:
+    value = exploding_float(error)
+    monkeypatch.setattr(driver_module, "json_objects", lambda text: iter([{"total_cost_usd": value}]))
+
+    with pytest.raises(CostError):
+        driver_module.envelope_cost("ignored")
+
+
+@pytest.mark.parametrize(
     "body",
     [
         '{"total_cost_usd": NaN}',
@@ -467,10 +524,21 @@ async def test_captured_cost_uses_the_last_complete_json_object_not_a_regex(tmp_
         '{"total_cost_usd": true}',
         '{"total_cost_usd": "0.5"}',
         '{"total_cost_usd": ' + "9" * 1000 + "}",
+        '{"total_cost_usd": ' + "9" * 10000 + "}",
         '{"type": "result"}',
         "no json envelope at all",
     ],
-    ids=["nan", "infinity", "negative", "bool", "string", "oversized-int", "missing-key", "no-json"],
+    ids=[
+        "nan",
+        "infinity",
+        "negative",
+        "bool",
+        "string",
+        "overflowing-int",
+        "json-integer-limit",
+        "missing-key",
+        "no-json",
+    ],
 )
 async def test_captured_cost_rejects_an_invalid_or_missing_cost(tmp_path: Path, body: str) -> None:
     # BP2: a present-but-invalid or missing cost is a hard failure, never a silent 0.0.

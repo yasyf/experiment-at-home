@@ -140,8 +140,14 @@ def validate_driver_cost(unit: int, cost: object) -> float:
     match cost:
         case bool():
             pass
-        case int() | float() as value if finite_number(value) and value >= 0:
-            return float(value)
+        case int() | float() as value:
+            try:
+                converted = float(value)
+            except Exception:
+                pass
+            else:
+                if finite_number(converted) and converted >= 0:
+                    return converted
     raise AccountingIntegrityError(f"unit {unit}: driver returned invalid cost of type {type(cost).__name__}")
 
 
@@ -513,7 +519,7 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
         BudgetExhausted: Cumulative spend crossed ``spec.budget.max_usd``.
         AccountingIntegrityError: Proposal spend could not be recovered or trusted.
         ConcurrentRun: Another live run holds the per-experiment lock.
-        PoisonedJournal: The resumed journal carried a non-finite metric or bad spend.
+        PoisonedJournal: The resumed journal was unreadable, malformed, or carried an invalid metric or spend.
         InfraFailure: A unit hit machine trouble that outlasted ``MAX_INFRA_RETRIES`` retries;
             the unit is never journaled, so a restart resumes the same unit index.
     """
