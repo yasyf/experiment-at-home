@@ -315,7 +315,7 @@ async def run_unit(
         logger.warning("unit {} infra failure, retry {}/{}: {!r}", unit, attempt + 1, MAX_INFRA_RETRIES, infra)
 
 
-async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path) -> LoopResult:
+async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_notes: bool = False) -> LoopResult:
     """Runs the greedy keep/discard loop in throwaway plain checkouts until the budget is spent.
 
     Each work-unit materializes the incumbent into a plain directory via ``git archive``
@@ -354,6 +354,7 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path) -> LoopResult
         spec: The experiment: metric, direction, budget, and the scoring boundary.
         driver: The proposer that edits mutable files and returns the proposal's cost.
         repo: The git repository the experiment runs against.
+        mirror_cc_notes: Whether to mirror journal rows to ``cc-notes``.
 
     Returns:
         The kept count and the best kept row over the whole (resumable) journal.
@@ -371,7 +372,7 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path) -> LoopResult
     athome_dir = anyio.Path(common if common.is_absolute() else repo / common) / "athome"
     await athome_dir.mkdir(parents=True, exist_ok=True)
     async with experiment_lock(Path(athome_dir) / f"{spec.name}.lock"):
-        journal = Journal.open(Path(athome_dir) / f"{spec.name}.jsonl")
+        journal = Journal.open(Path(athome_dir) / f"{spec.name}.jsonl", mirror_cc_notes=mirror_cc_notes)
         events = Path(athome_dir) / f"{spec.name}.events.jsonl"
         validate_journal(journal.rows())
         branch = f"{EXPERIMENT_BRANCH_PREFIX}/{spec.name}"

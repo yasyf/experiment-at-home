@@ -164,6 +164,7 @@ def test_train_settings_defaults_expand_user_paths() -> None:
     assert settings.backend is None
     assert settings.mlx_lm_version == "0.31.3"
     assert settings.registry_root == Path.home() / ".athome/train/registry"
+    assert settings.baseline_root == Path.home() / ".athome/train/baselines.db"
     assert settings.work_root == Path.home() / ".athome/train/runs"
 
 

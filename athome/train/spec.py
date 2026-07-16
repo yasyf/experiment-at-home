@@ -461,6 +461,7 @@ class TrainSettings(SectionSettings):
     backend: BackendName | None = None
     mlx_lm_version: str = "0.31.3"
     registry_root: Path = Path("~/.athome/train/registry")
+    baseline_root: Path = Path("~/.athome/train/baselines.db")
     work_root: Path = Path("~/.athome/train/runs")
 
 

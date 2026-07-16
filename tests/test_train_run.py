@@ -11,6 +11,9 @@ from athome import registry, serve, train
 from athome.bakeoff import Arm, ArmResult, BakeoffSpec, Leaderboard
 from athome.config import load
 from athome.progress import load_journal
+from athome.research.baseline import BaselineStore
+from athome.research.common import Hasher, dataset_digest
+from athome.research.spec import Comparability
 from athome.train.spec import BASE_MODELS, Checkpoint, Hyperparams, LocalJsonlRef, TrainSettings, TrainSpec
 
 if TYPE_CHECKING:
@@ -33,6 +36,13 @@ async def task(client: AsyncOpenAI, item: object) -> dict[str, object]:
 
 def evaluation() -> BakeoffSpec:
     return BakeoffSpec(task=task, corpus=("a", "b"), arms=(BASELINE,), primary_metric="exact")
+
+
+def comparability(evaluation: BakeoffSpec) -> Comparability:
+    return Comparability(
+        config_hash=Hasher.digest({"primary_metric": evaluation.primary_metric, "tiebreak": evaluation.tiebreak}),
+        dataset_digest=str(dataset_digest(evaluation.corpus)),
+    )
 
 
 def spec(**overrides: object) -> TrainSpec:
@@ -137,6 +147,7 @@ class FakeServer:
 @pytest.fixture(autouse=True)
 def train_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("ATHOME_TRAIN_REGISTRY_ROOT", str(tmp_path / "registry"))
+    monkeypatch.setenv("ATHOME_TRAIN_BASELINE_ROOT", str(tmp_path / "baselines.db"))
     monkeypatch.setenv("ATHOME_TRAIN_WORK_ROOT", str(tmp_path / "runs"))
     monkeypatch.chdir(tmp_path)
     load.cache_clear()
@@ -196,6 +207,31 @@ async def test_run_trains_evaluates_registers_and_promotes_the_winner(
         backend.checkpoints[0].mlx_path
     )
     assert len(ran) == 1
+
+
+async def test_run_registers_frozen_baseline_metadata(
+    monkeypatch: pytest.MonkeyPatch, backend: FakeBackend, tmp_path: Path
+) -> None:
+    bakeoff = evaluation()
+    async with BaselineStore.open(tmp_path / "baselines.db") as baselines:
+        await baselines.put(comparability(bakeoff), spec().name, 0.75)
+    stub_bakeoff(monkeypatch, leaderboard(winner=train.TRAINED_ARM, passed_gate=True, metric=0.9))
+
+    result = await train.run(spec(), evaluation=bakeoff)
+
+    assert result.version.metadata["baseline_metric"] == 0.75
+    assert result.version.metadata["uplift"] == pytest.approx(0.2)
+
+
+async def test_run_omits_frozen_baseline_metadata_when_unseeded(
+    monkeypatch: pytest.MonkeyPatch, backend: FakeBackend
+) -> None:
+    stub_bakeoff(monkeypatch, leaderboard(winner=train.TRAINED_ARM, passed_gate=True, metric=0.9))
+
+    result = await train.run(spec(), evaluation=evaluation())
+
+    assert "baseline_metric" not in result.version.metadata
+    assert "uplift" not in result.version.metadata
 
 
 async def test_run_preflights_with_loaded_settings_before_selecting_and_training(

@@ -195,6 +195,9 @@ async def run(spec: TrainSpec, *, evaluation: BakeoffSpec) -> TrainResult:
         PreflightFailure: A mandatory backend, dataset, cost, or evaluation probe fails.
     """
     from athome.progress import RunSink
+    from athome.research.baseline import BaselineStore, uplift
+    from athome.research.common import Hasher, dataset_digest
+    from athome.research.spec import Comparability
 
     settings = load(TrainSettings)
     await preflight(spec, evaluation=evaluation, settings=settings)
@@ -210,23 +213,34 @@ async def run(spec: TrainSpec, *, evaluation: BakeoffSpec) -> TrainResult:
     metric = next(result for result in leaderboard.results if result.arm == TRAINED_ARM).metrics[
         evaluation.primary_metric
     ]
+    comparability = Comparability(
+        config_hash=Hasher.digest({"primary_metric": evaluation.primary_metric, "tiebreak": evaluation.tiebreak}),
+        dataset_digest=str(dataset_digest(evaluation.corpus)),
+    )
+    async with BaselineStore.open(settings.baseline_root) as baselines:
+        baseline = await baselines.get(comparability, spec.name)
     promoted = leaderboard.winner == TRAINED_ARM and leaderboard.passed_gate
     await write_metric(metric)
 
+    metadata = {
+        "backend": checkpoint.backend,
+        "method": checkpoint.method,
+        "base": checkpoint.base.mlx,
+        "step": checkpoint.step,
+        "adapter_dir": checkpoint.adapter_dir,
+        "train_cost_usd": checkpoint.train_cost_usd,
+        METRIC_KEY: metric,
+        "primary_metric": evaluation.primary_metric,
+        "leaderboard": asdict(leaderboard),
+    } | (
+        {"baseline_metric": baseline, "uplift": uplift(metric, baseline, direction="max")}
+        if baseline is not None
+        else {}
+    )
     version = await register(
         spec.name,
         checkpoint.mlx_path,
-        {
-            "backend": checkpoint.backend,
-            "method": checkpoint.method,
-            "base": checkpoint.base.mlx,
-            "step": checkpoint.step,
-            "adapter_dir": checkpoint.adapter_dir,
-            "train_cost_usd": checkpoint.train_cost_usd,
-            METRIC_KEY: metric,
-            "primary_metric": evaluation.primary_metric,
-            "leaderboard": asdict(leaderboard),
-        },
+        metadata,
         root=settings.registry_root,
     )
     if promoted:

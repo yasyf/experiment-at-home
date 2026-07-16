@@ -215,6 +215,27 @@ async def test_end_to_end_all_gates_in_one_run(tmp_path: Path) -> None:
     assert next(proposals).files == {"train.py": "LOSS = 0.1\n"}
 
 
+async def test_run_passes_mirror_cc_notes_to_journal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = toy_repo(tmp_path)
+    original_open = Journal.open
+    calls: list[tuple[Path, bool]] = []
+
+    def open_journal(path: Path, *, mirror_cc_notes: bool = False) -> Journal:
+        calls.append((path, mirror_cc_notes))
+        return original_open(path)
+
+    monkeypatch.setattr(Journal, "open", staticmethod(open_journal))
+
+    await run(
+        make_spec(budget=Budget(max_units=0)),
+        driver=StubDriver(iter([])),
+        repo=repo,
+        mirror_cc_notes=True,
+    )
+
+    assert calls == [(repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.jsonl", True)]
+
+
 async def test_three_units_keep_keep_discard(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path, initial_loss=1.0)
     driver = StubDriver(iter([loss_proposal(0.5), loss_proposal(0.3), loss_proposal(0.4)]))
