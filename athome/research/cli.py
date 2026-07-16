@@ -53,6 +53,7 @@ def summary_record(report: nightly.MorningReport) -> dict[str, object]:
         "kept": report.kept,
         "crashes": report.crashes,
         "infra_retries": report.infra_retries,
+        "accounting_aborts": report.accounting_aborts,
         "best": asdict(report.best) if report.best is not None else None,
     }
 

@@ -28,8 +28,11 @@ spend, and the run aborts. It can never manufacture a journaled row — no forge
 discard, or contract-memory feedback — so the worst it achieves is burning its own unit's
 budget before the run aborts. Worthless.
 
-If a wall-cancel cost flush fails I/O, billing evidence cannot be parsed, or the
-detached process cannot be stopped, the run aborts loudly without recording that cost;
+Before an accounting-integrity abort escapes a unit, the harness best-effort appends an
+``accounting_abort`` breadcrumb with its unit and reason but no cost. A later run refuses
+to start while that marker remains: check the provider ledger, reconcile the spend, then
+remove the ``accounting_abort`` line. If the marker write fails I/O, billing evidence
+cannot be parsed, or the detached process cannot be stopped, the run still aborts loudly;
 check and reconcile the ledger before resuming.
 """
 
@@ -41,6 +44,7 @@ from math import isfinite
 from subprocess import CalledProcessError
 from typing import TYPE_CHECKING, Literal
 
+import anyio
 from loguru import logger
 
 from athome.research.errors import AccountingIntegrityError, ResearchError
@@ -66,6 +70,8 @@ INFRA_MARKERS: tuple[str, ...] = (
     "504 gateway timeout",
 )
 MAX_INFRA_RETRIES = 2
+
+type SidecarKind = Literal["retry", "wall_cancel", "accounting_abort"]
 
 
 class InfraFailure(ResearchError):
@@ -112,9 +118,19 @@ async def record_infra_event(
     cost: float,
     kind: Literal["retry", "wall_cancel"],
 ) -> None:
-    payload = (
-        json.dumps({"unit": unit, "attempt": attempt, "reason": reason, "cost": cost, "kind": kind}) + "\n"
-    ).encode()
+    append_event(path, {"unit": unit, "attempt": attempt, "reason": reason, "cost": cost}, kind=kind)
+
+
+async def record_accounting_abort(path: Path, *, unit: int, reason: str) -> None:
+    with anyio.CancelScope(shield=True):
+        try:
+            append_event(path, {"unit": unit, "reason": reason}, kind="accounting_abort")
+        except OSError:
+            logger.exception("could not write accounting-abort breadcrumb to {}", path)
+
+
+def append_event(path: Path, event: dict[str, object], *, kind: SidecarKind) -> None:
+    payload = (json.dumps(event | {"kind": kind}) + "\n").encode()
     fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
     try:
         if (size := os.fstat(fd).st_size) and os.pread(fd, 1, size - 1) != b"\n":
@@ -139,7 +155,7 @@ def parse_event(line: bytes, path: Path) -> dict[str, object] | None:
         logger.warning("skipping malformed infra sidecar line in {}", path)
         return None
     match record:
-        case {"kind": "retry" | "wall_cancel"}:
+        case {"kind": "retry" | "wall_cancel" | "accounting_abort"}:
             return record
         case _:
             logger.warning("skipping malformed infra sidecar line in {}", path)
@@ -148,6 +164,10 @@ def parse_event(line: bytes, path: Path) -> dict[str, object] | None:
 
 def infra_retries(path: Path) -> int:
     return sum(event["kind"] == "retry" for event in infra_events(path))
+
+
+def accounting_aborts(path: Path) -> int:
+    return sum(event["kind"] == "accounting_abort" for event in infra_events(path))
 
 
 def infra_cost(path: Path) -> float:

@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import signal
 from dataclasses import dataclass, field
 from math import isfinite
+from subprocess import PIPE, STDOUT
 from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
 import anyio
 
 from athome.detach import launch, running
-from athome.research.errors import AccountingIntegrityError, ResearchError
+from athome.research.errors import AccountingIntegrityError, PreflightFailure, ResearchError
 from athome.research.spec import ProposalTimeout
 
 if TYPE_CHECKING:
@@ -26,6 +28,9 @@ if TYPE_CHECKING:
 RUN_PREFIX = "athome-research"
 DEFAULT_CLAUDE_COMMAND = ("claude", "-p", "--output-format", "json", "--dangerously-skip-permissions")
 DEFAULT_PROPOSAL_TIMEOUT_S = 3600.0
+# total_cost became total_cost_usd in 1.0.22; older result envelopes cannot be accounted.
+CLAUDE_CLI_ENVELOPE_FLOOR = (1, 0, 22)
+CLAUDE_CLI_VERSION = re.compile(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)")
 
 
 class CostError(AccountingIntegrityError):
@@ -49,11 +54,15 @@ class Driver(Protocol):
     incurred. It never writes the metric file — the immutable ``metric_command`` owns
     that channel — and it never inspects git state: the harness owns all git plumbing
     and derives the change description from the trusted tree diff (:func:`describe_change`).
+    Before proposals begin, :meth:`preflight` validates any driver-specific external
+    prerequisites without incurring proposal spend.
     If cancellation interrupts :meth:`propose`, :meth:`recover_cost` returns any billed
     cost the interrupted proposal persisted before it could return.
     """
 
     label: str
+
+    async def preflight(self) -> None: ...
 
     async def propose(self, contract: str, workdir: Path) -> float: ...
 
@@ -130,6 +139,16 @@ def envelope_cost(text: str) -> float:
             raise CostError(f"total_cost_usd must be finite and non-negative, got {value!r}")
 
 
+def claude_cli_version(output: bytes) -> tuple[int, ...]:
+    try:
+        text = output.decode()
+    except UnicodeDecodeError as exc:
+        raise PreflightFailure("claude --version output is not valid UTF-8") from exc
+    if match := CLAUDE_CLI_VERSION.search(text):
+        return tuple(int(part) for part in match.groups())
+    raise PreflightFailure("claude --version output carried no semantic version")
+
+
 @dataclass(frozen=True, slots=True)
 class StubProposal:
     """One scripted edit the :class:`StubDriver` replays into a candidate directory.
@@ -156,6 +175,9 @@ class StubDriver:
 
     proposals: Iterator[StubProposal]
     label: str = "stub"
+
+    async def preflight(self) -> None:
+        return None
 
     async def propose(self, contract: str, workdir: Path) -> float:
         for relative, content in next(self.proposals).files.items():
@@ -198,7 +220,8 @@ class ClaudeCodeDriver:
 
     The generated contract is handed to a detached ``claude`` process
     (:func:`athome.detach.launch`) whose working directory is the plain candidate
-    directory. :meth:`propose` bounds that run — ``timeout_s`` when set, else the
+    directory. :meth:`preflight` rejects CLI versions predating the
+    ``total_cost_usd`` result envelope. :meth:`propose` bounds that run — ``timeout_s`` when set, else the
     spec's ``hard_kill_s``, else :data:`DEFAULT_PROPOSAL_TIMEOUT_S`, so a proposal is
     always bounded even when no wall-clock budget is configured — and waits on the
     process's actual exit (``detach.running`` reporting the pid gone, never a grepped
@@ -207,11 +230,11 @@ class ClaudeCodeDriver:
     run's dollar cost, captured from the CLI's own ``total_cost_usd`` envelope (the last
     complete JSON object in the log, validated to a finite non-negative number). On
     cancellation, :meth:`recover_cost` reads that envelope from the retained run. On
-    timeout it raises :class:`ProposalTimeout` carrying the spend recovered from the
-    log, so a hung expensive unit still counts toward ``max_usd``. The change
-    description is derived harness-side from the trusted tree diff, never the agent's
-    stdout. The ``claude`` CLI is shelled out to, never imported, so this driver loads
-    without the ``llm``/``research`` extras.
+    timeout it raises :class:`ProposalTimeout` carrying spend from a complete envelope;
+    an incomplete log instead raises :class:`CostError` because spawned-run spend is
+    unknown. The change description is derived harness-side from the trusted tree diff,
+    never the agent's stdout. The ``claude`` CLI is shelled out to, never imported, so
+    this driver loads without the ``llm``/``research`` extras.
 
     Example:
         >>> driver = ClaudeCodeDriver(spec)
@@ -224,6 +247,24 @@ class ClaudeCodeDriver:
     poll: float = 5.0
     timeout_s: float | None = None
     _recovery: ProposalRecovery = field(default_factory=ProposalRecovery, init=False, repr=False, compare=False)
+
+    async def preflight(self) -> None:
+        try:
+            result = await anyio.run_process(
+                [self.command[0], "--version"],
+                check=False,
+                stdout=PIPE,
+                stderr=STDOUT,
+            )
+        except OSError as exc:
+            raise PreflightFailure(f"claude --version could not run: {exc}") from exc
+        if result.returncode != 0:
+            raise PreflightFailure(f"claude --version exited with status {result.returncode}")
+        if (version := claude_cli_version(result.stdout)) < CLAUDE_CLI_ENVELOPE_FLOOR:
+            raise PreflightFailure(
+                f"claude CLI {'.'.join(map(str, version))} is below required "
+                f"{'.'.join(map(str, CLAUDE_CLI_ENVELOPE_FLOOR))}; upgrade Claude Code"
+            )
 
     async def propose(self, contract: str, workdir: Path) -> float:
         budget = () if self.spec.budget.max_usd is None else ("--max-budget-usd", str(self.spec.budget.max_usd))
@@ -270,7 +311,4 @@ class ClaudeCodeDriver:
         return envelope_cost(await anyio.Path(run.log_path).read_text())
 
     async def recovered_cost(self, run: DetachedRun) -> float:
-        text = await anyio.Path(run.log_path).read_text()
-        if "total_cost_usd" not in text:
-            return 0.0
-        return envelope_cost(text)
+        return envelope_cost(await anyio.Path(run.log_path).read_text())

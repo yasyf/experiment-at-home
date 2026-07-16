@@ -16,6 +16,7 @@ from athome.research.failures import (
     infra_events,
     infra_log,
     infra_retries,
+    record_accounting_abort,
     record_infra_event,
 )
 from athome.research.spec import ImmutableViolation, ProposalTimeout
@@ -66,13 +67,15 @@ async def test_record_and_count_infra_events(tmp_path: Path) -> None:
 
     await record_infra_event(events, unit=3, attempt=0, reason="OSError('reset')", cost=0.6, kind="retry")
     await record_infra_event(events, unit=3, attempt=1, reason="OSError('reset')", cost=0.0, kind="retry")
+    await record_accounting_abort(events, unit=4, reason="unknown spend")
 
     assert infra_retries(events) == 2
     assert infra_cost(events) == pytest.approx(0.6)
     records = [json.loads(line) for line in events.read_text().splitlines()]
-    assert [record["attempt"] for record in records] == [0, 1]
-    assert [record["kind"] for record in records] == ["retry", "retry"]
-    assert all(record["unit"] == 3 and record["reason"] == "OSError('reset')" for record in records)
+    assert [record.get("attempt") for record in records] == [0, 1, None]
+    assert [record["kind"] for record in records] == ["retry", "retry", "accounting_abort"]
+    assert all(record["unit"] == 3 and record["reason"] == "OSError('reset')" for record in records[:2])
+    assert records[2] == {"unit": 4, "reason": "unknown spend", "kind": "accounting_abort"}
 
 
 async def test_torn_sidecar_line_never_loses_a_later_record(tmp_path: Path) -> None:

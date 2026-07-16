@@ -129,6 +129,9 @@ class HostileDriver:
     label: str = "hostile"
     cost: float = 0.0
 
+    async def preflight(self) -> None:
+        return None
+
     async def propose(self, contract: str, workdir: Path) -> float:
         self.action(Path(workdir))
         return self.cost
@@ -144,6 +147,9 @@ class CostDriver:
     proposals: object
     cost: float
     label: str = "cost"
+
+    async def preflight(self) -> None:
+        return None
 
     async def propose(self, contract: str, workdir: Path) -> float:
         for relative, content in next(self.proposals).files.items():
@@ -161,6 +167,9 @@ class SlowDriver:
     delay: float
     label: str = "slow"
 
+    async def preflight(self) -> None:
+        return None
+
     async def propose(self, contract: str, workdir: Path) -> float:
         await anyio.sleep(self.delay)
         (Path(workdir) / "train.py").write_text("LOSS = 0.1\n")
@@ -177,6 +186,9 @@ class TimeoutDriver:
     cost: float
     label: str = "timeout"
 
+    async def preflight(self) -> None:
+        return None
+
     async def propose(self, contract: str, workdir: Path) -> float:
         (Path(workdir) / "train.py").write_text("LOSS = 0.1\n")
         raise ProposalTimeout("simulated hang killed on timeout", cost=self.cost)
@@ -186,12 +198,33 @@ class TimeoutDriver:
 
 
 @dataclass(frozen=True, slots=True)
+class RecoveryCostDriver:
+    """Runs until wall cancellation, then reports a fixed recovered cost."""
+
+    cost: float
+    label: str = "recovery-cost"
+
+    async def preflight(self) -> None:
+        return None
+
+    async def propose(self, contract: str, workdir: Path) -> float:
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable")
+
+    async def recover_cost(self) -> float:
+        return self.cost
+
+
+@dataclass(frozen=True, slots=True)
 class RecordingDriver:
     """Replays scripted edits like StubDriver while capturing every contract it receives."""
 
     proposals: Iterator[StubProposal]
     contracts: list[str] = field(default_factory=list)
     label: str = "recording"
+
+    async def preflight(self) -> None:
+        return None
 
     async def propose(self, contract: str, workdir: Path) -> float:
         self.contracts.append(contract)
@@ -785,6 +818,117 @@ async def test_driver_cost_is_validated_before_journaling(tmp_path: Path, cost: 
         await run(make_spec(budget=Budget(max_units=2, max_usd=0.1)), driver=driver, repo=repo)
 
     assert journal_rows(repo) == []
+    assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
+
+
+async def test_invalid_driver_cost_aborts_before_an_infra_retry_sidecar(tmp_path: Path) -> None:
+    failed = tmp_path / "failed"
+    score_py = textwrap.dedent(f"""
+        import json, pathlib, sys
+        train = pathlib.Path("train.py").read_text()
+        if "INFRA_ONCE" in train and not pathlib.Path({str(failed)!r}).exists():
+            pathlib.Path({str(failed)!r}).write_text("failed")
+            print("connection reset by peer", file=sys.stderr)
+            sys.exit(1)
+        namespace = {{}}
+        exec(train, namespace)
+        pathlib.Path(".athome-metric.json").write_text(json.dumps({{"loss": namespace["LOSS"]}}))
+    """).strip()
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = special_repo(repo_dir, score_py=score_py)
+
+    with pytest.raises(AccountingIntegrityError):
+        await run(
+            make_spec(budget=Budget(max_units=1)),
+            driver=HostileDriver(
+                lambda workdir: (workdir / "train.py").write_text("LOSS = 0.5\n# INFRA_ONCE\n"), cost=math.nan
+            ),
+            repo=repo,
+        )
+
+    assert journal_rows(repo) == []
+    assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
+    assert not failed.exists()
+
+
+async def test_invalid_recovered_cost_aborts_before_wall_cancel_sidecar(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+
+    with anyio.fail_after(3.0):
+        with pytest.raises(AccountingIntegrityError):
+            await run(
+                make_spec(budget=Budget(max_units=1, max_wall_s=0.2)),
+                driver=RecoveryCostDriver(math.nan),
+                repo=repo,
+            )
+
+    assert journal_rows(repo) == []
+    assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
+
+
+async def test_accounting_abort_marker_blocks_resume_until_removed(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    (athome := repo / ".git" / "athome").mkdir(parents=True, exist_ok=True)
+    events = athome / f"{EXPERIMENT_NAME}.events.jsonl"
+    events.write_text(json.dumps({"unit": 0, "reason": "unknown spend", "kind": "accounting_abort"}) + "\n")
+    driver = RecordingDriver(iter([loss_proposal(0.5)]))
+
+    with pytest.raises(AccountingIntegrityError, match="provider ledger.*remove the accounting_abort line") as exc_info:
+        await run(make_spec(budget=Budget(max_units=1)), driver=driver, repo=repo)
+    assert str(events) in str(exc_info.value)
+    assert driver.contracts == []
+
+    events.write_text("")
+    result = await run(make_spec(budget=Budget(max_units=1)), driver=driver, repo=repo)
+
+    assert result.kept == 1
+
+
+async def test_accounting_abort_restart_preserves_prior_sidecar_spend(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    budget = Budget(max_units=1, max_usd=0.7)
+
+    with anyio.fail_after(3.0):
+        result = await run(
+            make_spec(budget=Budget(max_units=1, max_wall_s=0.2)),
+            driver=RecoveryCostDriver(0.4),
+            repo=repo,
+        )
+
+    assert result.kept == 0
+    assert journal_rows(repo) == []
+    assert [(event["kind"], event.get("cost")) for event in infra_events(repo)] == [("wall_cancel", 0.4)]
+
+    with pytest.raises(AccountingIntegrityError):
+        await run(
+            make_spec(budget=budget),
+            driver=CostDriver(iter([loss_proposal(0.5)]), cost=math.nan),
+            repo=repo,
+        )
+
+    assert journal_rows(repo) == []
+    assert [(event["kind"], event.get("cost")) for event in infra_events(repo)] == [
+        ("wall_cancel", 0.4),
+        ("accounting_abort", None),
+    ]
+
+    resume_driver = CostDriver(iter([loss_proposal(0.4)]), cost=0.4)
+    with pytest.raises(AccountingIntegrityError, match="provider ledger.*remove the accounting_abort line"):
+        await run(make_spec(budget=budget), driver=resume_driver, repo=repo)
+
+    assert journal_rows(repo) == []
+    events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
+    events.write_text(
+        "".join(f"{json.dumps(event)}\n" for event in infra_events(repo) if event["kind"] != "accounting_abort")
+    )
+
+    with pytest.raises(BudgetExhausted, match=r"spend \$0\.8000 crossed max_usd \$0\.7000 at unit 0"):
+        await run(make_spec(budget=budget), driver=resume_driver, repo=repo)
+
+    (row,) = journal_rows(repo)
+    assert row.unit == 0
+    assert row.resources["usd"] == pytest.approx(0.4)
+    assert [(event["kind"], event["cost"]) for event in infra_events(repo)] == [("wall_cancel", 0.4)]
 
 
 async def test_poisoned_sidecar_cost_does_not_disable_max_usd(tmp_path: Path) -> None:
@@ -1425,6 +1569,9 @@ class SequenceDriver:
     actions: Iterator[Callable[[Path], None]]
     label: str = "seq"
     cost: float = 0.0
+
+    async def preflight(self) -> None:
+        return None
 
     async def propose(self, contract: str, workdir: Path) -> float:
         next(self.actions)(Path(workdir))

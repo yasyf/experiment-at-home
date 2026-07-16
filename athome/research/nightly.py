@@ -29,6 +29,7 @@ class MorningReport:
         best: The best kept row for the metric direction, or ``None`` if nothing was kept.
         rows: Every journaled unit, in order.
         infra_retries: How many infra retries the sidecar recorded (``0`` when absent).
+        accounting_aborts: How many accounting aborts the sidecar recorded (``0`` when absent).
     """
 
     experiment: str
@@ -38,6 +39,7 @@ class MorningReport:
     best: JournalRow | None
     rows: tuple[JournalRow, ...]
     infra_retries: int
+    accounting_aborts: int
 
 
 async def repo_root(spec_path: Path) -> Path:
@@ -102,4 +104,5 @@ async def report(spec: ExperimentSpec, *, repo: Path) -> MorningReport:
         best=journal.best(spec.direction),
         rows=tuple(rows),
         infra_retries=failures.infra_retries(path.with_name(f"{spec.name}.events.jsonl")),
+        accounting_aborts=failures.accounting_aborts(path.with_name(f"{spec.name}.events.jsonl")),
     )

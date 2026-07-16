@@ -54,6 +54,9 @@ class PaidDriver:
     cost: float
     label: str = "paid"
 
+    async def preflight(self) -> None:
+        return None
+
     async def propose(self, contract: str, workdir: Path) -> float:
         for relative, content in self.proposal.files.items():
             (workdir / relative).write_text(content)
@@ -126,6 +129,7 @@ async def test_report_summarizes_the_journal(tmp_path: Path) -> None:
     assert report.best is not None and report.best.metric == 0.5
     assert len(report.rows) == 3
     assert report.infra_retries == 0  # no infra sidecar for this clean run
+    assert report.accounting_aborts == 0
 
 
 async def test_report_counts_infra_retries_from_the_sidecar(tmp_path: Path) -> None:
@@ -143,6 +147,25 @@ async def test_report_counts_infra_retries_from_the_sidecar(tmp_path: Path) -> N
 
     assert report.infra_retries == 2  # both sidecar retry records counted
     assert report.units == 1  # the journal itself is untouched by infra events
+
+
+async def test_report_counts_accounting_aborts_from_the_sidecar(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    spec = await drive(repo, StubProposal({"train.py": "LOSS = 0.5\n"}))
+    events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
+    events.write_text(
+        json.dumps({"unit": 1, "reason": "unknown spend", "kind": "accounting_abort"})
+        + "\n"
+        + json.dumps({"unit": 1, "attempt": 0, "reason": "reset", "kind": "retry"})
+        + "\n"
+        + json.dumps({"unit": 2, "reason": "invalid cost", "kind": "accounting_abort"})
+        + "\n"
+    )
+
+    report = await nightly.report(spec, repo=repo)
+
+    assert report.accounting_aborts == 2
+    assert report.infra_retries == 1
 
 
 async def test_report_excludes_wall_cancel_from_retries_but_keeps_its_cost(tmp_path: Path) -> None:
@@ -273,13 +296,18 @@ def test_cli_status_and_report_read_the_journal(tmp_path: Path) -> None:
         StubProposal({"train.py": "LOSS = 0.5\n"}),
         StubProposal({"train.py": "LOSS = 0.6\n"}),
     )
+    (repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl").write_text(
+        json.dumps({"unit": 2, "reason": "unknown spend", "kind": "accounting_abort"}) + "\n"
+    )
     runner = CliRunner()
 
     status = json.loads(runner.invoke(research_cli, ["status", str(spec_path), "--repo", str(repo), "--json"]).output)
     assert (status["units"], status["kept"], status["crashes"]) == (2, 1, 0)
+    assert status["accounting_aborts"] == 1
     assert status["best"]["metric"] == 0.5
     assert "rows" not in status
 
     report = json.loads(runner.invoke(research_cli, ["report", str(spec_path), "--repo", str(repo), "--json"]).output)
+    assert report["accounting_aborts"] == 1
     assert len(report["rows"]) == 2
     assert [row["verdict"] for row in report["rows"]] == ["keep", "discard"]

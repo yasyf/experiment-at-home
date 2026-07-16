@@ -9,7 +9,7 @@ from pathlib import Path
 import anyio
 
 from athome.cache import atomic_write_text
-from athome.research.errors import ResearchError
+from athome.research.errors import PreflightFailure
 from athome.research.gate import matches, monotone_gate
 from athome.research.loop import (
     InvalidBaseline,
@@ -24,10 +24,6 @@ from athome.research.loop import (
 from athome.research.spec import ExperimentSpec
 
 STABILITY_RTOL = 0.1
-
-
-class PreflightFailure(ResearchError):
-    """A mandatory research validation probe failed before the unit loop began."""
 
 
 @dataclass(frozen=True, slots=True)

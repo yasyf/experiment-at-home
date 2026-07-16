@@ -23,6 +23,7 @@ from athome.research.failures import AccountingIntegrityError, infra_events
 from athome.research.gate import TreeChange
 from athome.research.journal import Journal, Verdict
 from athome.research.loop import run
+from athome.research.preflight import PreflightFailure
 from athome.research.spec import Budget, ExperimentSpec, ProposalTimeout
 
 if TYPE_CHECKING:
@@ -144,6 +145,26 @@ def fake_claude(tmp_path: Path, body: str) -> tuple[str, ...]:
     return (sys.executable, str(script))
 
 
+def versioned_fake_claude(tmp_path: Path, output: str) -> tuple[tuple[str, ...], Path]:
+    marker = tmp_path / "proposal-spend"
+    script = tmp_path / "fake-claude"
+    script.write_text(
+        textwrap.dedent(f"""
+            #!{sys.executable}
+            import json, pathlib, sys
+            if sys.argv[1:] == ["--version"]:
+                print({output!r})
+                raise SystemExit
+            pathlib.Path({str(marker)!r}).write_text("spent")
+            pathlib.Path("train.py").write_text("LOSS = 0.2\\n")
+            print(json.dumps({{"type": "result", "total_cost_usd": 0.15}}))
+        """).strip()
+        + "\n"
+    )
+    script.chmod(0o755)
+    return ((str(script), "-p", "--output-format", "json"), marker)
+
+
 def plain_checkout(repo: Path) -> Path:
     # The clone-isolation model hands the driver a plain `.git`-less dir seeded via git archive.
     (dest := repo.parent / f"wc-{repo.name}").mkdir()
@@ -166,6 +187,44 @@ async def test_propose_edits_the_candidate_dir_and_reports_cost(tmp_path: Path) 
 
     assert (workdir / "train.py").read_text() == "LOSS = 0.2\n"
     assert cost == 0.4207  # from total_cost_usd, never the "cost is 999" prose
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        pytest.param("1.0.22 (Claude Code)", id="floor"),
+        pytest.param("claude version 2.4.1", id="above-prefixed"),
+    ],
+)
+async def test_claude_preflight_accepts_supported_version_outputs(tmp_path: Path, output: str) -> None:
+    command, marker = versioned_fake_claude(tmp_path, output)
+    driver = ClaudeCodeDriver(make_spec(budget=Budget(max_units=1)), command=command)
+
+    await driver.preflight()
+
+    assert not marker.exists()
+
+
+async def test_claude_preflight_rejects_outdated_cli_before_proposal_spend(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    command, marker = versioned_fake_claude(tmp_path, "1.0.21 (Claude Code)")
+    spec = make_spec(budget=Budget(max_units=1, max_usd=1.0))
+
+    with pytest.raises(PreflightFailure, match=r"1\.0\.21.*1\.0\.22"):
+        await run(spec, driver=ClaudeCodeDriver(spec, command=command), repo=repo)
+
+    assert not marker.exists()
+    assert journal_rows(repo) == []
+
+
+async def test_claude_preflight_rejects_unparseable_version_output(tmp_path: Path) -> None:
+    command, marker = versioned_fake_claude(tmp_path, "Claude Code development build")
+    driver = ClaudeCodeDriver(make_spec(budget=Budget(max_units=1)), command=command)
+
+    with pytest.raises(PreflightFailure, match="carried no semantic version"):
+        await driver.preflight()
+
+    assert not marker.exists()
 
 
 def test_describe_change_reproduces_the_canonical_strings() -> None:
@@ -264,7 +323,7 @@ async def test_loop_drives_the_claude_driver_end_to_end(tmp_path: Path) -> None:
 
 
 async def test_hanging_proposal_is_killed_on_timeout(tmp_path: Path) -> None:
-    # BP1: a hung agent is bounded by timeout_s and its detached process group is killed.
+    # A spawned timeout without a complete envelope aborts accounting after killing the process group.
     workdir = plain_checkout(toy_repo(tmp_path))
     driver = ClaudeCodeDriver(
         make_spec(budget=Budget(max_units=1)),
@@ -273,7 +332,7 @@ async def test_hanging_proposal_is_killed_on_timeout(tmp_path: Path) -> None:
         timeout_s=1.0,
     )
 
-    with pytest.raises(ProposalTimeout):
+    with pytest.raises(AccountingIntegrityError):
         await driver.propose("contract", workdir)
 
     agent_pid = int((workdir / "agent.pid").read_text())  # the agent started before the kill
@@ -288,13 +347,13 @@ async def test_hanging_proposal_is_killed_on_timeout(tmp_path: Path) -> None:
 
 
 async def test_proposal_is_bounded_by_hard_kill_when_no_timeout_s(tmp_path: Path) -> None:
-    # BP1: no explicit timeout_s and no wall budget still bounds the proposal via hard_kill_s.
+    # The hard-kill fallback also aborts accounting when the spawned run left no complete envelope.
     workdir = plain_checkout(toy_repo(tmp_path))
     spec = make_spec(budget=Budget(max_units=1, hard_kill_s=1.0))
     driver = ClaudeCodeDriver(spec, command=fake_claude(tmp_path, FAKE_CLAUDE_HANGS), poll=0.05, timeout_s=None)
 
     with anyio.fail_after(6.0):  # must actually cut the 120s hang short
-        with pytest.raises(ProposalTimeout):
+        with pytest.raises(AccountingIntegrityError):
             await driver.propose("contract", workdir)
 
 
@@ -341,6 +400,35 @@ async def test_captured_cost_rejects_an_invalid_or_missing_cost(tmp_path: Path, 
         await driver.captured_cost(DetachedRun(name="x", pid=1, log_path=log))
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param("", id="empty"),
+        pytest.param('{"type":"result","total_co', id="truncated-mid-key"),
+        pytest.param('{"type":"result","total_cost_usd":', id="complete-key-no-value"),
+    ],
+)
+async def test_recovered_cost_requires_a_complete_envelope(tmp_path: Path, body: str) -> None:
+    (log := tmp_path / "run.log").write_text(body)
+    driver = ClaudeCodeDriver(make_spec(budget=Budget(max_units=1)))
+
+    with pytest.raises(AccountingIntegrityError):
+        await driver.recovered_cost(DetachedRun(name="x", pid=1, log_path=log))
+
+
+async def test_recovered_cost_reads_a_complete_envelope(tmp_path: Path) -> None:
+    (log := tmp_path / "run.log").write_text('{"type":"result","total_cost_usd":0.42}\n')
+    driver = ClaudeCodeDriver(make_spec(budget=Budget(max_units=1)))
+
+    assert await driver.recovered_cost(DetachedRun(name="x", pid=1, log_path=log)) == 0.42
+
+
+async def test_recover_cost_before_spawn_is_zero() -> None:
+    driver = ClaudeCodeDriver(make_spec(budget=Budget(max_units=1)))
+
+    assert await driver.recover_cost() == 0.0
+
+
 async def test_killed_unit_spend_is_recovered_from_the_log(tmp_path: Path) -> None:
     # BP2: an agent that bills then hangs is killed on timeout and its spend is recovered.
     workdir = plain_checkout(toy_repo(tmp_path))
@@ -374,7 +462,7 @@ async def test_wall_cancel_with_partial_cost_envelope_aborts_accounting(tmp_path
 
     events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
     assert journal_rows(repo) == []
-    assert not events.exists()
+    assert [(event["kind"], "cost" in event) for event in infra_events(events)] == [("accounting_abort", False)]
 
 
 async def test_wall_cancel_stop_failure_aborts_accounting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -404,11 +492,15 @@ async def test_wall_cancel_stop_failure_aborts_accounting(tmp_path: Path, monkey
 
     with anyio.fail_after(4.0):
         with pytest.raises(AccountingIntegrityError):
-            await run(spec, driver=ClaudeCodeDriver(spec, poll=30.0, timeout_s=10.0), repo=repo)
+            await run(
+                spec,
+                driver=ClaudeCodeDriver(spec, command=(sys.executable,), poll=30.0, timeout_s=10.0),
+                repo=repo,
+            )
 
     events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
     assert journal_rows(repo) == []
-    assert not events.exists()
+    assert [(event["kind"], "cost" in event) for event in infra_events(events)] == [("accounting_abort", False)]
 
 
 async def test_wall_cancel_during_pidfile_write_stops_retained_run_and_recovers_cost(
@@ -435,7 +527,11 @@ async def test_wall_cancel_during_pidfile_write_stops_retained_run_and_recovers_
     monkeypatch.setattr(driver_module, "stop", stopped.append)
 
     with anyio.fail_after(4.0):
-        result = await run(spec, driver=ClaudeCodeDriver(spec, poll=30.0, timeout_s=10.0), repo=repo)
+        result = await run(
+            spec,
+            driver=ClaudeCodeDriver(spec, command=(sys.executable,), poll=30.0, timeout_s=10.0),
+            repo=repo,
+        )
 
     events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
     assert result.kept == 0

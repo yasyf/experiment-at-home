@@ -31,7 +31,9 @@ from athome.research.failures import (
     InfraFailure,
     classify,
     infra_cost,
+    infra_events,
     infra_log,
+    record_accounting_abort,
     record_infra_event,
 )
 from athome.research.gate import immutable_violations, monotone_gate, parse_diff_tree
@@ -134,6 +136,15 @@ async def run_metric(command: tuple[str, ...], workdir: Path, *, hard_kill_s: fl
         return result.returncode, result.stdout
     return None, b""
 
+
+
+def validate_driver_cost(unit: int, cost: object) -> float:
+    match cost:
+        case bool():
+            pass
+        case int() | float() as value if isfinite(value) and value >= 0:
+            return float(value)
+    raise AccountingIntegrityError(f"unit {unit}: driver returned invalid cost {cost!r}")
 
 
 def finite_metric(text: str, key: str) -> float | None:
@@ -322,6 +333,39 @@ async def run_unit(
     deadline: float | None,
     spent: float,
 ) -> UnitOutcome | None:
+    try:
+        return await execute_unit(
+            spec,
+            unit=unit,
+            repo=repo,
+            worktrees=worktrees,
+            incumbent=incumbent,
+            incumbent_metric=incumbent_metric,
+            contract=contract,
+            driver=driver,
+            events=events,
+            deadline=deadline,
+            spent=spent,
+        )
+    except AccountingIntegrityError as exc:
+        await record_accounting_abort(events, unit=unit, reason=str(exc))
+        raise
+
+
+async def execute_unit(
+    spec: ExperimentSpec,
+    *,
+    unit: int,
+    repo: Path,
+    worktrees: Path,
+    incumbent: str,
+    incumbent_metric: float | None,
+    contract: str,
+    driver: Driver,
+    events: Path,
+    deadline: float | None,
+    spent: float,
+) -> UnitOutcome | None:
     committed: Candidate | None = None
     billed = False
     if spec.budget.max_usd is not None and spent > spec.budget.max_usd:
@@ -342,7 +386,7 @@ async def run_unit(
                     workdir = worktrees / f"unit-{unit}-{attempt}"
                     await extract_tree(repo, incumbent, workdir)
                     proposal_started = True
-                    cost = await driver.propose(contract, workdir)
+                    cost = validate_driver_cost(unit, await driver.propose(contract, workdir))
                     proposal_completed = True
                     reported = await read_reported_metric(spec, workdir)
                     await (anyio.Path(workdir) / spec.metric_file).unlink(missing_ok=True)
@@ -371,7 +415,13 @@ async def run_unit(
             except ProposalTimeout as exc:
                 # A hung proposal killed on timeout still counts its recovered spend.
                 logger.warning("unit {} proposal timed out: {}", unit, exc)
-                return UnitOutcome(Verdict.CRASH, None, incumbent, f"proposal timeout: {exc}", exc.cost)
+                return UnitOutcome(
+                    Verdict.CRASH,
+                    None,
+                    incumbent,
+                    f"proposal timeout: {exc}",
+                    validate_driver_cost(unit, exc.cost),
+                )
             except Exception as exc:
                 match classify(exc):
                     case "accounting":
@@ -386,7 +436,7 @@ async def run_unit(
         if scope.cancel_called:
             with anyio.CancelScope(shield=True):
                 if proposal_started and not proposal_completed:
-                    cost = await driver.recover_cost()
+                    cost = validate_driver_cost(unit, await driver.recover_cost())
                 if proposal_completed or cost > 0:
                     await record_infra_event(
                         events,
@@ -476,6 +526,11 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
     async with experiment_lock(Path(athome_dir) / f"{spec.name}.lock"):
         journal = Journal.open(Path(athome_dir) / f"{spec.name}.jsonl", mirror_cc_notes=mirror_cc_notes)
         events = Path(athome_dir) / f"{spec.name}.events.jsonl"
+        if any(event["kind"] == "accounting_abort" for event in infra_events(events)):
+            raise AccountingIntegrityError(
+                f"unreconciled accounting_abort marker in {events}; check the provider ledger, reconcile the spend, "
+                "then remove the accounting_abort line(s)"
+            )
         validate_journal(journal.rows())
         branch = f"{EXPERIMENT_BRANCH_PREFIX}/{spec.name}"
         incumbent, incumbent_metric = await resume(repo, branch, journal, direction=spec.direction)
@@ -484,6 +539,7 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
 
         worktrees = Path(tempfile.mkdtemp(prefix=f"athome-{spec.name}-")).resolve()
         try:
+            await driver.preflight()
             report = await preflight(
                 spec,
                 repo=repo,
@@ -524,8 +580,6 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
                 )
                 if outcome is None:
                     break  # the unit blew past the remaining wall budget and was cancelled
-                if not (finite_number(outcome.cost) and outcome.cost >= 0):
-                    raise AccountingIntegrityError(f"unit {unit}: driver returned invalid cost {outcome.cost!r}")
                 await journal.append(
                     JournalRow(
                         unit=unit,
