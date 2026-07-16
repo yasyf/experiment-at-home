@@ -23,6 +23,7 @@ from athome.config import base_environ
 from athome.research.common import Hasher
 from athome.research.contract import Memory, build_contract
 from athome.research.driver import describe_change, read_reported_metric
+from athome.research.errors import ResearchError
 from athome.research.gate import immutable_violations, monotone_gate, parse_diff_tree
 from athome.research.journal import Journal, JournalRow, Verdict
 from athome.research.spec import BudgetExhausted, ConcurrentRun, PoisonedJournal, ProposalTimeout, finite_number
@@ -65,6 +66,10 @@ class Baseline:
     commit: str
     metric: float | None
     spec_digest: str
+
+
+class InvalidBaseline(ResearchError):
+    pass
 
 
 def hermetic_env() -> dict[str, str]:
@@ -154,8 +159,14 @@ def baseline_digest(spec: ExperimentSpec) -> str:
 async def read_baseline(path: anyio.Path) -> Baseline | None:
     if not await path.exists():
         return None
-    record = json.loads(await path.read_text())
-    return Baseline(commit=record["commit"], metric=record["metric"], spec_digest=record["spec_digest"])
+    try:
+        record = json.loads(await path.read_text())
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise InvalidBaseline(path) from error
+    try:
+        return Baseline(commit=record["commit"], metric=record["metric"], spec_digest=record["spec_digest"])
+    except (KeyError, TypeError) as error:
+        raise InvalidBaseline(path) from error
 
 
 async def evaluate_unit(

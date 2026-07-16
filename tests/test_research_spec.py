@@ -117,7 +117,9 @@ def test_unbounded_glob(pattern: str, expected: bool) -> None:
     assert unbounded_glob(pattern) is expected
 
 
-def make_spec(*, mutable_paths: tuple[str, ...], metric_file: str = ".athome-metric.json") -> ExperimentSpec:
+def make_spec(
+    *, mutable_paths: tuple[str, ...], metric_file: str = ".athome-metric.json", known_good_dir: str | None = None
+) -> ExperimentSpec:
     return ExperimentSpec(
         name="toy",
         metric_command=("python", "score.py"),
@@ -127,6 +129,7 @@ def make_spec(*, mutable_paths: tuple[str, ...], metric_file: str = ".athome-met
         immutable_paths=("score.py",),
         budget=Budget(max_units=1),
         metric_file=metric_file,
+        known_good_dir=known_good_dir,
     )
 
 
@@ -155,6 +158,26 @@ def test_post_init_refuses_a_metric_file_escaping_the_workdir(metric_file: str) 
 
 def test_post_init_accepts_a_nested_relative_metric_file() -> None:
     assert make_spec(mutable_paths=("train.py",), metric_file="logs/.metric.json").metric_file == "logs/.metric.json"
+
+
+def test_post_init_rejects_absolute_known_good_dir() -> None:
+    with pytest.raises(ImmutableViolation, match="repo-relative directory"):
+        make_spec(mutable_paths=("train.py",), known_good_dir="/etc/known-good")
+
+
+def test_post_init_rejects_parent_component_in_known_good_dir() -> None:
+    with pytest.raises(ImmutableViolation, match="repo-relative directory"):
+        make_spec(mutable_paths=("train.py",), known_good_dir="known-good/../../etc")
+
+
+def test_post_init_rejects_empty_known_good_dir() -> None:
+    with pytest.raises(ImmutableViolation, match="repo-relative directory"):
+        make_spec(mutable_paths=("train.py",), known_good_dir="")
+
+
+def test_post_init_accepts_repo_relative_known_good_dir() -> None:
+    spec = make_spec(mutable_paths=("train.py",), known_good_dir="eval/known-good")
+    assert spec.known_good_dir == "eval/known-good"
 
 
 @pytest.mark.parametrize(

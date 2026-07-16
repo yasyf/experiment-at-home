@@ -157,6 +157,25 @@ async def test_dataset_probe_samples_at_most_sixteen_rows(monkeypatch: pytest.Mo
     assert report.checks[1] == "dataset renders: 16/18 examples sampled"
 
 
+@pytest.mark.parametrize(
+    ("method", "backend"),
+    (
+        pytest.param("sft", local(), id="sft"),
+        pytest.param("dpo", tinker(), id="dpo"),
+    ),
+)
+async def test_empty_dataset_is_a_preflight_failure(
+    monkeypatch: pytest.MonkeyPatch, method: Method, backend: TrainBackend
+) -> None:
+    choose(monkeypatch, backend)
+    normalized(monkeypatch)
+
+    with pytest.raises(PreflightFailure) as caught:
+        await preflight(spec(method=method), evaluation=evaluation(), settings=TrainSettings())
+
+    assert str(caught.value) == "dataset is empty after normalize"
+
+
 async def test_renderer_failure_names_the_sampled_row_index(monkeypatch: pytest.MonkeyPatch) -> None:
     choose(monkeypatch, tinker())
     normalized(
@@ -187,7 +206,8 @@ async def test_modal_projection_over_the_effective_cap_fails(monkeypatch: pytest
 
     monkeypatch.setitem(sys.modules, "modal", SimpleNamespace(App=ForbiddenApp))
     choose(monkeypatch, modal())
-    normalized(monkeypatch)
+    normalized(monkeypatch, SFT)
+    monkeypatch.setattr(probes, "render_trl", lambda examples, *, method: None)
 
     with pytest.raises(PreflightFailure, match=r"modal projected cost \$.* exceeds cap \$0.0000"):
         await preflight(spec(max_usd=0.0), evaluation=evaluation(), settings=TrainSettings())
@@ -197,7 +217,7 @@ async def test_modal_projection_over_the_effective_cap_fails(monkeypatch: pytest
 
 async def test_modal_projection_is_skipped_for_a_non_modal_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     choose(monkeypatch, local())
-    normalized(monkeypatch)
+    normalized(monkeypatch, SFT)
 
     report = await preflight(spec(), evaluation=evaluation(), settings=TrainSettings())
 
@@ -215,7 +235,7 @@ async def test_evaluation_sanity_is_mandatory(
     monkeypatch: pytest.MonkeyPatch, bakeoff: BakeoffSpec, message: str
 ) -> None:
     choose(monkeypatch, local())
-    normalized(monkeypatch)
+    normalized(monkeypatch, SFT)
 
     with pytest.raises(PreflightFailure, match=message):
         await preflight(spec(), evaluation=bakeoff, settings=TrainSettings())

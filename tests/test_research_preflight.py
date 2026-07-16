@@ -103,6 +103,17 @@ async def test_failed_baseline_score_never_persists_a_null_metric(tmp_path: Path
         assert not baseline_path.exists()
 
 
+async def test_corrupt_baseline_cache_names_path(tmp_path: Path) -> None:
+    repo = research_repo(tmp_path)
+    baseline_path = repo / "baseline.json"
+    baseline_path.write_text("{")
+
+    with pytest.raises(PreflightFailure) as caught:
+        await run_preflight(repo, make_spec())
+
+    assert str(baseline_path) in str(caught.value)
+
+
 async def test_nondeterministic_stability_score_fails(tmp_path: Path) -> None:
     repo = research_repo(tmp_path, score=UNSTABLE_SCORE_PY)
 
@@ -158,6 +169,35 @@ async def test_known_good_reachability_uses_extracted_overlay_measurement(
     assert score_dirs == ["baseline", "stability"]
     assert extracted_dirs == ["reachability"]
     assert measured_dirs == ["reachability"]
+
+
+async def test_missing_known_good_dir_fails_reachability_after_scoring(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = research_repo(tmp_path)
+    probes = import_module("athome.research.preflight")
+    original_score = probes.score_commit
+    original_extract = probes.extract_tree
+    score_dirs: list[str] = []
+    extracted_dirs: list[str] = []
+
+    async def score_spy(*args: object, **kwargs: object) -> tuple[float | None, bytes]:
+        score_dirs.append(Path(kwargs["score_dir"]).name)
+        return await original_score(*args, **kwargs)
+
+    async def extract_spy(source: Path, treeish: str, dest: Path) -> None:
+        extracted_dirs.append(dest.name)
+        await original_extract(source, treeish, dest)
+
+    monkeypatch.setattr(probes, "score_commit", score_spy)
+    monkeypatch.setattr(probes, "extract_tree", extract_spy)
+
+    with pytest.raises(PreflightFailure, match="not-there"):
+        await run_preflight(repo, make_spec(known_good_dir="not-there"))
+
+    assert score_dirs == ["baseline", "stability"]
+    assert extracted_dirs == ["reachability"]
 
 
 async def test_resume_digest_mismatch_names_both_digests(tmp_path: Path) -> None:

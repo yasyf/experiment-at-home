@@ -72,6 +72,8 @@ async def render_dataset(spec: TrainSpec, backend: TrainBackend) -> tuple[int, i
                 examples = await normalize(spec.dataset, method="sft")
             except Exception as error:
                 raise PreflightFailure(f"dataset normalization failed: {error}") from error
+            if not examples:
+                raise PreflightFailure("dataset is empty after normalize")
             with TemporaryDirectory() as directory:
                 for index, example in enumerate(examples[:SAMPLE_SIZE]):
                     try:
@@ -83,6 +85,8 @@ async def render_dataset(spec: TrainSpec, backend: TrainBackend) -> tuple[int, i
                 examples = await normalize(spec.dataset, method="dpo")
             except Exception as error:
                 raise PreflightFailure(f"dataset normalization failed: {error}") from error
+            if not examples:
+                raise PreflightFailure("dataset is empty after normalize")
             for index, example in enumerate(examples[:SAMPLE_SIZE]):
                 try:
                     render_dpo(example, backend, spec)

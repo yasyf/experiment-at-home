@@ -12,6 +12,7 @@ from athome.cache import atomic_write_text
 from athome.research.errors import ResearchError
 from athome.research.gate import matches, monotone_gate
 from athome.research.loop import (
+    InvalidBaseline,
     baseline_digest,
     extract_tree,
     finite_number,
@@ -93,7 +94,12 @@ async def preflight(
     checks = ["globs bind: passed"]
 
     digest = baseline_digest(spec)
-    cached = await read_baseline(anyio.Path(baseline_path))
+    try:
+        cached = await read_baseline(anyio.Path(baseline_path))
+    except InvalidBaseline as error:
+        raise PreflightFailure(
+            f"frozen baseline at {baseline_path} is corrupt; delete it to re-anchor a fresh run"
+        ) from error
     if resume:
         if cached is None:
             raise PreflightFailure(f"resumed experiment has no frozen baseline at {baseline_path}")
@@ -145,9 +151,14 @@ async def preflight(
 
     reachability_dir = scratch_dir / "reachability"
     await extract_tree(repo, incumbent, reachability_dir)
-    await anyio.to_thread.run_sync(
-        partial(shutil.copytree, repo / spec.known_good_dir, reachability_dir, dirs_exist_ok=True)
-    )
+    try:
+        await anyio.to_thread.run_sync(
+            partial(shutil.copytree, repo / spec.known_good_dir, reachability_dir, dirs_exist_ok=True)
+        )
+    except OSError as error:
+        raise PreflightFailure(
+            f"known_good_dir {spec.known_good_dir!r} could not be copied for reachability: {error}"
+        ) from error
     reachable, _log = await measure(spec, reachability_dir)
     reachable_metric = checked_metric(reachable, probe="reachability")
     if not monotone_gate(reachable_metric, baseline, direction=spec.direction):

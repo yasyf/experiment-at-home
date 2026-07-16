@@ -141,6 +141,8 @@ class ExperimentSpec:
             raise ImmutableViolation(f"mutable_paths must be a tight allowlist; unbounded globs rejected: {bad}")
         if escapes_workdir(self.metric_file):
             raise UnconfinedPath(f"metric_file {self.metric_file!r} must be a relative path inside the work directory")
+        if self.known_good_dir is not None and escapes_workdir(self.known_good_dir):
+            raise ImmutableViolation("known_good_dir must be a repo-relative directory")
 
     @classmethod
     def load(cls, path: Path) -> ExperimentSpec:
