@@ -33,8 +33,6 @@ DIGEST_CHARS = 12
 LOCK_SUFFIX = ".lock"
 LOCK_POLL_SECONDS = 0.01
 READ_ONLY_MODE = 0o444
-READ_WRITE_DIR_MODE = 0o755
-READ_WRITE_FILE_MODE = 0o644
 DIGEST_CHUNK_BYTES = 1 << 20
 
 
@@ -139,22 +137,27 @@ async def promote(name: str, version: str, *, root: Path) -> None:
     """Atomically flips ``current`` to the named version (full name or ``v<NNN>`` prefix).
 
     The flip writes a staging symlink under a unique per-promotion name and renames
-    it over ``current``, so a reader never sees a missing or half-written link and
-    two concurrent promotions never clobber one another's staging.
+    it over ``current``, so a reader never sees a missing or half-written link. The
+    family lock serialises it against :func:`register`, :func:`rollback`, :func:`prune`,
+    and concurrent promotions, so no prune can delete the version being promoted.
     """
-    info = await _resolve(name, version, root=root)
-    family = anyio.Path(info.path).parent
-    staging = family / f"{STAGING_PREFIX}{uuid4().hex}"
-    await staging.symlink_to(info.version)
-    await staging.replace(family / CURRENT_LINK)
+    async with _family_lock(anyio.Path(root) / name):
+        await _promote(name, version, root=root)
 
 
 async def components(root: Path) -> tuple[str, ...]:
-    """Every artifact family name registered under ``root``, sorted."""
+    """Every artifact family with at least one registered version under ``root``, sorted.
+
+    A family directory exists from the moment a registration stages its first version, so a
+    registration that dies before its commit leaves the directory behind. Such a family has
+    registered nothing and is not listed.
+    """
     base = anyio.Path(root)
     if not await base.is_dir():
         return ()
-    return tuple(sorted([child.name async for child in base.iterdir() if await child.is_dir()]))
+    return tuple(
+        sorted([child.name async for child in base.iterdir() if await child.is_dir() and await versions(child.name, root=root)])
+    )
 
 
 async def rollback(name: str, *, root: Path) -> VersionInfo:
@@ -179,7 +182,7 @@ async def rollback(name: str, *, root: Path) -> VersionInfo:
         ordered = await versions(name, root=root)
         if (prior := next((info for info in reversed(ordered) if info.number < promoted.number), None)) is None:
             raise RegistryError(f"cannot roll back {name}: {promoted.version} is the earliest version")
-        await promote(name, prior.version, root=root)
+        await _promote(name, prior.version, root=root)
     return prior
 
 
@@ -187,8 +190,9 @@ async def prune(name: str, *, keep: int = 3, root: Path) -> tuple[VersionInfo, .
     """Deletes all but the newest ``keep`` versions of ``name``, never the one ``current`` points to.
 
     The promoted version is always retained, even when it falls outside the newest-``keep`` window.
-    Doomed version directories are unfrozen and removed under the family lock, so a prune never races
-    a :func:`register` or :func:`rollback` on the same family.
+    Doomed versions are renamed out of discovery and then removed under the family lock, so a prune
+    never races a :func:`register`, :func:`promote`, or :func:`rollback` on the same family, and a
+    reader never sees a half-deleted version.
 
     Args:
         name: The artifact family to prune.
@@ -197,7 +201,12 @@ async def prune(name: str, *, keep: int = 3, root: Path) -> tuple[VersionInfo, .
 
     Returns:
         The removed versions, oldest first.
+
+    Raises:
+        RegistryError: ``keep`` is negative.
     """
+    if keep < 0:
+        raise RegistryError(f"refusing to prune {name} with a negative keep of {keep}")
     async with _family_lock(anyio.Path(root) / name):
         ordered = await versions(name, root=root)
         promoted = await current(name, root=root)
@@ -206,8 +215,7 @@ async def prune(name: str, *, keep: int = 3, root: Path) -> tuple[VersionInfo, .
             retained.add(promoted.version)
         doomed = [info for info in ordered if info.version not in retained]
         for info in doomed:
-            await _unfreeze(anyio.Path(info.path))
-            await anyio.to_thread.run_sync(shutil.rmtree, info.path)
+            await _discard(anyio.Path(info.path))
     return tuple(doomed)
 
 
@@ -228,6 +236,20 @@ async def _family_lock(family: anyio.Path) -> AsyncIterator[None]:
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
+
+
+async def _promote(name: str, version: str, *, root: Path) -> None:
+    info = await _resolve(name, version, root=root)
+    family = anyio.Path(info.path).parent
+    staging = family / f"{STAGING_PREFIX}{uuid4().hex}"
+    await staging.symlink_to(info.version)
+    await staging.replace(family / CURRENT_LINK)
+
+
+async def _discard(path: anyio.Path) -> None:
+    staging = path.parent / f"{VERSION_STAGING_PREFIX}{uuid4().hex}"
+    await path.rename(staging)
+    await anyio.to_thread.run_sync(shutil.rmtree, staging)
 
 
 async def _materialize(destination: anyio.Path, content: bytes | Path) -> None:
@@ -258,11 +280,6 @@ async def _freeze(path: anyio.Path) -> None:
     async for child in path.rglob("*"):
         if await child.is_file():
             await child.chmod(READ_ONLY_MODE)
-
-
-async def _unfreeze(path: anyio.Path) -> None:
-    async for child in path.rglob("*"):
-        await child.chmod(READ_WRITE_DIR_MODE if await child.is_dir() else READ_WRITE_FILE_MODE)
 
 
 async def _info(name: str, path: anyio.Path) -> VersionInfo:

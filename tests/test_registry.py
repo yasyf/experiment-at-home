@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import itertools
+import shutil
 from typing import TYPE_CHECKING
 
 import anyio
+import anyio.to_thread
 import pytest
 
 from athome import registry
@@ -38,23 +41,12 @@ def content_digest(files: dict[str, bytes]) -> str:
     return hasher.hexdigest()[:DIGEST_CHARS]
 
 
-class Barrier:
-    """A minimal count-gated async barrier: every waiter blocks until ``n`` have arrived."""
-
-    def __init__(self, n: int) -> None:
-        self.n = n
-        self.count = 0
-        self.event = anyio.Event()
-
-    async def wait(self) -> None:
-        self.count += 1
-        if self.count >= self.n:
-            self.event.set()
-        await self.event.wait()
-
-
 async def promote_one(name: str, version: str, root: Path) -> None:
     await promote(name, version, root=root)
+
+
+async def prune_one(name: str, keep: int, root: Path) -> None:
+    await prune(name, keep=keep, root=root)
 
 
 async def test_register_writes_a_content_addressed_version(tmp_path: Path) -> None:
@@ -172,25 +164,40 @@ async def test_promote_is_an_atomic_symlink_swap(tmp_path: Path) -> None:
     assert sorted(child.name for child in family.iterdir() if not child.is_symlink()) == [v1.version, v2.version]
 
 
-async def test_concurrent_promotions_do_not_clobber(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # WR4: two promotions of the same family race at the symlink step; a shared staging
-    # name makes one clobber the other, so both must use a unique per-promotion name.
+async def test_concurrent_promotions_serialize_on_the_family_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # WR4: a lock-free promote let two promotions collide at the symlink swap, and let one flip
+    # `current` onto a version a concurrent prune was deleting.
     v1 = await register("toy", {"m": b"a"}, {}, root=tmp_path)
     v2 = await register("toy", {"m": b"b"}, {}, root=tmp_path)
 
-    barrier = Barrier(2)
+    inside = 0
+    overlapped = False
+    gate = anyio.Event()
     real_symlink = anyio.Path.symlink_to
 
-    async def synced_symlink(self: anyio.Path, target: object, *args: object, **kwargs: object) -> None:
-        await barrier.wait()  # force both promotions to collide at the staging symlink
-        return await real_symlink(self, target, *args, **kwargs)
+    async def counted_symlink(self: anyio.Path, target: object, *args: object, **kwargs: object) -> None:
+        nonlocal inside, overlapped
+        inside += 1
+        if inside > 1:
+            overlapped = True  # a second promotion reached the swap while the first held it
+            gate.set()
+        else:
+            with anyio.move_on_after(0.25):  # serialized: no partner arrives, so this times out
+                await gate.wait()
+        try:
+            return await real_symlink(self, target, *args, **kwargs)
+        finally:
+            inside -= 1
 
-    monkeypatch.setattr(anyio.Path, "symlink_to", synced_symlink)
+    monkeypatch.setattr(anyio.Path, "symlink_to", counted_symlink)
 
     async with anyio.create_task_group() as tg:
         tg.start_soon(promote_one, "toy", v1.version, tmp_path)
         tg.start_soon(promote_one, "toy", v2.version, tmp_path)
 
+    assert not overlapped
     promoted = await current("toy", root=tmp_path)
     assert promoted is not None and promoted.version in {v1.version, v2.version}
     family = tmp_path / "toy"
@@ -293,7 +300,6 @@ async def test_prune_keeps_newest_and_removes_the_rest(tmp_path: Path) -> None:
 
     removed = await prune("toy", keep=2, root=tmp_path)
 
-    # Removed versions are frozen read-only on disk, so a passing rmtree proves the unfreeze.
     assert [info.number for info in removed] == [1, 2, 3]
     assert not any(info.path.exists() for info in removed)
     assert [info.number for info in await versions("toy", root=tmp_path)] == [4, 5]
@@ -319,3 +325,97 @@ async def test_prune_keep_larger_than_count_removes_nothing(tmp_path: Path) -> N
     await register("toy", {"m": b"b"}, {}, root=tmp_path)
     assert await prune("toy", keep=5, root=tmp_path) == ()
     assert [info.number for info in await versions("toy", root=tmp_path)] == [1, 2]
+
+
+async def test_prune_refuses_a_negative_keep(tmp_path: Path) -> None:
+    # A negative keep retained nothing, silently deleting every unpromoted version.
+    await register("toy", {"m": b"a"}, {}, root=tmp_path)
+    await register("toy", {"m": b"b"}, {}, root=tmp_path)
+
+    with pytest.raises(RegistryError):
+        await prune("toy", keep=-1, root=tmp_path)
+
+    assert [info.number for info in await versions("toy", root=tmp_path)] == [1, 2]
+
+
+async def test_prune_cannot_strand_current_on_a_concurrent_promotion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PRUNE/PROMOTE RACE: prune snapshots `current` under the family lock, so a lock-free promote
+    # could flip `current` onto a doomed version mid-delete and leave it dangling.
+    v1 = await register("toy", {"m": b"a"}, {}, root=tmp_path)
+    await register("toy", {"m": b"b"}, {}, root=tmp_path)
+    v3 = await register("toy", {"m": b"c"}, {}, root=tmp_path)
+    await promote("toy", v3.version, root=tmp_path)
+
+    deleting = anyio.Event()  # prune holds the lock and is about to delete v1's bytes
+    flipped = anyio.Event()  # the racing promotion landed
+    real_run_sync = anyio.to_thread.run_sync
+
+    async def gated_run_sync(func: object, *args: object, **kwargs: object) -> object:
+        if func is not shutil.rmtree:  # every anyio filesystem call lands here; gate only the delete
+            return await real_run_sync(func, *args, **kwargs)
+        deleting.set()
+        with anyio.move_on_after(0.25):  # serialized: the promotion can't land, so this times out
+            await flipped.wait()
+        return await real_run_sync(func, *args, **kwargs)
+
+    monkeypatch.setattr(anyio.to_thread, "run_sync", gated_run_sync)
+
+    async def promote_while_deleting() -> None:
+        await deleting.wait()
+        with contextlib.suppress(RegistryError):  # a serialized prune removes v1 first
+            await promote("toy", v1.version, root=tmp_path)
+        flipped.set()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(prune_one, "toy", 2, tmp_path)
+        tg.start_soon(promote_while_deleting)
+
+    link = tmp_path / "toy" / "current"
+    assert link.is_symlink()
+    assert link.resolve().is_dir()  # `current` resolves to a version that still exists
+    promoted = await current("toy", root=tmp_path)
+    assert promoted is not None and promoted.metadata["version"] == promoted.version
+
+
+async def test_prune_hides_a_doomed_version_before_deleting_its_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # TORN DELETES: removing a version tree in place let a lock-free reader observe a half-deleted
+    # directory that still matched the version pattern.
+    await register("toy", {"m": b"a"}, {}, root=tmp_path)
+    await register("toy", {"m": b"b"}, {}, root=tmp_path)
+
+    observed: list[list[int]] = []
+    real_run_sync = anyio.to_thread.run_sync
+
+    async def observing_run_sync(func: object, *args: object, **kwargs: object) -> object:
+        if func is shutil.rmtree:  # what a lock-free reader sees the instant the bytes go away
+            observed.append([info.number for info in await versions("toy", root=tmp_path)])
+        return await real_run_sync(func, *args, **kwargs)
+
+    monkeypatch.setattr(anyio.to_thread, "run_sync", observing_run_sync)
+
+    removed = await prune("toy", keep=1, root=tmp_path)
+
+    assert [info.number for info in removed] == [1]
+    assert observed == [[2]]  # v1 left discovery before its bytes started disappearing
+
+
+async def test_components_omits_a_family_whose_registration_never_committed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # GHOST FAMILIES: register creates the family directory to stage its first version, so a
+    # registration that died before the commit rename left the family listed with nothing in it.
+    async def failing_materialize(destination: anyio.Path, content: bytes | Path) -> None:
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(registry, "_materialize", failing_materialize)
+
+    with pytest.raises(OSError, match="no space left on device"):
+        await register("ghost", {"m": b"a"}, {}, root=tmp_path)
+
+    assert (tmp_path / "ghost").is_dir()  # the staging mkdir made the family visible
+    assert await versions("ghost", root=tmp_path) == []
+    assert await components(tmp_path) == ()
