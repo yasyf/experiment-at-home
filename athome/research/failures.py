@@ -27,12 +27,16 @@ dollars nor free wall-clock: the retry count is hard-capped, ``max_usd`` still c
 spend, and the run aborts. It can never manufacture a journaled row — no forged keep,
 discard, or contract-memory feedback — so the worst it achieves is burning its own unit's
 budget before the run aborts. Worthless.
+
+If a wall-cancel cost flush fails I/O, the run aborts loudly without recording that
+cost; check the ledger before resuming.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from math import isfinite
 from subprocess import CalledProcessError
 from typing import TYPE_CHECKING, Literal
 
@@ -96,8 +100,18 @@ def classify(exc: BaseException) -> Literal["infra", "candidate"]:
             return "candidate"
 
 
-async def record_infra_event(path: Path, *, unit: int, attempt: int, reason: str, cost: float) -> None:
-    payload = (json.dumps({"unit": unit, "attempt": attempt, "reason": reason, "cost": cost}) + "\n").encode()
+async def record_infra_event(
+    path: Path,
+    *,
+    unit: int,
+    attempt: int,
+    reason: str,
+    cost: float,
+    kind: Literal["retry", "wall_cancel"],
+) -> None:
+    payload = (
+        json.dumps({"unit": unit, "attempt": attempt, "reason": reason, "cost": cost, "kind": kind}) + "\n"
+    ).encode()
     fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
     try:
         if (size := os.fstat(fd).st_size) and os.pread(fd, 1, size - 1) != b"\n":
@@ -130,12 +144,15 @@ def parse_event(line: bytes, path: Path) -> dict[str, object] | None:
 
 
 def infra_retries(path: Path) -> int:
-    return len(infra_events(path))
+    return sum(event.get("kind", "retry") == "retry" for event in infra_events(path))
 
 
 def infra_cost(path: Path) -> float:
     return sum(
         float(cost)
         for event in infra_events(path)
-        if isinstance(cost := event.get("cost"), (int, float)) and not isinstance(cost, bool)
+        if isinstance(cost := event.get("cost"), (int, float))
+        and not isinstance(cost, bool)
+        and isfinite(cost)
+        and cost >= 0
     )

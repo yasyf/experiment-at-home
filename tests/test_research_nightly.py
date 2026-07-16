@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import textwrap
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -14,6 +15,7 @@ from athome import launchd
 from athome.research import nightly
 from athome.research.cli import cli as research_cli
 from athome.research.driver import StubDriver, StubProposal
+from athome.research.failures import infra_cost
 from athome.research.loop import run
 from athome.research.spec import Budget, ExperimentSpec
 
@@ -44,6 +46,21 @@ SPEC_TOML = textwrap.dedent(
     max_units = 3
     """
 ).strip()
+
+
+@dataclass(frozen=True, slots=True)
+class PaidDriver:
+    proposal: StubProposal
+    cost: float
+    label: str = "paid"
+
+    async def propose(self, contract: str, workdir: Path) -> float:
+        for relative, content in self.proposal.files.items():
+            (workdir / relative).write_text(content)
+        return self.cost
+
+    async def recover_cost(self) -> float:
+        return 0.0
 
 
 def git(repo: Path, *args: str) -> str:
@@ -116,7 +133,7 @@ async def test_report_counts_infra_retries_from_the_sidecar(tmp_path: Path) -> N
     spec = await drive(repo, StubProposal({"train.py": "LOSS = 0.5\n"}))
     events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
     events.write_text(
-        json.dumps({"unit": 1, "attempt": 0, "reason": "OSError('reset')"})
+        json.dumps({"unit": 1, "attempt": 0, "reason": "OSError('reset')", "kind": "retry"})
         + "\n"
         + json.dumps({"unit": 1, "attempt": 1, "reason": "OSError('reset')"})
         + "\n"
@@ -126,6 +143,27 @@ async def test_report_counts_infra_retries_from_the_sidecar(tmp_path: Path) -> N
 
     assert report.infra_retries == 2  # both sidecar retry records counted
     assert report.units == 1  # the journal itself is untouched by infra events
+
+
+async def test_report_excludes_wall_cancel_from_retries_but_keeps_its_cost(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    spec = make_spec(Budget(max_units=1, max_wall_s=0.3))
+
+    with anyio.fail_after(3.0):
+        result = await run(
+            spec,
+            driver=PaidDriver(
+                StubProposal({"train.py": "import time\ntime.sleep(30)\nLOSS = 0.5\n"}),
+                cost=0.6,
+            ),
+            repo=repo,
+        )
+
+    events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
+    report = await nightly.report(spec, repo=repo)
+    assert result.kept == 0 and report.units == 0
+    assert report.infra_retries == 0
+    assert infra_cost(events) == 0.6
 
 
 async def test_install_wires_the_agent_from_the_spec(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

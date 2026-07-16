@@ -14,8 +14,8 @@ import anyio
 import pytest
 
 from athome.research.contract import Memory, build_contract
-from athome.research.driver import StubDriver, StubProposal
-from athome.research.failures import MAX_INFRA_RETRIES, InfraFailure
+from athome.research.driver import ClaudeCodeDriver, StubDriver, StubProposal
+from athome.research.failures import MAX_INFRA_RETRIES, InfraFailure, infra_cost
 from athome.research.journal import Journal, JournalRow, Verdict
 from athome.research.loop import (
     baseline_digest,
@@ -128,6 +128,9 @@ class HostileDriver:
         self.action(Path(workdir))
         return self.cost
 
+    async def recover_cost(self) -> float:
+        return 0.0
+
 
 @dataclass(frozen=True, slots=True)
 class CostDriver:
@@ -142,6 +145,9 @@ class CostDriver:
             (Path(workdir) / relative).write_text(content)
         return self.cost
 
+    async def recover_cost(self) -> float:
+        return 0.0
+
 
 @dataclass(frozen=True, slots=True)
 class SlowDriver:
@@ -155,6 +161,9 @@ class SlowDriver:
         (Path(workdir) / "train.py").write_text("LOSS = 0.1\n")
         return 0.0
 
+    async def recover_cost(self) -> float:
+        return 0.0
+
 
 @dataclass(frozen=True, slots=True)
 class TimeoutDriver:
@@ -166,6 +175,9 @@ class TimeoutDriver:
     async def propose(self, contract: str, workdir: Path) -> float:
         (Path(workdir) / "train.py").write_text("LOSS = 0.1\n")
         raise ProposalTimeout("simulated hang killed on timeout", cost=self.cost)
+
+    async def recover_cost(self) -> float:
+        return 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +194,9 @@ class RecordingDriver:
             target = anyio.Path(workdir) / relative
             await target.parent.mkdir(parents=True, exist_ok=True)
             await target.write_text(content)
+        return 0.0
+
+    async def recover_cost(self) -> float:
         return 0.0
 
 
@@ -750,6 +765,22 @@ async def test_bp2_cumulative_spend_over_max_usd_aborts_loudly(tmp_path: Path) -
     assert sum(row.resources["usd"] for row in rows) == pytest.approx(0.8)  # both units' spend recorded
 
 
+async def test_poisoned_sidecar_cost_does_not_disable_max_usd(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    (athome := repo / ".git" / "athome").mkdir(parents=True, exist_ok=True)
+    (athome / f"{EXPERIMENT_NAME}.events.jsonl").write_text('{"cost":NaN}\n')
+
+    with pytest.raises(BudgetExhausted, match=r"spend \$0\.6000 crossed max_usd \$0\.5000"):
+        await run(
+            make_spec(budget=Budget(max_units=1, max_usd=0.5)),
+            driver=CostDriver(iter([loss_proposal(0.5)]), cost=0.6),
+            repo=repo,
+        )
+
+    (row,) = journal_rows(repo)
+    assert row.resources["usd"] == pytest.approx(0.6)
+
+
 async def test_killed_unit_spend_counts_toward_max_usd(tmp_path: Path) -> None:
     # BP2: a hung unit killed on timeout recovers its spend onto the journaled CRASH, so an
     # expensive hang still counts toward max_usd instead of under-reporting as 0.0.
@@ -1222,6 +1253,50 @@ async def test_wall_cancel_after_proposal_records_cost_for_resume(tmp_path: Path
     assert resume_driver.contracts == []
 
 
+async def test_wall_cancel_during_billed_claude_proposal_recovers_cost_for_resume(tmp_path: Path) -> None:
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = toy_repo(repo_dir)
+    marker = tmp_path / "claude-exited"
+    (fake_claude := tmp_path / "fake_claude.py").write_text(
+        textwrap.dedent(f"""
+            import json, pathlib, time
+            pathlib.Path("train.py").write_text("LOSS = 0.5\\n")
+            print(json.dumps({{"type": "result", "total_cost_usd": 0.6}}), flush=True)
+            time.sleep(0.25)
+            pathlib.Path({str(marker)!r}).write_text("exited")
+        """).strip()
+        + "\n"
+    )
+    spec = make_spec(budget=Budget(max_units=1, max_wall_s=1.0))
+
+    with anyio.fail_after(4.0):
+        result = await run(
+            spec,
+            driver=ClaudeCodeDriver(
+                spec,
+                command=(sys.executable, str(fake_claude)),
+                poll=30.0,
+                timeout_s=10.0,
+            ),
+            repo=repo,
+        )
+
+    events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
+    assert marker.read_text() == "exited"
+    assert result.kept == 0 and journal_rows(repo) == []
+    assert [(record["kind"], record["cost"]) for record in infra_events(repo)] == [("wall_cancel", 0.6)]
+    assert infra_cost(events) == pytest.approx(0.6)
+
+    resume_driver = RecordingDriver(iter([loss_proposal(0.4)]))
+    with pytest.raises(BudgetExhausted, match=r"spend \$0\.6000 crossed max_usd \$0\.5000"):
+        await run(
+            make_spec(budget=Budget(max_units=1, max_usd=0.5)),
+            driver=resume_driver,
+            repo=repo,
+        )
+    assert resume_driver.contracts == []
+
+
 async def test_all_infra_reproposals_cross_max_usd_mid_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repo = toy_repo(tmp_path)
     incumbent = git(repo, "rev-parse", "HEAD")
@@ -1332,6 +1407,9 @@ class SequenceDriver:
     async def propose(self, contract: str, workdir: Path) -> float:
         next(self.actions)(Path(workdir))
         return self.cost
+
+    async def recover_cost(self) -> float:
+        return 0.0
 
 
 async def test_fifo_in_a_mutable_path_is_a_candidate_crash(tmp_path: Path) -> None:

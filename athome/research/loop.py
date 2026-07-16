@@ -330,6 +330,7 @@ async def run_unit(
         if remaining is not None and remaining <= 0:
             return None
         cost = 0.0
+        proposal_started = False
         proposal_completed = False
         infra: BaseException | None = None
         with anyio.move_on_after(remaining) as scope:
@@ -339,6 +340,7 @@ async def run_unit(
                 else:
                     workdir = worktrees / f"unit-{unit}-{attempt}"
                     await extract_tree(repo, incumbent, workdir)
+                    proposal_started = True
                     cost = await driver.propose(contract, workdir)
                     proposal_completed = True
                     reported = await read_reported_metric(spec, workdir)
@@ -379,20 +381,25 @@ async def run_unit(
                     case "infra":
                         infra = exc
         if scope.cancel_called:
-            if proposal_completed:
-                with anyio.CancelScope(shield=True):
+            with anyio.CancelScope(shield=True):
+                if proposal_started and not proposal_completed:
+                    cost = await driver.recover_cost()
+                if proposal_completed or cost > 0:
                     await record_infra_event(
                         events,
                         unit=unit,
                         attempt=attempt,
                         reason="wall deadline cancelled after proposal",
                         cost=cost,
+                        kind="wall_cancel",
                     )
             return None
         # A committed candidate re-scores (bill its cost once); a pre-commit failure re-proposes.
         attempt_cost = (committed.cost if not billed else 0.0) if committed is not None else cost
         billed = billed or committed is not None
-        await record_infra_event(events, unit=unit, attempt=attempt, reason=repr(infra), cost=attempt_cost)
+        await record_infra_event(
+            events, unit=unit, attempt=attempt, reason=repr(infra), cost=attempt_cost, kind="retry"
+        )
         spent += attempt_cost
         logger.warning("unit {} infra failure, attempt {}/{}: {!r}", unit, attempt, MAX_INFRA_RETRIES, infra)
         if spec.budget.max_usd is not None and spent > spec.budget.max_usd:

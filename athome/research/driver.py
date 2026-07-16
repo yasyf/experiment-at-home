@@ -4,7 +4,7 @@ import json
 import os
 import shlex
 import signal
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import isfinite
 from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
@@ -49,11 +49,15 @@ class Driver(Protocol):
     incurred. It never writes the metric file — the immutable ``metric_command`` owns
     that channel — and it never inspects git state: the harness owns all git plumbing
     and derives the change description from the trusted tree diff (:func:`describe_change`).
+    If cancellation interrupts :meth:`propose`, :meth:`recover_cost` returns any billed
+    cost the interrupted proposal persisted before it could return.
     """
 
     label: str
 
     async def propose(self, contract: str, workdir: Path) -> float: ...
+
+    async def recover_cost(self) -> float: ...
 
 
 async def read_reported_metric(spec: ExperimentSpec, workdir: Path) -> float | None:
@@ -160,12 +164,20 @@ class StubDriver:
             await target.write_text(content)
         return 0.0
 
+    async def recover_cost(self) -> float:
+        return 0.0
+
 
 def stop(run: DetachedRun) -> None:
     try:
         os.killpg(os.getpgid(run.pid), signal.SIGKILL)
     except ProcessLookupError:
         pass
+
+
+@dataclass(slots=True)
+class ProposalRecovery:
+    run: DetachedRun | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +194,7 @@ class ClaudeCodeDriver:
     cancellation so a hung or over-budget agent stops billing. It returns only the
     run's dollar cost, captured from the CLI's own ``total_cost_usd`` envelope (the last
     complete JSON object in the log, validated to a finite non-negative number). On
+    cancellation, :meth:`recover_cost` reads that envelope from the retained run. On
     timeout it raises :class:`ProposalTimeout` carrying the spend recovered from the
     log, so a hung expensive unit still counts toward ``max_usd``. The change
     description is derived harness-side from the trusted tree diff, never the agent's
@@ -198,11 +211,14 @@ class ClaudeCodeDriver:
     command: tuple[str, ...] = DEFAULT_CLAUDE_COMMAND
     poll: float = 5.0
     timeout_s: float | None = None
+    _recovery: ProposalRecovery = field(default_factory=ProposalRecovery, init=False, repr=False, compare=False)
 
     async def propose(self, contract: str, workdir: Path) -> float:
         budget = () if self.spec.budget.max_usd is None else ("--max-budget-usd", str(self.spec.budget.max_usd))
         inner = f"cd {shlex.quote(str(workdir))} && exec {shlex.join([*self.command, *budget, contract])}"
+        self._recovery.run = None
         run = await launch(["/bin/sh", "-c", inner], name=f"{RUN_PREFIX}-{self.spec.name}-{uuid4().hex[:12]}")
+        self._recovery.run = run
         try:
             await self.await_exit(run)
         except TimeoutError as exc:
@@ -211,7 +227,16 @@ class ClaudeCodeDriver:
         except BaseException:
             stop(run)
             raise
-        return await self.captured_cost(run)
+        cost = await self.captured_cost(run)
+        self._recovery.run = None
+        return cost
+
+    async def recover_cost(self) -> float:
+        match self._recovery.run:
+            case None:
+                return 0.0
+            case run:
+                return await self.recovered_cost(run)
 
     async def await_exit(self, run: DetachedRun) -> None:
         fallback = self.spec.budget.hard_kill_s or DEFAULT_PROPOSAL_TIMEOUT_S
