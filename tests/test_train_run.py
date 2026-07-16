@@ -149,6 +149,13 @@ def train_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Non
 @pytest.fixture
 def backend(monkeypatch: pytest.MonkeyPatch) -> FakeBackend:
     chosen = FakeBackend.from_settings()
+
+    async def passes_preflight(
+        spec: TrainSpec, *, evaluation: BakeoffSpec, settings: TrainSettings
+    ) -> train.PreflightReport:
+        return train.PreflightReport(checks=())
+
+    monkeypatch.setattr(train, "preflight", passes_preflight)
     monkeypatch.setattr(train, "select", lambda spec, settings: chosen)
     monkeypatch.setattr(serve, "ManagedServer", FakeServer)
     return chosen
@@ -189,6 +196,41 @@ async def test_run_trains_evaluates_registers_and_promotes_the_winner(
         backend.checkpoints[0].mlx_path
     )
     assert len(ran) == 1
+
+
+async def test_run_preflights_with_loaded_settings_before_selecting_and_training(
+    monkeypatch: pytest.MonkeyPatch, backend: FakeBackend
+) -> None:
+    events: list[str] = []
+    request = spec()
+    bakeoff = evaluation()
+    expected_settings = load(TrainSettings)
+    original_train = FakeBackend.train
+
+    async def preflight(spec: TrainSpec, *, evaluation: BakeoffSpec, settings: TrainSettings) -> train.PreflightReport:
+        assert spec is request
+        assert evaluation is bakeoff
+        assert settings is expected_settings
+        events.append("preflight")
+        return train.PreflightReport(checks=("passed",))
+
+    def select(spec: TrainSpec, settings: TrainSettings) -> FakeBackend:
+        assert settings is expected_settings
+        events.append("select")
+        return backend
+
+    async def train_backend(self: FakeBackend, spec: TrainSpec, *, sink: RunSink, work_dir: Path) -> Checkpoint:
+        events.append("train")
+        return await original_train(self, spec, sink=sink, work_dir=work_dir)
+
+    monkeypatch.setattr(train, "preflight", preflight)
+    monkeypatch.setattr(train, "select", select)
+    monkeypatch.setattr(FakeBackend, "train", train_backend)
+    stub_bakeoff(monkeypatch, leaderboard(winner=train.TRAINED_ARM, passed_gate=True))
+
+    await train.run(request, evaluation=bakeoff)
+
+    assert events == ["preflight", "select", "train"]
 
 
 async def test_the_registry_owns_a_frozen_copy_of_the_weights_it_registers(

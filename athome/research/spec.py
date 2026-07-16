@@ -134,6 +134,7 @@ class ExperimentSpec:
     budget: Budget
     metric_file: str = ".athome-metric.json"
     hypothesis: str | None = None
+    known_good_dir: str | None = None
 
     def __post_init__(self) -> None:
         if bad := [pattern for pattern in self.mutable_paths if unbounded_glob(pattern)]:

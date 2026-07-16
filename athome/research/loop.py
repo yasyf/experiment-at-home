@@ -158,17 +158,6 @@ async def read_baseline(path: anyio.Path) -> Baseline | None:
     return Baseline(commit=record["commit"], metric=record["metric"], spec_digest=record["spec_digest"])
 
 
-async def frozen_baseline(
-    spec: ExperimentSpec, *, repo: Path, score_dir: Path, path: anyio.Path, commit: str
-) -> float | None:
-    digest = baseline_digest(spec)
-    if (cached := await read_baseline(path)) is not None and cached.commit == commit and cached.spec_digest == digest:
-        return cached.metric
-    metric, _log = await score_commit(spec, repo=repo, score_dir=score_dir, commit=commit)
-    await path.write_text(json.dumps({"commit": commit, "metric": metric, "spec_digest": digest}))
-    return metric
-
-
 async def evaluate_unit(
     spec: ExperimentSpec,
     *,
@@ -304,6 +293,8 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path) -> LoopResult
         ConcurrentRun: Another live run holds the per-experiment lock.
         PoisonedJournal: The resumed journal carried a non-finite metric or bad spend.
     """
+    from athome.research.preflight import preflight
+
     common = Path((await run_git(repo, "rev-parse", "--git-common-dir")).strip())
     athome_dir = anyio.Path(common if common.is_absolute() else repo / common) / "athome"
     await athome_dir.mkdir(parents=True, exist_ok=True)
@@ -312,19 +303,22 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path) -> LoopResult
         validate_journal(journal.rows())
         branch = f"{EXPERIMENT_BRANCH_PREFIX}/{spec.name}"
         incumbent, incumbent_metric = await resume(repo, branch, journal, direction=spec.direction)
+        resumed = bool(journal.rows())
         spent = sum(row.resources.get("usd", 0.0) for row in journal.rows())
 
         worktrees = Path(tempfile.mkdtemp(prefix=f"athome-{spec.name}-")).resolve()
         try:
-            baseline = incumbent_metric
+            report = await preflight(
+                spec,
+                repo=repo,
+                incumbent=incumbent,
+                scratch_dir=worktrees / "preflight",
+                baseline_path=Path(athome_dir) / f"{spec.name}.baseline.json",
+                resume=resumed,
+            )
             if incumbent_metric is None:
-                baseline = incumbent_metric = await frozen_baseline(
-                    spec,
-                    repo=repo,
-                    score_dir=worktrees / "baseline",
-                    path=athome_dir / f"{spec.name}.baseline.json",
-                    commit=incumbent,
-                )
+                incumbent_metric = report.baseline
+            baseline = report.baseline
             started = time.monotonic()
             for unit in range(journal.resume_unit(), spec.budget.max_units):
                 elapsed = time.monotonic() - started

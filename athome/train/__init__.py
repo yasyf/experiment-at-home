@@ -27,6 +27,7 @@ from athome.train.data import (
     render_tinker_sft,
     render_trl,
 )
+from athome.train.preflight import PreflightFailure, PreflightReport, preflight
 from athome.train.retrain import RetrainOutcome, retrain
 from athome.train.spec import (
     BASE_MODELS,
@@ -191,11 +192,12 @@ async def run(spec: TrainSpec, *, evaluation: BakeoffSpec) -> TrainResult:
         version, and whether that version was promoted.
 
     Raises:
-        NoBackendAvailable: No backend can train the spec's method.
+        PreflightFailure: A mandatory backend, dataset, cost, or evaluation probe fails.
     """
     from athome.progress import RunSink
 
     settings = load(TrainSettings)
+    await preflight(spec, evaluation=evaluation, settings=settings)
     backend = select(spec, settings)
     work_dir = new_work_dir(spec, settings)
     sink = RunSink.open(work_dir / JOURNAL_FILE)

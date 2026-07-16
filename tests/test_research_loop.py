@@ -17,6 +17,7 @@ from athome.research.contract import Memory, build_contract
 from athome.research.driver import StubDriver, StubProposal
 from athome.research.journal import Journal, JournalRow, Verdict
 from athome.research.loop import baseline_digest, experiment_lock, measure, run, run_metric
+from athome.research.preflight import PreflightFailure
 from athome.research.spec import (
     Budget,
     BudgetExhausted,
@@ -493,7 +494,7 @@ async def test_ig5_candidate_hooks_path_never_fires_under_commit_tree(tmp_path: 
 async def test_autoloader_addition_is_rejected_even_inside_a_mutable_dir(tmp_path: Path) -> None:
     # finding (a): a conftest.py runs at scoring time merely by existing, so it is rejected even
     # inside the mutable allowlist (pkg/**).
-    repo = toy_repo(tmp_path)
+    repo = special_repo(tmp_path, score_py=SCORE_PY, extra={"pkg/module.py": "VALUE = 1\n"})
     driver = StubDriver(iter([StubProposal({"train.py": "LOSS = 0.5\n", "pkg/conftest.py": "CFG = 1\n"})]))
 
     result = await run(
@@ -827,6 +828,8 @@ async def test_history_carries_prior_discard_reason_and_baseline(tmp_path: Path)
     assert len(driver.contracts) == 2
     unit0_history, unit1_history = driver.contracts
     assert "## History" in unit0_history and "unit 0" not in unit0_history  # no prior rows on the first unit
+    assert "baseline (untouched tree): 1.0" in unit0_history
+    assert "incumbent: 1.0" in unit0_history
     assert "baseline (untouched tree): 1.0" in unit1_history
     assert "[discard]" in unit1_history and "ImmutableViolation" in unit1_history
 
@@ -856,6 +859,42 @@ async def test_first_candidate_must_strictly_beat_the_frozen_baseline(tmp_path: 
     assert result.kept == 0 and result.best is None
 
 
+async def test_all_discard_resume_still_requires_beating_the_frozen_baseline(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path, initial_loss=0.5)
+    await run(
+        make_spec(budget=Budget(max_units=2)),
+        driver=StubDriver(iter([loss_proposal("0.50"), loss_proposal("undefined")])),
+        repo=repo,
+    )
+    driver = RecordingDriver(iter([loss_proposal("0.500")]))
+
+    result = await run(make_spec(budget=Budget(max_units=3)), driver=driver, repo=repo)
+
+    rows = journal_rows(repo)
+    assert [row.verdict for row in rows] == [Verdict.DISCARD, Verdict.CRASH, Verdict.DISCARD]
+    assert rows[-1].metric == 0.5
+    assert result.kept == 0 and result.best is None
+    assert len(driver.contracts) == 1
+    assert "baseline (untouched tree): 0.5" in driver.contracts[0]
+    assert "incumbent: 0.5" in driver.contracts[0]
+
+
+async def test_preflight_failure_aborts_before_the_driver_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = toy_repo(tmp_path)
+    driver = RecordingDriver(iter([loss_proposal(0.5)]))
+
+    async def fail_preflight(*args: object, **kwargs: object) -> object:
+        raise PreflightFailure("mandatory probe failed")
+
+    monkeypatch.setattr("athome.research.preflight.preflight", fail_preflight)
+
+    with pytest.raises(PreflightFailure, match="mandatory probe failed"):
+        await run(make_spec(budget=Budget(max_units=1)), driver=driver, repo=repo)
+
+    assert driver.contracts == []
+    assert journal_rows(repo) == []
+
+
 async def test_first_run_scores_and_persists_the_frozen_baseline(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path, initial_loss=1.0)
     spec = make_spec(budget=Budget(max_units=1))
@@ -873,15 +912,27 @@ async def test_first_run_scores_and_persists_the_frozen_baseline(tmp_path: Path)
 
 async def test_baseline_reused_when_commit_and_spec_digest_match(tmp_path: Path) -> None:
     # A persisted baseline whose commit and scorer digest match is reused verbatim, not re-scored:
-    # a 0.4 baseline makes a 0.5 candidate a DISCARD (against a fresh 1.0 re-score it would keep).
+    # on resume, a 0.4 baseline makes a 0.5 candidate a DISCARD (a fresh 1.0 score would keep).
     repo = toy_repo(tmp_path, initial_loss=1.0)
-    spec = make_spec(budget=Budget(max_units=1))
-    seed_baseline(repo, commit=git(repo, "rev-parse", "HEAD"), metric=0.4, digest=baseline_digest(spec))
+    spec = make_spec(budget=Budget(max_units=2))
+    head = git(repo, "rev-parse", "HEAD")
+    seed_baseline(repo, commit=head, metric=0.4, digest=baseline_digest(spec))
+    journal = Journal.open(repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.jsonl")
+    await journal.append(
+        JournalRow(
+            unit=0,
+            commit=head,
+            metric=0.75,
+            verdict=Verdict.DISCARD,
+            resources={"wall_s": 0.0, "usd": 0.0},
+            description="prior discard",
+        )
+    )
 
     result = await run(spec, driver=StubDriver(iter([loss_proposal(0.5)])), repo=repo)
 
-    (row,) = journal_rows(repo)
-    assert row.verdict is Verdict.DISCARD and result.kept == 0  # reused 0.4, not a fresh 1.0
+    rows = journal_rows(repo)
+    assert rows[-1].verdict is Verdict.DISCARD and result.kept == 0  # reused 0.4, not a fresh 1.0
 
 
 async def test_baseline_rescored_when_spec_digest_changes(tmp_path: Path) -> None:
