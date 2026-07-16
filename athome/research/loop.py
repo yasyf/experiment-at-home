@@ -31,7 +31,6 @@ from athome.research.failures import (
     InfraFailure,
     classify,
     infra_cost,
-    infra_events,
     infra_log,
     record_accounting_abort,
     record_infra_event,
@@ -137,14 +136,13 @@ async def run_metric(command: tuple[str, ...], workdir: Path, *, hard_kill_s: fl
     return None, b""
 
 
-
 def validate_driver_cost(unit: int, cost: object) -> float:
     match cost:
         case bool():
             pass
-        case int() | float() as value if isfinite(value) and value >= 0:
+        case int() | float() as value if finite_number(value) and value >= 0:
             return float(value)
-    raise AccountingIntegrityError(f"unit {unit}: driver returned invalid cost {cost!r}")
+    raise AccountingIntegrityError(f"unit {unit}: driver returned invalid cost of type {type(cost).__name__}")
 
 
 def finite_metric(text: str, key: str) -> float | None:
@@ -330,6 +328,7 @@ async def run_unit(
     contract: str,
     driver: Driver,
     events: Path,
+    abort: Path,
     deadline: float | None,
     spent: float,
 ) -> UnitOutcome | None:
@@ -348,7 +347,7 @@ async def run_unit(
             spent=spent,
         )
     except AccountingIntegrityError as exc:
-        await record_accounting_abort(events, unit=unit, reason=str(exc))
+        await record_accounting_abort(abort, events, unit=unit, reason=str(exc))
         raise
 
 
@@ -526,10 +525,11 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
     async with experiment_lock(Path(athome_dir) / f"{spec.name}.lock"):
         journal = Journal.open(Path(athome_dir) / f"{spec.name}.jsonl", mirror_cc_notes=mirror_cc_notes)
         events = Path(athome_dir) / f"{spec.name}.events.jsonl"
-        if any(event["kind"] == "accounting_abort" for event in infra_events(events)):
+        abort = Path(athome_dir) / f"{spec.name}.abort.json"
+        if abort.exists():
             raise AccountingIntegrityError(
-                f"unreconciled accounting_abort marker in {events}; check the provider ledger, reconcile the spend, "
-                "then remove the accounting_abort line(s)"
+                f"unreconciled accounting abort latch in {abort}; check the provider ledger, reconcile the spend, "
+                "then delete the latch file"
             )
         validate_journal(journal.rows())
         branch = f"{EXPERIMENT_BRANCH_PREFIX}/{spec.name}"
@@ -575,6 +575,7 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
                     contract=contract,
                     driver=driver,
                     events=events,
+                    abort=abort,
                     deadline=deadline,
                     spent=spent,
                 )

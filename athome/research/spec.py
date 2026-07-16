@@ -54,7 +54,17 @@ def unbounded_glob(pattern: str) -> bool:
 
 
 def finite_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(value)
+    match value:
+        case bool():
+            return False
+        case int() | float():
+            try:
+                coerced = float(value)
+            except OverflowError:
+                return False
+            return isfinite(coerced)
+        case _:
+            return False
 
 
 def positive_int(value: object) -> bool:

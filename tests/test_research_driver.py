@@ -112,6 +112,16 @@ FAKE_CLAUDE_PARTIAL_COST_THEN_HANGS = textwrap.dedent(
     """
 ).strip()
 
+FAKE_CLAUDE_INVALID_UTF8_THEN_HANGS = textwrap.dedent(
+    """
+    import json, sys, time
+    print(json.dumps({"type": "result", "total_cost_usd": 0.99}), flush=True)
+    sys.stdout.buffer.write(b"\\xff\\xfe")
+    sys.stdout.flush()
+    time.sleep(120)
+    """
+).strip()
+
 
 def git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()
@@ -141,11 +151,20 @@ def make_spec(*, budget: Budget, direction: str = "min") -> ExperimentSpec:
 
 
 def fake_claude(tmp_path: Path, body: str) -> tuple[str, ...]:
-    (script := tmp_path / "fake_claude.py").write_text(body + "\n")
-    return (sys.executable, str(script))
+    script = tmp_path / "fake-claude"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        'if sys.argv[1:] == ["--version"]:\n'
+        '    print("1.0.22 (Claude Code)")\n'
+        "    raise SystemExit\n"
+        f"{body}\n"
+    )
+    script.chmod(0o755)
+    return (str(script),)
 
 
-def versioned_fake_claude(tmp_path: Path, output: str) -> tuple[tuple[str, ...], Path]:
+def versioned_fake_claude(tmp_path: Path, output: str, *, status: int = 0) -> tuple[tuple[str, ...], Path]:
     marker = tmp_path / "proposal-spend"
     script = tmp_path / "fake-claude"
     script.write_text(
@@ -154,7 +173,7 @@ def versioned_fake_claude(tmp_path: Path, output: str) -> tuple[tuple[str, ...],
             import json, pathlib, sys
             if sys.argv[1:] == ["--version"]:
                 print({output!r})
-                raise SystemExit
+                raise SystemExit({status})
             pathlib.Path({str(marker)!r}).write_text("spent")
             pathlib.Path("train.py").write_text("LOSS = 0.2\\n")
             print(json.dumps({{"type": "result", "total_cost_usd": 0.15}}))
@@ -177,6 +196,28 @@ def journal_rows(repo: Path) -> list:
     return Journal.open(repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.jsonl").rows()
 
 
+def assert_accounting_abort_recorded(repo: Path) -> None:
+    athome = repo / ".git" / "athome"
+    latch = athome / f"{EXPERIMENT_NAME}.abort.json"
+    record = json.loads(latch.read_text())
+    assert set(record) == {"unit", "reason", "ts"}
+    assert record["unit"] == 0 and isinstance(record["reason"], str) and record["reason"]
+    assert list(athome.glob(f"{EXPERIMENT_NAME}.abort.json.tmp-*")) == []
+    events = athome / f"{EXPERIMENT_NAME}.events.jsonl"
+    assert [(event["kind"], "cost" in event) for event in infra_events(events)] == [("accounting_abort", False)]
+
+
+def make_run_log_unreadable(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = anyio.Path.read_text
+
+    async def read_text(path: anyio.Path, encoding: str | None = None, errors: str | None = None) -> str:
+        if str(path).endswith(".log"):
+            raise OSError("simulated unreadable detached log")
+        return await original(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(anyio.Path, "read_text", read_text)
+
+
 async def test_propose_edits_the_candidate_dir_and_reports_cost(tmp_path: Path) -> None:
     workdir = plain_checkout(toy_repo(tmp_path))
     driver = ClaudeCodeDriver(
@@ -193,7 +234,7 @@ async def test_propose_edits_the_candidate_dir_and_reports_cost(tmp_path: Path) 
     "output",
     [
         pytest.param("1.0.22 (Claude Code)", id="floor"),
-        pytest.param("claude version 2.4.1", id="above-prefixed"),
+        pytest.param("2.4.1 (Claude Code)", id="above"),
     ],
 )
 async def test_claude_preflight_accepts_supported_version_outputs(tmp_path: Path, output: str) -> None:
@@ -217,11 +258,50 @@ async def test_claude_preflight_rejects_outdated_cli_before_proposal_spend(tmp_p
     assert journal_rows(repo) == []
 
 
-async def test_claude_preflight_rejects_unparseable_version_output(tmp_path: Path) -> None:
-    command, marker = versioned_fake_claude(tmp_path, "Claude Code development build")
+@pytest.mark.parametrize(
+    "output",
+    [
+        pytest.param("Claude Code development build (Node v22.14.0)", id="node-version"),
+        pytest.param("garbage; runtime 3.13.5", id="garbage-runtime-version"),
+        pytest.param("1.0.22-beta.3 (Claude Code)", id="prerelease"),
+        pytest.param("1.0.22+build.7 (Claude Code)", id="build-suffix"),
+    ],
+)
+async def test_claude_preflight_rejects_non_claude_version_output(tmp_path: Path, output: str) -> None:
+    command, marker = versioned_fake_claude(tmp_path, output)
     driver = ClaudeCodeDriver(make_spec(budget=Budget(max_units=1)), command=command)
 
-    with pytest.raises(PreflightFailure, match="carried no semantic version"):
+    with pytest.raises(PreflightFailure):
+        await driver.preflight()
+
+    assert not marker.exists()
+
+
+async def test_claude_preflight_rejects_python_wrapper_command(tmp_path: Path) -> None:
+    driver = ClaudeCodeDriver(
+        make_spec(budget=Budget(max_units=1)),
+        command=(sys.executable, str(tmp_path / "nonexistent-wrapper.py")),
+    )
+
+    with pytest.raises(PreflightFailure):
+        await driver.preflight()
+
+
+async def test_claude_preflight_rejects_exec_failure(tmp_path: Path) -> None:
+    driver = ClaudeCodeDriver(
+        make_spec(budget=Budget(max_units=1)),
+        command=(str(tmp_path / "missing-claude"),),
+    )
+
+    with pytest.raises(PreflightFailure, match="could not run"):
+        await driver.preflight()
+
+
+async def test_claude_preflight_rejects_nonzero_exit(tmp_path: Path) -> None:
+    command, marker = versioned_fake_claude(tmp_path, "1.0.22 (Claude Code)", status=7)
+    driver = ClaudeCodeDriver(make_spec(budget=Budget(max_units=1)), command=command)
+
+    with pytest.raises(PreflightFailure, match="status 7"):
         await driver.preflight()
 
     assert not marker.exists()
@@ -386,10 +466,11 @@ async def test_captured_cost_uses_the_last_complete_json_object_not_a_regex(tmp_
         '{"total_cost_usd": -1.5}',
         '{"total_cost_usd": true}',
         '{"total_cost_usd": "0.5"}',
+        '{"total_cost_usd": ' + "9" * 1000 + "}",
         '{"type": "result"}',
         "no json envelope at all",
     ],
-    ids=["nan", "infinity", "negative", "bool", "string", "missing-key", "no-json"],
+    ids=["nan", "infinity", "negative", "bool", "string", "oversized-int", "missing-key", "no-json"],
 )
 async def test_captured_cost_rejects_an_invalid_or_missing_cost(tmp_path: Path, body: str) -> None:
     # BP2: a present-but-invalid or missing cost is a hard failure, never a silent 0.0.
@@ -446,6 +527,62 @@ async def test_killed_unit_spend_is_recovered_from_the_log(tmp_path: Path) -> No
     assert exc_info.value.cost == 0.99  # recovered from the log even though the agent was killed
 
 
+@pytest.mark.parametrize(
+    ("body", "read_fails"),
+    [
+        pytest.param(FAKE_CLAUDE_INVALID_UTF8_THEN_HANGS, False, id="invalid-utf8"),
+        pytest.param(FAKE_CLAUDE_COST_THEN_HANGS, True, id="read-oserror"),
+    ],
+)
+async def test_internal_timeout_recovery_read_failure_aborts_accounting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body: str,
+    read_fails: bool,
+) -> None:
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = toy_repo(repo_dir)
+    if read_fails:
+        make_run_log_unreadable(monkeypatch)
+    spec = make_spec(budget=Budget(max_units=1))
+    driver = ClaudeCodeDriver(spec, command=fake_claude(tmp_path, body), poll=0.02, timeout_s=0.2)
+
+    with anyio.fail_after(5.0):
+        with pytest.raises(AccountingIntegrityError):
+            await run(spec, driver=driver, repo=repo)
+
+    assert journal_rows(repo) == []
+    assert_accounting_abort_recorded(repo)
+
+
+@pytest.mark.parametrize(
+    ("body", "read_fails"),
+    [
+        pytest.param(FAKE_CLAUDE_INVALID_UTF8_THEN_HANGS, False, id="invalid-utf8"),
+        pytest.param(FAKE_CLAUDE_COST_THEN_HANGS, True, id="read-oserror"),
+    ],
+)
+async def test_wall_cancel_recovery_read_failure_aborts_accounting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body: str,
+    read_fails: bool,
+) -> None:
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = toy_repo(repo_dir)
+    if read_fails:
+        make_run_log_unreadable(monkeypatch)
+    spec = make_spec(budget=Budget(max_units=1, max_wall_s=0.2))
+    driver = ClaudeCodeDriver(spec, command=fake_claude(tmp_path, body), poll=30.0, timeout_s=10.0)
+
+    with anyio.fail_after(5.0):
+        with pytest.raises(AccountingIntegrityError):
+            await run(spec, driver=driver, repo=repo)
+
+    assert journal_rows(repo) == []
+    assert_accounting_abort_recorded(repo)
+
+
 async def test_wall_cancel_with_partial_cost_envelope_aborts_accounting(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path)
     spec = make_spec(budget=Budget(max_units=1, max_wall_s=1.0))
@@ -460,9 +597,8 @@ async def test_wall_cancel_with_partial_cost_envelope_aborts_accounting(tmp_path
         with pytest.raises(AccountingIntegrityError):
             await run(spec, driver=driver, repo=repo)
 
-    events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
     assert journal_rows(repo) == []
-    assert [(event["kind"], "cost" in event) for event in infra_events(events)] == [("accounting_abort", False)]
+    assert_accounting_abort_recorded(repo)
 
 
 async def test_wall_cancel_stop_failure_aborts_accounting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -494,13 +630,17 @@ async def test_wall_cancel_stop_failure_aborts_accounting(tmp_path: Path, monkey
         with pytest.raises(AccountingIntegrityError):
             await run(
                 spec,
-                driver=ClaudeCodeDriver(spec, command=(sys.executable,), poll=30.0, timeout_s=10.0),
+                driver=ClaudeCodeDriver(
+                    spec,
+                    command=fake_claude(tmp_path, FAKE_CLAUDE_HANGS),
+                    poll=30.0,
+                    timeout_s=10.0,
+                ),
                 repo=repo,
             )
 
-    events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
     assert journal_rows(repo) == []
-    assert [(event["kind"], "cost" in event) for event in infra_events(events)] == [("accounting_abort", False)]
+    assert_accounting_abort_recorded(repo)
 
 
 async def test_wall_cancel_during_pidfile_write_stops_retained_run_and_recovers_cost(
@@ -529,7 +669,12 @@ async def test_wall_cancel_during_pidfile_write_stops_retained_run_and_recovers_
     with anyio.fail_after(4.0):
         result = await run(
             spec,
-            driver=ClaudeCodeDriver(spec, command=(sys.executable,), poll=30.0, timeout_s=10.0),
+            driver=ClaudeCodeDriver(
+                spec,
+                command=fake_claude(tmp_path, FAKE_CLAUDE_HANGS),
+                poll=30.0,
+                timeout_s=10.0,
+            ),
             repo=repo,
         )
 

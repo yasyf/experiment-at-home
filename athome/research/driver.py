@@ -30,11 +30,11 @@ DEFAULT_CLAUDE_COMMAND = ("claude", "-p", "--output-format", "json", "--dangerou
 DEFAULT_PROPOSAL_TIMEOUT_S = 3600.0
 # total_cost became total_cost_usd in 1.0.22; older result envelopes cannot be accounted.
 CLAUDE_CLI_ENVELOPE_FLOOR = (1, 0, 22)
-CLAUDE_CLI_VERSION = re.compile(r"(?<!\d)(\d+)\.(\d+)\.(\d+)(?!\d)")
+CLAUDE_CLI_VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+) \(Claude Code\)\r?\n?")
 
 
 class CostError(AccountingIntegrityError):
-    """A run log carried no valid ``total_cost_usd`` envelope (missing, non-number, or out of range)."""
+    """A run log could not provide a valid ``total_cost_usd`` envelope."""
 
 
 class MetricShapeError(ResearchError):
@@ -133,8 +133,14 @@ def envelope_cost(text: str) -> float:
     match costs[-1]:
         case bool() | str() as value:
             raise CostError(f"total_cost_usd must be a real number, got {value!r}")
-        case int() | float() as value if isfinite(value) and value >= 0:
-            return float(value)
+        case int() | float() as value:
+            try:
+                cost = float(value)
+            except OverflowError as exc:
+                raise CostError("total_cost_usd must be finite and non-negative") from exc
+            if isfinite(cost) and cost >= 0:
+                return cost
+            raise CostError("total_cost_usd must be finite and non-negative")
         case value:
             raise CostError(f"total_cost_usd must be finite and non-negative, got {value!r}")
 
@@ -144,9 +150,9 @@ def claude_cli_version(output: bytes) -> tuple[int, ...]:
         text = output.decode()
     except UnicodeDecodeError as exc:
         raise PreflightFailure("claude --version output is not valid UTF-8") from exc
-    if match := CLAUDE_CLI_VERSION.search(text):
+    if match := CLAUDE_CLI_VERSION.fullmatch(text):
         return tuple(int(part) for part in match.groups())
-    raise PreflightFailure("claude --version output carried no semantic version")
+    raise PreflightFailure("claude --version output did not match '<version> (Claude Code)'")
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,4 +317,8 @@ class ClaudeCodeDriver:
         return envelope_cost(await anyio.Path(run.log_path).read_text())
 
     async def recovered_cost(self, run: DetachedRun) -> float:
-        return envelope_cost(await anyio.Path(run.log_path).read_text())
+        try:
+            text = await anyio.Path(run.log_path).read_text()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise CostError("could not read detached proposal log; billing state is unknown") from exc
+        return envelope_cost(text)

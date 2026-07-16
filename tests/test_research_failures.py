@@ -6,11 +6,13 @@ from typing import TYPE_CHECKING, Literal
 
 import pytest
 
+import athome.research.failures as failures
 from athome.research.driver import MetricShapeError
 from athome.research.failures import (
     AccountingIntegrityError,
     CandidateFault,
     InfraFailure,
+    accounting_aborts,
     classify,
     infra_cost,
     infra_events,
@@ -62,20 +64,45 @@ def test_infra_log_marker_scan(log: bytes, expected: bool) -> None:
 
 
 async def test_record_and_count_infra_events(tmp_path: Path) -> None:
+    latch = tmp_path / "toy.abort.json"
     events = tmp_path / "toy.events.jsonl"
     assert infra_retries(events) == 0 and infra_cost(events) == 0.0  # absent sidecar reads as zero
 
     await record_infra_event(events, unit=3, attempt=0, reason="OSError('reset')", cost=0.6, kind="retry")
     await record_infra_event(events, unit=3, attempt=1, reason="OSError('reset')", cost=0.0, kind="retry")
-    await record_accounting_abort(events, unit=4, reason="unknown spend")
+    await record_accounting_abort(latch, events, unit=4, reason="unknown spend")
 
     assert infra_retries(events) == 2
     assert infra_cost(events) == pytest.approx(0.6)
+    assert accounting_aborts(events) == 1
+    latch_payload = json.loads(latch.read_text())
+    assert set(latch_payload) == {"unit", "reason", "ts"}
+    assert latch_payload["unit"] == 4
+    assert latch_payload["reason"] == "unknown spend"
+    assert isinstance(latch_payload["ts"], float) and latch_payload["ts"] > 0
     records = [json.loads(line) for line in events.read_text().splitlines()]
     assert [record.get("attempt") for record in records] == [0, 1, None]
     assert [record["kind"] for record in records] == ["retry", "retry", "accounting_abort"]
     assert all(record["unit"] == 3 and record["reason"] == "OSError('reset')" for record in records[:2])
     assert records[2] == {"unit": 4, "reason": "unknown spend", "kind": "accounting_abort"}
+
+
+async def test_accounting_abort_writes_latch_before_breadcrumb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    latch = tmp_path / "toy.abort.json"
+    events = tmp_path / "toy.events.jsonl"
+    observed: list[tuple[Path, dict[str, object], object]] = []
+
+    def observe_append(path: Path, event: dict[str, object], *, kind: object) -> None:
+        payload = json.loads(latch.read_text())
+        assert payload["unit"] == 7
+        assert payload["reason"] == "unrecoverable spend"
+        observed.append((path, event, kind))
+
+    monkeypatch.setattr(failures, "append_event", observe_append)
+
+    await record_accounting_abort(latch, events, unit=7, reason="unrecoverable spend")
+
+    assert observed == [(events, {"unit": 7, "reason": "unrecoverable spend"}, "accounting_abort")]
 
 
 async def test_torn_sidecar_line_never_loses_a_later_record(tmp_path: Path) -> None:

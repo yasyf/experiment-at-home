@@ -31,6 +31,7 @@ from athome.research.loop import (
     run_metric,
     run_unit,
     stage_candidate,
+    validate_driver_cost,
 )
 from athome.research.preflight import PreflightFailure
 from athome.research.spec import (
@@ -821,6 +822,13 @@ async def test_driver_cost_is_validated_before_journaling(tmp_path: Path, cost: 
     assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
 
 
+def test_driver_cost_validation_is_total_over_numeric_input() -> None:
+    with pytest.raises(AccountingIntegrityError):
+        validate_driver_cost(0, 10**1000)
+
+    assert validate_driver_cost(0, 0.25) == 0.25
+
+
 async def test_invalid_driver_cost_aborts_before_an_infra_retry_sidecar(tmp_path: Path) -> None:
     failed = tmp_path / "failed"
     score_py = textwrap.dedent(f"""
@@ -864,24 +872,28 @@ async def test_invalid_recovered_cost_aborts_before_wall_cancel_sidecar(tmp_path
 
     assert journal_rows(repo) == []
     assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
+    latch = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
+    assert json.loads(latch.read_text())["unit"] == 0
+    assert not list(latch.parent.glob(f"{latch.name}.tmp-*"))
 
 
-async def test_accounting_abort_marker_blocks_resume_until_removed(tmp_path: Path) -> None:
+@pytest.mark.parametrize("sidecar", [None, b'{"unit":', b"not-json\n"])
+async def test_accounting_abort_latch_blocks_resume_without_valid_sidecar(
+    tmp_path: Path, sidecar: bytes | None
+) -> None:
     repo = toy_repo(tmp_path)
     (athome := repo / ".git" / "athome").mkdir(parents=True, exist_ok=True)
+    latch = athome / f"{EXPERIMENT_NAME}.abort.json"
+    latch.write_text(json.dumps({"unit": 0, "reason": "unknown spend", "ts": 1.0}))
     events = athome / f"{EXPERIMENT_NAME}.events.jsonl"
-    events.write_text(json.dumps({"unit": 0, "reason": "unknown spend", "kind": "accounting_abort"}) + "\n")
+    if sidecar is not None:
+        events.write_bytes(sidecar)
     driver = RecordingDriver(iter([loss_proposal(0.5)]))
 
-    with pytest.raises(AccountingIntegrityError, match="provider ledger.*remove the accounting_abort line") as exc_info:
+    with pytest.raises(AccountingIntegrityError, match="provider ledger.*delete the latch file") as exc_info:
         await run(make_spec(budget=Budget(max_units=1)), driver=driver, repo=repo)
-    assert str(events) in str(exc_info.value)
+    assert str(latch) in str(exc_info.value)
     assert driver.contracts == []
-
-    events.write_text("")
-    result = await run(make_spec(budget=Budget(max_units=1)), driver=driver, repo=repo)
-
-    assert result.kept == 1
 
 
 async def test_accounting_abort_restart_preserves_prior_sidecar_spend(tmp_path: Path) -> None:
@@ -911,16 +923,16 @@ async def test_accounting_abort_restart_preserves_prior_sidecar_spend(tmp_path: 
         ("wall_cancel", 0.4),
         ("accounting_abort", None),
     ]
+    latch = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
+    assert json.loads(latch.read_text())["unit"] == 0
 
     resume_driver = CostDriver(iter([loss_proposal(0.4)]), cost=0.4)
-    with pytest.raises(AccountingIntegrityError, match="provider ledger.*remove the accounting_abort line"):
-        await run(make_spec(budget=budget), driver=resume_driver, repo=repo)
+    for _ in range(2):
+        with pytest.raises(AccountingIntegrityError, match="provider ledger.*delete the latch file"):
+            await run(make_spec(budget=budget), driver=resume_driver, repo=repo)
 
     assert journal_rows(repo) == []
-    events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
-    events.write_text(
-        "".join(f"{json.dumps(event)}\n" for event in infra_events(repo) if event["kind"] != "accounting_abort")
-    )
+    latch.unlink()
 
     with pytest.raises(BudgetExhausted, match=r"spend \$0\.8000 crossed max_usd \$0\.7000 at unit 0"):
         await run(make_spec(budget=budget), driver=resume_driver, repo=repo)
@@ -928,7 +940,10 @@ async def test_accounting_abort_restart_preserves_prior_sidecar_spend(tmp_path: 
     (row,) = journal_rows(repo)
     assert row.unit == 0
     assert row.resources["usd"] == pytest.approx(0.4)
-    assert [(event["kind"], event["cost"]) for event in infra_events(repo)] == [("wall_cancel", 0.4)]
+    assert [(event["kind"], event.get("cost")) for event in infra_events(repo)] == [
+        ("wall_cancel", 0.4),
+        ("accounting_abort", None),
+    ]
 
 
 async def test_poisoned_sidecar_cost_does_not_disable_max_usd(tmp_path: Path) -> None:
@@ -1012,7 +1027,9 @@ def poison_journal(repo: Path, *, metric: object, usd: object) -> None:
     [
         pytest.param(math.nan, 0.0, id="nan-metric"),
         pytest.param(math.inf, 0.0, id="inf-metric"),
+        pytest.param(10**1000, 0.0, id="overflow-metric"),
         pytest.param(0.5, math.nan, id="nan-usd"),
+        pytest.param(0.5, 10**1000, id="overflow-usd"),
         pytest.param(0.5, -5.0, id="negative-usd"),
         pytest.param(0.5, "abc", id="non-number-usd"),
     ],
@@ -1423,9 +1440,13 @@ async def test_wall_cancel_during_billed_claude_proposal_recovers_cost_for_resum
     (repo_dir := tmp_path / "repo").mkdir()
     repo = toy_repo(repo_dir)
     marker = tmp_path / "claude-exited"
-    (fake_claude := tmp_path / "fake_claude.py").write_text(
+    (fake_claude := tmp_path / "fake-claude").write_text(
         textwrap.dedent(f"""
-            import json, pathlib, time
+            #!{sys.executable}
+            import json, pathlib, sys, time
+            if sys.argv[1:] == ["--version"]:
+                print("1.0.22 (Claude Code)")
+                raise SystemExit
             pathlib.Path("train.py").write_text("LOSS = 0.5\\n")
             print(json.dumps({{"type": "result", "total_cost_usd": 0.6}}), flush=True)
             time.sleep(0.25)
@@ -1433,6 +1454,7 @@ async def test_wall_cancel_during_billed_claude_proposal_recovers_cost_for_resum
         """).strip()
         + "\n"
     )
+    fake_claude.chmod(0o755)
     spec = make_spec(budget=Budget(max_units=1, max_wall_s=1.0))
 
     with anyio.fail_after(4.0):
@@ -1440,7 +1462,7 @@ async def test_wall_cancel_during_billed_claude_proposal_recovers_cost_for_resum
             spec,
             driver=ClaudeCodeDriver(
                 spec,
-                command=(sys.executable, str(fake_claude)),
+                command=(str(fake_claude),),
                 poll=30.0,
                 timeout_s=10.0,
             ),
@@ -1497,6 +1519,7 @@ async def test_all_infra_reproposals_cross_max_usd_mid_retry(tmp_path: Path, mon
             incumbent_metric=1.0,
             contract="contract",
             driver=HostileDriver(paid_edit, cost=0.4),
+            abort=events.with_name(f"{EXPERIMENT_NAME}.abort.json"),
             events=events,
             deadline=None,
             spent=0.0,

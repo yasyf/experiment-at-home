@@ -28,18 +28,21 @@ spend, and the run aborts. It can never manufacture a journaled row — no forge
 discard, or contract-memory feedback — so the worst it achieves is burning its own unit's
 budget before the run aborts. Worthless.
 
-Before an accounting-integrity abort escapes a unit, the harness best-effort appends an
-``accounting_abort`` breadcrumb with its unit and reason but no cost. A later run refuses
-to start while that marker remains: check the provider ledger, reconcile the spend, then
-remove the ``accounting_abort`` line. If the marker write fails I/O, billing evidence
-cannot be parsed, or the detached process cannot be stopped, the run still aborts loudly;
-check and reconcile the ledger before resuming.
+Before an accounting-integrity abort escapes a unit, the harness atomically writes a
+per-run ``<name>.abort.json`` latch with its unit, reason, and timestamp, then best-effort
+appends an ``accounting_abort`` sidecar breadcrumb for M3 reporting. A later run refuses
+to start while the latch remains: check the provider ledger, reconcile the spend, then
+delete the latch file. The sidecar is reporting evidence, not the restart authority. If
+the latch write itself fails I/O, the doubly-degraded F3 residue still aborts loudly, as
+do unreadable billing evidence or a detached process that cannot be stopped; check and
+reconcile the ledger before resuming.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import time
 from math import isfinite
 from subprocess import CalledProcessError
 from typing import TYPE_CHECKING, Literal
@@ -47,6 +50,7 @@ from typing import TYPE_CHECKING, Literal
 import anyio
 from loguru import logger
 
+from athome.cache import atomic_write_text
 from athome.research.errors import AccountingIntegrityError, ResearchError
 
 if TYPE_CHECKING:
@@ -121,12 +125,19 @@ async def record_infra_event(
     append_event(path, {"unit": unit, "attempt": attempt, "reason": reason, "cost": cost}, kind=kind)
 
 
-async def record_accounting_abort(path: Path, *, unit: int, reason: str) -> None:
+async def record_accounting_abort(latch: Path, events: Path, *, unit: int, reason: str) -> None:
     with anyio.CancelScope(shield=True):
         try:
-            append_event(path, {"unit": unit, "reason": reason}, kind="accounting_abort")
+            await atomic_write_text(
+                anyio.Path(latch),
+                json.dumps({"unit": unit, "reason": reason, "ts": time.time()}),
+            )
         except OSError:
-            logger.exception("could not write accounting-abort breadcrumb to {}", path)
+            logger.exception("could not write accounting-abort latch to {}", latch)
+        try:
+            append_event(events, {"unit": unit, "reason": reason}, kind="accounting_abort")
+        except OSError:
+            logger.exception("could not write accounting-abort breadcrumb to {}", events)
 
 
 def append_event(path: Path, event: dict[str, object], *, kind: SidecarKind) -> None:
