@@ -60,7 +60,15 @@ async def read_reported_metric(spec: ExperimentSpec, workdir: Path) -> float | N
     metric_file = anyio.Path(workdir) / spec.metric_file
     if not await metric_file.exists():
         return None
-    return reported_metric(json.loads(await metric_file.read_text()), spec.metric_key)
+    try:
+        text = await metric_file.read_text()
+    except UnicodeDecodeError as exc:
+        raise MetricShapeError(f"reported metric file for {spec.metric_key!r} has invalid encoding") from exc
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise MetricShapeError(f"reported metric file for {spec.metric_key!r} is not valid JSON") from exc
+    return reported_metric(payload, spec.metric_key)
 
 
 def reported_metric(payload: object, key: str) -> float:
@@ -69,10 +77,21 @@ def reported_metric(payload: object, key: str) -> float:
     match payload[key]:
         case bool() as value:
             raise MetricShapeError(f"reported {key!r} must be a real number, not {type(value).__name__}")
-        case int() | float() as value if isfinite(value):
-            return float(value)
+        case int() | float() as value:
+            return coerce_finite(value, key)
         case value:
             raise MetricShapeError(f"reported {key!r} must be a finite real number, not {type(value).__name__}")
+
+
+def coerce_finite(value: int | float, key: str) -> float:
+    reason = f"reported {key!r} must be a finite real number, not {type(value).__name__}"
+    try:
+        coerced = float(value)
+    except OverflowError as exc:
+        raise MetricShapeError(reason) from exc
+    if isfinite(coerced):
+        return coerced
+    raise MetricShapeError(reason)
 
 
 def describe_change(label: str, spec: ExperimentSpec, changes: Sequence[TreeChange], reported: float | None) -> str:

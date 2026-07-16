@@ -15,6 +15,8 @@ RECENT_UNITS = 10
 
 HISTORY_LINE_MAX = 240
 NEWLINE_PLACEHOLDER = "⏎"
+LINE_BREAKS = "\r\n\u2028\u2029"
+NEUTRALIZE_CATEGORIES = frozenset({"Cc", "Cf"})
 
 BUDGET_LOW_WARNING = (
     "## Budget is nearly exhausted\n"
@@ -31,11 +33,16 @@ def show_metric(value: float | None) -> str:
     return "unscored" if value is None else str(value)
 
 
+def sanitize_char(ch: str) -> str:
+    if ch in LINE_BREAKS:
+        return NEWLINE_PLACEHOLDER
+    if unicodedata.category(ch) in NEUTRALIZE_CATEGORIES:
+        return " "
+    return "'" if ch == "`" else ch
+
+
 def sanitize_history(text: str) -> str:
-    clean = "".join(
-        NEWLINE_PLACEHOLDER if ch in "\r\n" else " " if unicodedata.category(ch) == "Cc" else "'" if ch == "`" else ch
-        for ch in text
-    )
+    clean = "".join(sanitize_char(ch) for ch in text)
     return clean if len(clean) <= HISTORY_LINE_MAX else f"{clean[: HISTORY_LINE_MAX - 1]}…"
 
 
