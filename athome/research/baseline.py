@@ -60,18 +60,16 @@ class BaselineStore:
 
     async def put(self, key: Comparability, arm: str, metric: float) -> None:
         """Stores ``metric`` once, rejecting changes to an existing baseline."""
-        existing = await self.get(key, arm)
-        if existing is not None:
-            if existing != metric:
-                raise BaselineConflict(
-                    f"baseline for config {key.config_hash!r}, dataset {key.dataset_digest!r}, "
-                    f"and arm {arm!r} is frozen at {existing}, not {metric}"
-                )
-            return
         await self.store.execute(
-            "INSERT INTO baselines(config_hash, dataset_digest, arm, metric) VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO baselines(config_hash, dataset_digest, arm, metric) VALUES (?, ?, ?, ?)",
             (key.config_hash, key.dataset_digest, arm, metric),
         )
+        existing = await self.get(key, arm)
+        if existing != metric:
+            raise BaselineConflict(
+                f"baseline for config {key.config_hash!r}, dataset {key.dataset_digest!r}, "
+                f"and arm {arm!r} is frozen at {existing}, not {metric}"
+            )
 
 
 def uplift(

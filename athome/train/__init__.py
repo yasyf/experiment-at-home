@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from athome.bakeoff import BakeoffSpec, Leaderboard
+    from athome.research.spec import Comparability
 
 METRIC_FILE = ".athome-metric.json"
 METRIC_KEY = "metric"
@@ -79,6 +80,23 @@ JOURNAL_FILE = "progress.jsonl"
 TRAINED_ARM = "trained"
 EVAL_RECIPE = "rapid-mlx"
 RUN_ID_CHARS = 8
+
+
+def _comparability(evaluation: BakeoffSpec) -> Comparability:
+    from athome.research.common import Hasher, dataset_digest
+    from athome.research.spec import Comparability
+
+    return Comparability(
+        config_hash=Hasher.digest(
+            {
+                "task": f"{evaluation.task.__module__}.{evaluation.task.__qualname__}",
+                "arms": [{"name": arm.name, "base_url": arm.base_url, "model": arm.model} for arm in evaluation.arms],
+                "primary_metric": evaluation.primary_metric,
+                "tiebreak": evaluation.tiebreak,
+            }
+        ),
+        dataset_digest=str(dataset_digest(evaluation.corpus)),
+    )
 
 
 def free_port() -> int:
@@ -196,8 +214,6 @@ async def run(spec: TrainSpec, *, evaluation: BakeoffSpec) -> TrainResult:
     """
     from athome.progress import RunSink
     from athome.research.baseline import BaselineStore, uplift
-    from athome.research.common import Hasher, dataset_digest
-    from athome.research.spec import Comparability
 
     settings = load(TrainSettings)
     await preflight(spec, evaluation=evaluation, settings=settings)
@@ -213,10 +229,7 @@ async def run(spec: TrainSpec, *, evaluation: BakeoffSpec) -> TrainResult:
     metric = next(result for result in leaderboard.results if result.arm == TRAINED_ARM).metrics[
         evaluation.primary_metric
     ]
-    comparability = Comparability(
-        config_hash=Hasher.digest({"primary_metric": evaluation.primary_metric, "tiebreak": evaluation.tiebreak}),
-        dataset_digest=str(dataset_digest(evaluation.corpus)),
-    )
+    comparability = _comparability(evaluation)
     async with BaselineStore.open(settings.baseline_root) as baselines:
         baseline = await baselines.get(comparability, spec.name)
     promoted = leaderboard.winner == TRAINED_ARM and leaderboard.passed_gate

@@ -6,6 +6,8 @@ from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING
 
 from athome.errors import AthomeError
+from athome.research.baseline import BaselineStore
+from athome.research.spec import Comparability
 from athome.train.backend import NoBackendAvailable, TrainBackend, select
 from athome.train.data import (
     DpoExample,
@@ -108,7 +110,8 @@ async def preflight(spec: TrainSpec, *, evaluation: BakeoffSpec, settings: Train
 
     Raises:
         PreflightFailure: A backend cannot run the method, a sampled row cannot render,
-            a Modal projection crosses its cap, or the evaluation is incomplete.
+            a Modal projection crosses its cap, the evaluation is incomplete, or the baseline
+            store cannot be opened and read.
     """
     checks: list[str] = []
     try:
@@ -135,4 +138,11 @@ async def preflight(spec: TrainSpec, *, evaluation: BakeoffSpec, settings: Train
     if not evaluation.primary_metric:
         raise PreflightFailure("evaluation requires a primary metric")
     checks.append(f"evaluation sanity: {len(evaluation.arms)} arms, primary metric {evaluation.primary_metric!r}")
+
+    try:
+        async with BaselineStore.open(settings.baseline_root) as baselines:
+            await baselines.get(Comparability(config_hash="preflight", dataset_digest="preflight"), "preflight")
+    except Exception as error:
+        raise PreflightFailure(f"baseline store inaccessible at {settings.baseline_root}: {error}") from error
+    checks.append(f"baseline store accessible: {settings.baseline_root}")
     return PreflightReport(checks=tuple(checks))

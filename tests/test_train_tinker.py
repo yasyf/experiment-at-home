@@ -302,6 +302,8 @@ def test_cost_prices_each_base_model_off_its_own_sheet() -> None:
 
     assert backend.cost(model=TinkerModelId("Qwen/Qwen3.5-4B"), prefill=1_000_000) == pytest.approx(0.22)
     assert backend.cost(model=TinkerModelId("Qwen/Qwen3.5-4B"), train=1_000_000) == pytest.approx(0.67)
+    assert backend.cost(model=TinkerModelId("Qwen/Qwen3.5-9B"), prefill=1_000_000) == pytest.approx(0.44)
+    assert backend.cost(model=TinkerModelId("Qwen/Qwen3.5-9B"), train=1_000_000) == pytest.approx(1.33)
 
 
 async def test_sft_runs_cross_entropy_and_one_optim_step_per_step(

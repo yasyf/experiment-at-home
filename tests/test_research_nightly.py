@@ -164,6 +164,28 @@ async def test_install_honors_a_custom_calendar(monkeypatch: pytest.MonkeyPatch,
     assert captured["agent"].schedule == launchd.Calendar(hour=5, minute=30)
 
 
+async def test_install_mirrors_cc_notes_when_requested(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    spec_path = write_spec(repo)
+    captured: dict[str, launchd.AgentSpec] = {}
+
+    async def fake_install(agent: launchd.AgentSpec) -> Path:
+        captured["agent"] = agent
+        return tmp_path / "written.plist"
+
+    monkeypatch.setattr(launchd, "install", fake_install)
+
+    await nightly.install(spec_path, mirror_cc_notes=True)
+
+    assert captured["agent"].command == (
+        "athome",
+        "research",
+        "run",
+        str(spec_path.resolve()),
+        "--mirror-cc-notes",
+    )
+
+
 def test_cli_init_scaffolds_a_loadable_spec(tmp_path: Path) -> None:
     result = CliRunner().invoke(research_cli, ["init", str(dest := tmp_path / "exp.toml"), "--name", "myexp"])
 
@@ -176,18 +198,32 @@ def test_cli_init_scaffolds_a_loadable_spec(tmp_path: Path) -> None:
 
 def test_cli_nightly_install_is_wired(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     spec_path = write_spec(toy_repo(tmp_path))
+    captured: list[launchd.AgentSpec] = []
 
     async def fake_install(agent: launchd.AgentSpec) -> Path:
+        captured.append(agent)
         return tmp_path / f"{agent.label}.plist"
 
     monkeypatch.setattr(launchd, "install", fake_install)
 
     result = CliRunner().invoke(
-        research_cli, ["nightly", "install", str(spec_path), "--hour", "3", "--minute", "15", "--json"]
+        research_cli,
+        [
+            "nightly",
+            "install",
+            str(spec_path),
+            "--hour",
+            "3",
+            "--minute",
+            "15",
+            "--mirror-cc-notes",
+            "--json",
+        ],
     )
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["installed"].endswith("com.athome.research.toy.plist")
+    assert captured[0].command[-1] == "--mirror-cc-notes"
 
 
 def test_cli_status_and_report_read_the_journal(tmp_path: Path) -> None:

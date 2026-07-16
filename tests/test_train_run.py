@@ -12,7 +12,6 @@ from athome.bakeoff import Arm, ArmResult, BakeoffSpec, Leaderboard
 from athome.config import load
 from athome.progress import load_journal
 from athome.research.baseline import BaselineStore
-from athome.research.common import Hasher, dataset_digest
 from athome.research.spec import Comparability
 from athome.train.spec import BASE_MODELS, Checkpoint, Hyperparams, LocalJsonlRef, TrainSettings, TrainSpec
 
@@ -34,15 +33,50 @@ async def task(client: AsyncOpenAI, item: object) -> dict[str, object]:
     raise AssertionError("the stubbed bake-off never runs the task")
 
 
+async def other_task(client: AsyncOpenAI, item: object) -> dict[str, object]:
+    raise AssertionError("the stubbed bake-off never runs the task")
+
+
 def evaluation() -> BakeoffSpec:
     return BakeoffSpec(task=task, corpus=("a", "b"), arms=(BASELINE,), primary_metric="exact")
 
 
 def comparability(evaluation: BakeoffSpec) -> Comparability:
-    return Comparability(
-        config_hash=Hasher.digest({"primary_metric": evaluation.primary_metric, "tiebreak": evaluation.tiebreak}),
-        dataset_digest=str(dataset_digest(evaluation.corpus)),
-    )
+    return train._comparability(evaluation)
+
+
+def test_comparability_hash_is_stable_for_equivalent_evaluations() -> None:
+    assert comparability(evaluation()).config_hash == comparability(evaluation()).config_hash
+
+
+@pytest.mark.parametrize(
+    "changed",
+    (
+        pytest.param(
+            BakeoffSpec(task=other_task, corpus=("a", "b"), arms=(BASELINE,), primary_metric="exact"),
+            id="task",
+        ),
+        pytest.param(
+            BakeoffSpec(
+                task=task,
+                corpus=("a", "b"),
+                arms=(Arm(name="other", base_url="http://localhost/v1", model="other"),),
+                primary_metric="exact",
+            ),
+            id="arms",
+        ),
+        pytest.param(
+            BakeoffSpec(task=task, corpus=("a", "b"), arms=(BASELINE,), primary_metric="accuracy"),
+            id="primary-metric",
+        ),
+        pytest.param(
+            BakeoffSpec(task=task, corpus=("a", "b"), arms=(BASELINE,), primary_metric="exact", tiebreak="latency"),
+            id="tiebreak",
+        ),
+    ),
+)
+def test_comparability_hash_changes_with_the_evaluation_configuration(changed: BakeoffSpec) -> None:
+    assert comparability(changed).config_hash != comparability(evaluation()).config_hash
 
 
 def spec(**overrides: object) -> TrainSpec:

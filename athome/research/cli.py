@@ -34,6 +34,12 @@ repo_option = click.option(
     default=None,
     help="The git repository to run against (default: the spec's repository).",
 )
+mirror_cc_notes_option = click.option(
+    "--mirror-cc-notes",
+    is_flag=True,
+    default=False,
+    help="Mirror journal rows to the installed cc-notes service.",
+)
 
 
 async def resolve_repo(spec_path: Path, repo: Path | None) -> Path:
@@ -70,12 +76,18 @@ async def init_command(path: Path, name: str, *, as_json: bool) -> None:
 @cli.command("run")
 @spec_argument
 @repo_option
+@mirror_cc_notes_option
 @json_option
 @coro
-async def run_command(spec_path: Path, repo: Path | None, *, as_json: bool) -> None:
+async def run_command(spec_path: Path, repo: Path | None, *, mirror_cc_notes: bool, as_json: bool) -> None:
     """Drive the greedy keep/discard loop for SPEC_PATH with the Claude Code driver."""
     spec = ExperimentSpec.load(spec_path)
-    result = await loop.run(spec, driver=ClaudeCodeDriver(spec), repo=await resolve_repo(spec_path, repo))
+    result = await loop.run(
+        spec,
+        driver=ClaudeCodeDriver(spec),
+        repo=await resolve_repo(spec_path, repo),
+        mirror_cc_notes=mirror_cc_notes,
+    )
     emit({"kept": result.kept, "best": asdict(result.best) if result.best is not None else None}, as_json=as_json)
 
 
@@ -111,9 +123,16 @@ def nightly_group() -> None:
 @spec_argument
 @click.option("--hour", type=int, default=2, show_default=True, help="Local hour the agent fires.")
 @click.option("--minute", type=int, default=0, show_default=True, help="Minute the agent fires.")
+@mirror_cc_notes_option
 @json_option
 @coro
-async def nightly_install_command(spec_path: Path, hour: int, minute: int, *, as_json: bool) -> None:
+async def nightly_install_command(
+    spec_path: Path, hour: int, minute: int, *, mirror_cc_notes: bool, as_json: bool
+) -> None:
     """Install a launchd agent running SPEC_PATH's loop overnight."""
-    path = await nightly.install(spec_path, calendar=launchd.Calendar(hour=hour, minute=minute))
+    path = await nightly.install(
+        spec_path,
+        calendar=launchd.Calendar(hour=hour, minute=minute),
+        mirror_cc_notes=mirror_cc_notes,
+    )
     emit({"installed": str(path)}, as_json=as_json)

@@ -505,6 +505,7 @@ class TinkerSettings(SectionSettings):
         default_factory=lambda: {
             TinkerModelId("Qwen/Qwen3-8B"): TinkerPrice(prefill=0.13, sample=0.40, train=0.40),
             TinkerModelId("Qwen/Qwen3.5-4B"): TinkerPrice(prefill=0.22, sample=0.67, train=0.67),
+            TinkerModelId("Qwen/Qwen3.5-9B"): TinkerPrice(prefill=0.44, sample=1.33, train=1.33),
         }
     )
 

@@ -189,6 +189,7 @@ def test_tinker_settings_source_the_secret_from_the_canonical_env_var() -> None:
     assert "sk-tinker-test" not in repr(settings)
     assert settings.spend_cap_usd == 60.0
     assert settings.price_per_mtok["Qwen/Qwen3-8B"] == TinkerPrice(prefill=0.13, sample=0.40, train=0.40)
+    assert settings.price_per_mtok["Qwen/Qwen3.5-9B"] == TinkerPrice(prefill=0.44, sample=1.33, train=1.33)
 
 
 def test_tinker_settings_require_the_key(monkeypatch: pytest.MonkeyPatch) -> None:

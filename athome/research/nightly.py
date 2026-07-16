@@ -49,7 +49,12 @@ async def journal_path(repo: Path, name: str) -> Path:
     return (common if common.is_absolute() else repo / common) / "athome" / f"{name}.jsonl"
 
 
-async def install(spec_path: Path, *, calendar: launchd.Calendar = NIGHTLY_CALENDAR) -> Path:
+async def install(
+    spec_path: Path,
+    *,
+    calendar: launchd.Calendar = NIGHTLY_CALENDAR,
+    mirror_cc_notes: bool = False,
+) -> Path:
     """Installs a launchd Calendar agent that runs the experiment's loop overnight.
 
     The agent runs ``athome research run <spec>`` at ``calendar`` in the experiment's
@@ -58,6 +63,7 @@ async def install(spec_path: Path, *, calendar: launchd.Calendar = NIGHTLY_CALEN
     Args:
         spec_path: The experiment TOML the nightly agent runs.
         calendar: When to fire; defaults to 02:00 nightly.
+        mirror_cc_notes: Whether to mirror journal rows to the installed ``cc-notes`` service.
 
     Returns:
         The path of the written launchd plist.
@@ -65,7 +71,13 @@ async def install(spec_path: Path, *, calendar: launchd.Calendar = NIGHTLY_CALEN
     spec = ExperimentSpec.load(spec_path)
     agent = launchd.AgentSpec(
         label=f"{RESEARCH_LABEL_PREFIX}{spec.name}",
-        command=("athome", "research", "run", str(spec_path.resolve())),
+        command=(
+            "athome",
+            "research",
+            "run",
+            str(spec_path.resolve()),
+            *(("--mirror-cc-notes",) if mirror_cc_notes else ()),
+        ),
         schedule=calendar,
         working_dir=await repo_root(spec_path),
     )

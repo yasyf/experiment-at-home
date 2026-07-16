@@ -239,3 +239,13 @@ async def test_evaluation_sanity_is_mandatory(
 
     with pytest.raises(PreflightFailure, match=message):
         await preflight(spec(), evaluation=bakeoff, settings=TrainSettings())
+
+
+async def test_inaccessible_baseline_store_is_a_preflight_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    choose(monkeypatch, local())
+    normalized(monkeypatch, SFT)
+
+    with pytest.raises(PreflightFailure, match=f"baseline store inaccessible at {tmp_path}"):
+        await preflight(spec(), evaluation=evaluation(), settings=TrainSettings(baseline_root=tmp_path))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
+import anyio
 import pytest
 
 from athome.research.baseline import BaselineConflict, BaselineStore, uplift
@@ -38,6 +39,55 @@ async def test_put_rejects_a_different_metric_for_existing_key(tmp_path: Path) -
         await baselines.put(key, "candidate", 0.75)
         with pytest.raises(BaselineConflict):
             await baselines.put(key, "candidate", 0.8)
+
+
+async def test_concurrent_put_same_metric_is_idempotent(tmp_path: Path) -> None:
+    key = Comparability(config_hash="config", dataset_digest="dataset")
+    path = tmp_path / "baselines.db"
+    async with BaselineStore.open(path) as first, BaselineStore.open(path) as second:
+        start = anyio.Event()
+
+        async def put(baselines: BaselineStore) -> None:
+            await start.wait()
+            await baselines.put(key, "candidate", 0.75)
+
+        async with anyio.create_task_group() as group:
+            group.start_soon(put, first)
+            group.start_soon(put, second)
+            await anyio.sleep(0)
+            start.set()
+
+        assert await first.get(key, "candidate") == 0.75
+        assert await second.get(key, "candidate") == 0.75
+
+
+async def test_concurrent_put_different_metrics_raises_one_conflict(tmp_path: Path) -> None:
+    key = Comparability(config_hash="config", dataset_digest="dataset")
+    path = tmp_path / "baselines.db"
+    conflicts: list[BaselineConflict] = []
+    successes: list[float] = []
+    async with BaselineStore.open(path) as first, BaselineStore.open(path) as second:
+        start = anyio.Event()
+
+        async def put(baselines: BaselineStore, metric: float) -> None:
+            await start.wait()
+            try:
+                await baselines.put(key, "candidate", metric)
+            except BaselineConflict as error:
+                conflicts.append(error)
+            else:
+                successes.append(metric)
+
+        async with anyio.create_task_group() as group:
+            group.start_soon(put, first, 0.75)
+            group.start_soon(put, second, 0.8)
+            await anyio.sleep(0)
+            start.set()
+
+        assert len(conflicts) == 1
+        assert len(successes) == 1
+        assert await first.get(key, "candidate") == successes[0]
+        assert await second.get(key, "candidate") == successes[0]
 
 
 @pytest.mark.parametrize(
