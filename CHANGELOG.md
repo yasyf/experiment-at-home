@@ -11,9 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `athome.registry.components` / `rollback` / `prune` — generic registry verbs. `components` lists the artifact families under a root; `rollback` repoints `current` to the version registered before the current promotion (raising when none exists); `prune` deletes all but the newest `keep` versions while always retaining the one `current` points to. `rollback` and `prune` serialise under the family lock, and `prune` unfreezes each version directory before removing it.
 - `athome.llm.pricing` prices `Qwen/Qwen3-8B` at $0.13 in / $0.40 out per Mtok, so a lane pointed at the Qwen base costs out instead of raising `UnpricedModel`.
 - `athome.train.spec.TinkerPrice` — one Tinker base model's price split into the three token classes Tinker actually meters: `prefill`, `sample`, `train`.
+- `AgentSpec.log_dir` — a per-agent log directory, so a consumer keeps its agents' logs beside its own state instead of in the shared `[athome].logs_root`. It overrides the directory only: the filename stays `{log_name or label}.log`, and the default `None` still writes to `logs_root`, so an existing spec renders the same plist it always did.
 
 ### Changed
 - **`TinkerSettings.price_per_mtok` is now a per-class price, not a flat rate.** It binds `dict[TinkerModelId, TinkerPrice]` rather than `dict[str, float]`, and `TinkerBackend.cost` takes a token count per class — `cost(model=…, prefill=…, sample=…, train=…)` — instead of one undifferentiated `tokens`. Tinker bills a forward-only pass, a sampled token, and a training token at three different rates, so the old flat rate charged DPO's frozen reference pass at the training rate: that pass now bills at prefill ($0.13 vs $0.40 per Mtok on Qwen3-8B). Training rates are unchanged ($0.40 Qwen3-8B, $0.67 Qwen3.5-4B), so an SFT run costs exactly what it did. A `[train.tinker.price_per_mtok]` TOML override written against the old flat shape no longer validates.
+
+### Known limitations
+- **The `embed-voyage` extra does not install on free-threaded 3.14t**, the same as `train`. `voyageai` pulls `langchain-*` → `langsmith` → `orjson`, and `orjson` publishes no `cp314t` wheel, so the resolve fails outright rather than degrading. The extra installs normally on GIL 3.13 and 3.14. `athome` core stays 3.14t-clean either way: `VoyageEmbedBackend` imports `voyageai` lazily, so nothing in the core import graph reaches it.
 
 ## [0.4.0] - 2026-07-14
 

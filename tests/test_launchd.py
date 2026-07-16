@@ -98,6 +98,27 @@ def test_plist_dict_log_name_override(logs_root: Path) -> None:
     assert plist_dict(spec)["StandardErrorPath"] == str(logs_root / "collector.log")
 
 
+def test_plist_dict_log_dir_override(tmp_path: Path) -> None:
+    spec = AgentSpec(label="com.athome.demo", command=("athome",), schedule=KeepAlive(), log_dir=tmp_path / "logs")
+    assert plist_dict(spec)["StandardOutPath"] == str(tmp_path / "logs" / "com.athome.demo.log")
+    assert plist_dict(spec)["StandardErrorPath"] == str(tmp_path / "logs" / "com.athome.demo.log")
+
+
+def test_plist_dict_log_dir_overrides_only_the_directory(tmp_path: Path) -> None:
+    spec = AgentSpec(
+        label="com.athome.demo",
+        command=("athome",),
+        schedule=KeepAlive(),
+        log_name="collector",
+        log_dir=tmp_path / "logs",
+    )
+    assert plist_dict(spec)["StandardOutPath"] == str(tmp_path / "logs" / "collector.log")
+
+
+def test_plist_dict_without_log_dir_falls_back_to_logs_root(logs_root: Path) -> None:
+    assert plist_dict(base_spec(KeepAlive()))["StandardOutPath"] == str(logs_root / "com.athome.demo.log")
+
+
 def test_plist_dict_working_dir_and_env(tmp_path: Path) -> None:
     spec = AgentSpec(
         label="com.athome.demo",
@@ -126,6 +147,17 @@ async def test_install_writes_plist_and_bootstraps(monkeypatch: pytest.MonkeyPat
         ["launchctl", "bootout", domain, str(path)],
         ["launchctl", "bootstrap", domain, str(path)],
     ]
+
+
+async def test_install_creates_the_specs_own_log_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(launchd, "LAUNCH_AGENTS", tmp_path / "LaunchAgents")
+    monkeypatch.setattr("anyio.run_process", FakeLaunchctl())
+    logs = tmp_path / "consumer-logs"
+    spec = AgentSpec(label="com.athome.demo", command=("athome",), schedule=KeepAlive(), log_dir=logs)
+
+    await launchd.install(spec)
+
+    assert logs.is_dir()
 
 
 async def test_install_raises_on_bootstrap_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

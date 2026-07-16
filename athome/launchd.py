@@ -70,6 +70,7 @@ class AgentSpec:
     command: tuple[str, ...]
     schedule: Schedule
     log_name: str | None = None
+    log_dir: Path | None = None
     working_dir: Path | None = None
     env: tuple[tuple[str, str], ...] = ()
 
@@ -117,7 +118,7 @@ def schedule_keys(schedule: Schedule) -> dict[str, object]:
 
 def plist_dict(spec: AgentSpec) -> dict[str, object]:
     """Render ``spec`` to the launchd plist dictionary launchctl loads."""
-    log = load(AthomeSettings).logs_root / f"{spec.log_name or spec.label}.log"
+    log = (spec.log_dir or load(AthomeSettings).logs_root) / f"{spec.log_name or spec.label}.log"
     return (
         {
             "Label": spec.label,
@@ -142,7 +143,7 @@ async def install(spec: AgentSpec) -> Path:
         LaunchdError: ``launchctl bootstrap`` exited non-zero (stderr attached).
     """
     path = agent_path(spec.label)
-    await anyio.Path(load(AthomeSettings).logs_root).mkdir(parents=True, exist_ok=True)
+    await anyio.Path(spec.log_dir or load(AthomeSettings).logs_root).mkdir(parents=True, exist_ok=True)
     await anyio.Path(path.parent).mkdir(parents=True, exist_ok=True)
     await anyio.Path(path).write_bytes(plistlib.dumps(plist_dict(spec)))
     domain = f"gui/{os.getuid()}"
