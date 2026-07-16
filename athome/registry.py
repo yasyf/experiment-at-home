@@ -156,7 +156,13 @@ async def components(root: Path) -> tuple[str, ...]:
     if not await base.is_dir():
         return ()
     return tuple(
-        sorted([child.name async for child in base.iterdir() if await child.is_dir() and await versions(child.name, root=root)])
+        sorted(
+            [
+                child.name
+                async for child in base.iterdir()
+                if await child.is_dir() and await versions(child.name, root=root)
+            ]
+        )
     )
 
 

@@ -82,7 +82,9 @@ async def ensure_write_auth() -> None:
     """
     from huggingface_hub import whoami
 
-    auth = (await to_thread.run_sync(functools.partial(whoami, token=load(HfSettings).token.get_secret_value())))["auth"]
+    auth = (await to_thread.run_sync(functools.partial(whoami, token=load(HfSettings).token.get_secret_value())))[
+        "auth"
+    ]
     match auth:
         case {"type": "oauth"} | {"type": "access_token", "accessToken": {"role": "write"}}:
             return
