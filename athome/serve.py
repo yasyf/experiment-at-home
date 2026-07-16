@@ -41,7 +41,24 @@ class HealthTimeout(ServeError):
 
 
 class RapidMlxSettings(SectionSettings):
-    """The ``[serve.rapid-mlx]`` section: the daily-pinned rapid-mlx version, model, and port."""
+    """The ``[serve.rapid-mlx]`` section: the daily-pinned rapid-mlx version, model, and port.
+
+    The default text lane. On ordinary tool calling it and :class:`LlamaServerSettings` are
+    equivalent: serving the same Qwen3.6-35B-A3B to both, 42 calls each, every call
+    dispatched and every argument came back valid and schema-conformant — flat, enum,
+    nested, arrays of objects, multi-tool selection, and numeric-verbatim alike. Pick
+    between them on the two edges below, not on general quality.
+
+    rapid-mlx serves MLX-native weights only, and honors ``tool_choice="required"``.
+
+    Warning:
+        rapid-mlx extracts tool calls with a delimiter-based parser (it advertises
+        ``qwen3_coder_xml``), and a string argument containing that delimiter is truncated
+        at it: send ``</function>`` inside a payload and the argument arrives silently
+        short, as well-formed JSON no downstream check can catch. Serve
+        :class:`LlamaServerSettings` when arguments can carry tool-call syntax — quoted
+        model output, agent transcripts, scraped markup.
+    """
 
     section: ClassVar[tuple[str, ...]] = ("serve", "rapid-mlx")
     version: str
@@ -59,7 +76,22 @@ class MlxVlmSettings(SectionSettings):
 
 
 class LlamaServerSettings(SectionSettings):
-    """The ``[serve.llama-server]`` section: a full llama-server command string and its port."""
+    """The ``[serve.llama-server]`` section: a full llama-server command string and its port.
+
+    The opt-in GGUF lane, equivalent to the default :class:`RapidMlxSettings` on ordinary
+    tool calling. Its one advantage is string fidelity: it returns arguments containing
+    tool-call delimiter syntax verbatim, where rapid-mlx's parser truncates them. That is
+    the reason to select it.
+
+    Takes a full command string rather than a model and port, because a llama-server
+    invocation carries flags no recipe can generalize.
+
+    Warning:
+        llama-server ignores ``tool_choice="required"`` — it applies no grammar constraint,
+        so instead of forcing a call it can answer in prose and run to ``max_tokens``,
+        returning no tool call at all. Code that depends on being handed one must stay on
+        rapid-mlx or treat a missing call as a real outcome.
+    """
 
     section: ClassVar[tuple[str, ...]] = ("serve", "llama-server")
     command: str

@@ -140,6 +140,21 @@ reference:
     desc: The shared aiosqlite scaffold.
     contents:
       - store.Store
+  - title: Serve
+    desc: Recipe-driven local model servers. RapidMlxSettings and LlamaServerSettings carry the engine-selection guidance.
+    contents:
+      - serve.RapidMlxSettings
+      - serve.MlxVlmSettings
+      - serve.LlamaServerSettings
+      - serve.ManagedServer
+      - serve.ServerHandle
+      - serve.up
+      - serve.down
+      - serve.settings_for
+      - serve.command_for
+      - serve.probe_all
+      - serve.ServeError
+      - serve.HealthTimeout
   - title: Embed
     desc: Batch text-embedding backends and a digest-keyed incremental index with MMR rerank.
     contents:
