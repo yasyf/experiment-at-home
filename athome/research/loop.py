@@ -26,6 +26,7 @@ from athome.research.driver import describe_change, read_reported_metric
 from athome.research.errors import ResearchError
 from athome.research.failures import (
     MAX_INFRA_RETRIES,
+    AccountingIntegrityError,
     CandidateFault,
     InfraFailure,
     classify,
@@ -373,6 +374,8 @@ async def run_unit(
                 return UnitOutcome(Verdict.CRASH, None, incumbent, f"proposal timeout: {exc}", exc.cost)
             except Exception as exc:
                 match classify(exc):
+                    case "accounting":
+                        raise
                     case "candidate":
                         # Candidate crash: journaled with its proposal cost; the loop continues.
                         logger.warning("unit {} crashed: {!r}", unit, exc)
@@ -459,6 +462,7 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
 
     Raises:
         BudgetExhausted: Cumulative spend crossed ``spec.budget.max_usd``.
+        AccountingIntegrityError: Proposal spend could not be recovered or trusted.
         ConcurrentRun: Another live run holds the per-experiment lock.
         PoisonedJournal: The resumed journal carried a non-finite metric or bad spend.
         InfraFailure: A unit hit machine trouble that outlasted ``MAX_INFRA_RETRIES`` retries;
@@ -520,6 +524,8 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
                 )
                 if outcome is None:
                     break  # the unit blew past the remaining wall budget and was cancelled
+                if not (finite_number(outcome.cost) and outcome.cost >= 0):
+                    raise AccountingIntegrityError(f"unit {unit}: driver returned invalid cost {outcome.cost!r}")
                 await journal.append(
                     JournalRow(
                         unit=unit,

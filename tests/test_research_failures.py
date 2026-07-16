@@ -8,6 +8,7 @@ import pytest
 
 from athome.research.driver import MetricShapeError
 from athome.research.failures import (
+    AccountingIntegrityError,
     CandidateFault,
     InfraFailure,
     classify,
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
 @pytest.mark.parametrize(
     "exc, expected",
     [
+        pytest.param(AccountingIntegrityError("unknown spend"), "accounting", id="accounting-integrity"),
         pytest.param(InfraFailure("machine trouble"), "infra", id="infra-failure"),
         pytest.param(OSError("disk gone"), "infra", id="oserror"),
         pytest.param(ConnectionResetError("peer reset"), "infra", id="connection-reset-subclass"),
@@ -37,7 +39,7 @@ if TYPE_CHECKING:
         pytest.param(RuntimeError("harness bug"), "candidate", id="unknown-defaults-to-candidate"),
     ],
 )
-def test_classify_taxonomy(exc: BaseException, expected: Literal["infra", "candidate"]) -> None:
+def test_classify_taxonomy(exc: BaseException, expected: Literal["accounting", "infra", "candidate"]) -> None:
     assert classify(exc) == expected
 
 
@@ -92,15 +94,32 @@ async def test_torn_sidecar_line_never_loses_a_later_record(tmp_path: Path) -> N
 def test_corrupt_sidecar_lines_are_skipped_independently(tmp_path: Path) -> None:
     events = tmp_path / "toy.events.jsonl"
     events.write_bytes(
-        b'{"unit":0,"attempt":0,"reason":"ok","cost":0.2}\n'
+        b'{"unit":0,"attempt":0,"reason":"ok","cost":0.2,"kind":"retry"}\n'
         b'{"unit":1,"reason":"torn \xe2\x82\n'
         b"[]\n"
-        b'{"unit":2,"attempt":0,"reason":"missing"}\n'
-        b'{"unit":3,"attempt":0,"reason":"bad","cost":"nope"}\n'
-        b'{"unit":4,"attempt":0,"reason":"ok","cost":0.4}\n'
+        b'{"unit":2,"attempt":0,"reason":"missing","kind":"retry"}\n'
+        b'{"unit":3,"attempt":0,"reason":"bad","cost":"nope","kind":"retry"}\n'
+        b'{"unit":4,"attempt":0,"reason":"ok","cost":0.4,"kind":"retry"}\n'
     )
 
     assert [event["unit"] for event in infra_events(events)] == [0, 2, 3, 4]
+    assert infra_cost(events) == pytest.approx(0.6)
+
+
+def test_missing_and_unknown_sidecar_kinds_are_skipped(tmp_path: Path) -> None:
+    events = tmp_path / "toy.events.jsonl"
+    events.write_bytes(
+        b'{"unit":0,"attempt":0,"reason":"missing","cost":0.6}\n'
+        b'{"unit":1,"attempt":0,"reason":"unknown","cost":0.7,"kind":"legacy"}\n'
+        b'{"unit":2,"attempt":0,"reason":"retry","cost":0.4,"kind":"retry"}\n'
+        b'{"unit":3,"attempt":0,"reason":"cancel","cost":0.2,"kind":"wall_cancel"}\n'
+    )
+
+    assert [(event["unit"], event["kind"]) for event in infra_events(events)] == [
+        (2, "retry"),
+        (3, "wall_cancel"),
+    ]
+    assert infra_retries(events) == 1
     assert infra_cost(events) == pytest.approx(0.6)
 
 
@@ -109,15 +128,19 @@ def test_corrupt_sidecar_lines_are_skipped_independently(tmp_path: Path) -> None
     [
         pytest.param(b"NaN", id="nan"),
         pytest.param(b"Infinity", id="infinity"),
+        pytest.param(b"-Infinity", id="negative-infinity"),
         pytest.param(b"-0.1", id="negative"),
+        pytest.param(b"true", id="true"),
+        pytest.param(b"false", id="false"),
+        pytest.param(b'"nope"', id="string"),
     ],
 )
 def test_invalid_sidecar_costs_are_skipped(tmp_path: Path, cost: bytes) -> None:
     events = tmp_path / "toy.events.jsonl"
     events.write_bytes(
-        b'{"unit":0,"attempt":0,"reason":"invalid","cost":'
+        b'{"unit":0,"attempt":0,"reason":"invalid","kind":"retry","cost":'
         + cost
-        + b'}\n{"unit":1,"attempt":0,"reason":"valid","cost":0.4}\n'
+        + b'}\n{"unit":1,"attempt":0,"reason":"valid","kind":"retry","cost":0.4}\n'
     )
 
     assert infra_cost(events) == pytest.approx(0.4)

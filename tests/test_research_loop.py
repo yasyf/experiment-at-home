@@ -15,7 +15,12 @@ import pytest
 
 from athome.research.contract import Memory, build_contract
 from athome.research.driver import ClaudeCodeDriver, StubDriver, StubProposal
-from athome.research.failures import MAX_INFRA_RETRIES, InfraFailure, infra_cost
+from athome.research.failures import (
+    MAX_INFRA_RETRIES,
+    AccountingIntegrityError,
+    InfraFailure,
+    infra_cost,
+)
 from athome.research.journal import Journal, JournalRow, Verdict
 from athome.research.loop import (
     baseline_digest,
@@ -765,10 +770,27 @@ async def test_bp2_cumulative_spend_over_max_usd_aborts_loudly(tmp_path: Path) -
     assert sum(row.resources["usd"] for row in rows) == pytest.approx(0.8)  # both units' spend recorded
 
 
+@pytest.mark.parametrize(
+    "cost",
+    [
+        pytest.param(math.nan, id="nan"),
+        pytest.param(-0.1, id="negative"),
+    ],
+)
+async def test_driver_cost_is_validated_before_journaling(tmp_path: Path, cost: float) -> None:
+    repo = toy_repo(tmp_path)
+    driver = CostDriver(iter([loss_proposal(0.5), loss_proposal(0.4)]), cost=cost)
+
+    with pytest.raises(AccountingIntegrityError):
+        await run(make_spec(budget=Budget(max_units=2, max_usd=0.1)), driver=driver, repo=repo)
+
+    assert journal_rows(repo) == []
+
+
 async def test_poisoned_sidecar_cost_does_not_disable_max_usd(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path)
     (athome := repo / ".git" / "athome").mkdir(parents=True, exist_ok=True)
-    (athome / f"{EXPERIMENT_NAME}.events.jsonl").write_text('{"cost":NaN}\n')
+    (athome / f"{EXPERIMENT_NAME}.events.jsonl").write_text('{"cost":NaN,"kind":"retry"}\n')
 
     with pytest.raises(BudgetExhausted, match=r"spend \$0\.6000 crossed max_usd \$0\.5000"):
         await run(

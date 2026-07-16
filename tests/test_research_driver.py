@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import anyio
 import pytest
 
+import athome.research.driver as driver_module
 from athome.detach import DetachedRun
 from athome.research.driver import (
     ClaudeCodeDriver,
@@ -18,12 +19,14 @@ from athome.research.driver import (
     describe_change,
     read_reported_metric,
 )
+from athome.research.failures import AccountingIntegrityError, infra_events
 from athome.research.gate import TreeChange
 from athome.research.journal import Journal, Verdict
 from athome.research.loop import run
 from athome.research.spec import Budget, ExperimentSpec, ProposalTimeout
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 EXPERIMENT_NAME = "toy"
@@ -94,6 +97,15 @@ FAKE_CLAUDE_COST_THEN_HANGS = textwrap.dedent(
     import json, pathlib, sys, time
     pathlib.Path("train.py").write_text("LOSS = 0.2\\n")
     print(json.dumps({"type": "result", "total_cost_usd": 0.99}))
+    sys.stdout.flush()
+    time.sleep(120)
+    """
+).strip()
+
+FAKE_CLAUDE_PARTIAL_COST_THEN_HANGS = textwrap.dedent(
+    """
+    import sys, time
+    sys.stdout.write('{"type": "result", "total_cost_usd":')
     sys.stdout.flush()
     time.sleep(120)
     """
@@ -344,6 +356,92 @@ async def test_killed_unit_spend_is_recovered_from_the_log(tmp_path: Path) -> No
             await driver.propose("contract", workdir)
 
     assert exc_info.value.cost == 0.99  # recovered from the log even though the agent was killed
+
+
+async def test_wall_cancel_with_partial_cost_envelope_aborts_accounting(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    spec = make_spec(budget=Budget(max_units=1, max_wall_s=1.0))
+    driver = ClaudeCodeDriver(
+        spec,
+        command=fake_claude(tmp_path, FAKE_CLAUDE_PARTIAL_COST_THEN_HANGS),
+        poll=30.0,
+        timeout_s=10.0,
+    )
+
+    with anyio.fail_after(4.0):
+        with pytest.raises(AccountingIntegrityError):
+            await run(spec, driver=driver, repo=repo)
+
+    events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
+    assert journal_rows(repo) == []
+    assert not events.exists()
+
+
+async def test_wall_cancel_stop_failure_aborts_accounting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = toy_repo(tmp_path)
+    spec = make_spec(budget=Budget(max_units=1, max_wall_s=1.0))
+    log = tmp_path / "fake-run.log"
+    log.write_text("")
+
+    async def fake_launch(
+        command: object,
+        *,
+        name: str,
+        on_spawn: Callable[[DetachedRun], None] | None = None,
+    ) -> DetachedRun:
+        run = DetachedRun(name=name, pid=1234, log_path=log)
+        if on_spawn is not None:
+            on_spawn(run)
+        return run
+
+    def fail_killpg(pgid: int, sig: int) -> None:
+        raise PermissionError("cannot stop billing process")
+
+    monkeypatch.setattr(driver_module, "launch", fake_launch)
+    monkeypatch.setattr(driver_module, "running", lambda name: 1234)
+    monkeypatch.setattr(driver_module.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(driver_module.os, "killpg", fail_killpg)
+
+    with anyio.fail_after(4.0):
+        with pytest.raises(AccountingIntegrityError):
+            await run(spec, driver=ClaudeCodeDriver(spec, poll=30.0, timeout_s=10.0), repo=repo)
+
+    events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
+    assert journal_rows(repo) == []
+    assert not events.exists()
+
+
+async def test_wall_cancel_during_pidfile_write_stops_retained_run_and_recovers_cost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = toy_repo(tmp_path)
+    spec = make_spec(budget=Budget(max_units=1, max_wall_s=1.0))
+    (log := tmp_path / "fake-run.log").write_text('{"type": "result", "total_cost_usd": 0.6}\n')
+    detached = DetachedRun(name="spawned", pid=1234, log_path=log)
+    stopped: list[DetachedRun] = []
+
+    async def fake_launch(
+        command: object,
+        *,
+        name: str,
+        on_spawn: Callable[[DetachedRun], None] | None = None,
+    ) -> DetachedRun:
+        if on_spawn is not None:
+            on_spawn(detached)
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(driver_module, "launch", fake_launch)
+    monkeypatch.setattr(driver_module, "stop", stopped.append)
+
+    with anyio.fail_after(4.0):
+        result = await run(spec, driver=ClaudeCodeDriver(spec, poll=30.0, timeout_s=10.0), repo=repo)
+
+    events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
+    assert result.kept == 0
+    assert stopped == [detached]
+    assert journal_rows(repo) == []
+    assert [(event["kind"], event["cost"]) for event in infra_events(events)] == [("wall_cancel", 0.6)]
 
 
 @pytest.mark.live

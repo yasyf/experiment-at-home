@@ -135,7 +135,7 @@ async def test_report_counts_infra_retries_from_the_sidecar(tmp_path: Path) -> N
     events.write_text(
         json.dumps({"unit": 1, "attempt": 0, "reason": "OSError('reset')", "kind": "retry"})
         + "\n"
-        + json.dumps({"unit": 1, "attempt": 1, "reason": "OSError('reset')"})
+        + json.dumps({"unit": 1, "attempt": 1, "reason": "OSError('reset')", "kind": "retry"})
         + "\n"
     )
 

@@ -12,7 +12,7 @@ from uuid import uuid4
 import anyio
 
 from athome.detach import launch, running
-from athome.research.errors import ResearchError
+from athome.research.errors import AccountingIntegrityError, ResearchError
 from athome.research.spec import ProposalTimeout
 
 if TYPE_CHECKING:
@@ -28,7 +28,7 @@ DEFAULT_CLAUDE_COMMAND = ("claude", "-p", "--output-format", "json", "--dangerou
 DEFAULT_PROPOSAL_TIMEOUT_S = 3600.0
 
 
-class CostError(ResearchError):
+class CostError(AccountingIntegrityError):
     """A run log carried no valid ``total_cost_usd`` envelope (missing, non-number, or out of range)."""
 
 
@@ -173,11 +173,23 @@ def stop(run: DetachedRun) -> None:
         os.killpg(os.getpgid(run.pid), signal.SIGKILL)
     except ProcessLookupError:
         pass
+    except OSError as exc:
+        raise AccountingIntegrityError("could not stop detached proposal; billing state is unknown") from exc
 
 
 @dataclass(slots=True)
 class ProposalRecovery:
     run: DetachedRun | None = None
+
+    def retain(self, run: DetachedRun) -> None:
+        self.run = run
+
+    def stop(self) -> None:
+        match self.run:
+            case None:
+                return
+            case run:
+                stop(run)
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,8 +229,15 @@ class ClaudeCodeDriver:
         budget = () if self.spec.budget.max_usd is None else ("--max-budget-usd", str(self.spec.budget.max_usd))
         inner = f"cd {shlex.quote(str(workdir))} && exec {shlex.join([*self.command, *budget, contract])}"
         self._recovery.run = None
-        run = await launch(["/bin/sh", "-c", inner], name=f"{RUN_PREFIX}-{self.spec.name}-{uuid4().hex[:12]}")
-        self._recovery.run = run
+        try:
+            run = await launch(
+                ["/bin/sh", "-c", inner],
+                name=f"{RUN_PREFIX}-{self.spec.name}-{uuid4().hex[:12]}",
+                on_spawn=self._recovery.retain,
+            )
+        except BaseException:
+            self._recovery.stop()
+            raise
         try:
             await self.await_exit(run)
         except TimeoutError as exc:
@@ -251,7 +270,7 @@ class ClaudeCodeDriver:
         return envelope_cost(await anyio.Path(run.log_path).read_text())
 
     async def recovered_cost(self, run: DetachedRun) -> float:
-        try:
-            return envelope_cost(await anyio.Path(run.log_path).read_text())
-        except CostError:
+        text = await anyio.Path(run.log_path).read_text()
+        if "total_cost_usd" not in text:
             return 0.0
+        return envelope_cost(text)

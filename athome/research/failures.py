@@ -28,8 +28,9 @@ spend, and the run aborts. It can never manufacture a journaled row — no forge
 discard, or contract-memory feedback — so the worst it achieves is burning its own unit's
 budget before the run aborts. Worthless.
 
-If a wall-cancel cost flush fails I/O, the run aborts loudly without recording that
-cost; check the ledger before resuming.
+If a wall-cancel cost flush fails I/O, billing evidence cannot be parsed, or the
+detached process cannot be stopped, the run aborts loudly without recording that cost;
+check and reconcile the ledger before resuming.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ from typing import TYPE_CHECKING, Literal
 
 from loguru import logger
 
-from athome.research.errors import ResearchError
+from athome.research.errors import AccountingIntegrityError, ResearchError
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -90,8 +91,10 @@ def infra_log(log: bytes) -> bool:
     return any(marker in text for marker in INFRA_MARKERS)
 
 
-def classify(exc: BaseException) -> Literal["infra", "candidate"]:
+def classify(exc: BaseException) -> Literal["accounting", "infra", "candidate"]:
     match exc:
+        case AccountingIntegrityError():
+            return "accounting"
         case CandidateFault():
             return "candidate"
         case InfraFailure() | OSError() | CalledProcessError():
@@ -136,7 +139,7 @@ def parse_event(line: bytes, path: Path) -> dict[str, object] | None:
         logger.warning("skipping malformed infra sidecar line in {}", path)
         return None
     match record:
-        case dict():
+        case {"kind": "retry" | "wall_cancel"}:
             return record
         case _:
             logger.warning("skipping malformed infra sidecar line in {}", path)
@@ -144,7 +147,7 @@ def parse_event(line: bytes, path: Path) -> dict[str, object] | None:
 
 
 def infra_retries(path: Path) -> int:
-    return sum(event.get("kind", "retry") == "retry" for event in infra_events(path))
+    return sum(event["kind"] == "retry" for event in infra_events(path))
 
 
 def infra_cost(path: Path) -> float:

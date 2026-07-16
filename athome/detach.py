@@ -15,7 +15,7 @@ from athome.config import AthomeSettings, load
 from athome.errors import AthomeError
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
     from pathlib import Path
 
 NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
@@ -65,7 +65,9 @@ def running(name: str) -> int | None:
     return pid
 
 
-async def launch(command: Sequence[str], *, name: str) -> DetachedRun:
+async def launch(
+    command: Sequence[str], *, name: str, on_spawn: Callable[[DetachedRun], None] | None = None
+) -> DetachedRun:
     """Launch ``command`` as a detached, session-leader subprocess that outlives the caller.
 
     The command runs under ``/bin/sh -c`` with stdout and stderr appended to
@@ -77,6 +79,7 @@ async def launch(command: Sequence[str], *, name: str) -> DetachedRun:
     Args:
         command: The argv of the program to run.
         name: A unique name for the run; also names its log, pid, and exit files.
+        on_spawn: Synchronous callback invoked with the run before post-spawn I/O.
 
     Returns:
         The launched run's name, pid, and log path.
@@ -94,15 +97,22 @@ async def launch(command: Sequence[str], *, name: str) -> DetachedRun:
     prefix = f"{env}; " if (env := load(AthomeSettings).env_prefix_cmd) else ""
     inner = f"{prefix}{shlex.join(command)}; rc=$?; echo $rc > {shlex.quote(str(exit_path))}"
     with log_path.open("ab") as log_file:
-        process = await anyio.open_process(
-            ["/bin/sh", "-c", inner],
-            stdin=subprocess.DEVNULL,
-            stdout=log_file.fileno(),
-            stderr=log_file.fileno(),
-            start_new_session=True,
-        )
+        with anyio.CancelScope(shield=True):
+            process = await anyio.open_process(
+                ["/bin/sh", "-c", inner],
+                stdin=subprocess.DEVNULL,
+                stdout=log_file.fileno(),
+                stderr=log_file.fileno(),
+                start_new_session=True,
+            )
+            run = DetachedRun(name=name, pid=process.pid, log_path=log_path)
+            match on_spawn:
+                case None:
+                    pass
+                case retain:
+                    retain(run)
     await anyio.Path(pid_path).write_text(str(process.pid))
-    return DetachedRun(name=name, pid=process.pid, log_path=log_path)
+    return run
 
 
 async def wait(name: str, *, poll: float = 5.0, timeout: float | None = None) -> int:
