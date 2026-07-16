@@ -199,11 +199,14 @@ ever comes from the JSON file the metric_command writes.
 
 - `StubDriver` — a deterministic test driver: applies a scripted edit + writes a
   metric file, so the loop is testable end-to-end without an LLM.
-- `contract.py` — `build_contract(spec, *, budget_low: bool) -> str`: generates the
-  agent instruction spec (the `program.md` role) from the ExperimentSpec —
+- `contract.py` — `build_contract(spec, *, budget_low: bool, memory: Memory) -> str`:
+  generates the agent instruction spec (the `program.md` role) from the ExperimentSpec —
   mutable/immutable manifest, the metric command + file, the keep/discard rule, the
-  simplicity criterion, "return the metric in the JSON file", and (when budget_low)
-  the budget-low warning.
+  simplicity criterion, "return the metric in the JSON file", a harness-authored
+  `## History` (frozen baseline, current incumbent, best-so-far, and the most recent
+  units with their verdicts and discard reasons — never the withheld run log), and
+  (when budget_low) the budget-low warning. `Memory.from_journal(journal, *, baseline,
+  incumbent, direction)` builds that history view.
 
 ---
 

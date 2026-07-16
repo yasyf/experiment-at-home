@@ -20,7 +20,8 @@ import anyio
 from loguru import logger
 
 from athome.config import base_environ
-from athome.research.contract import build_contract
+from athome.research.common import Hasher
+from athome.research.contract import Memory, build_contract
 from athome.research.driver import describe_change, read_reported_metric
 from athome.research.gate import immutable_violations, monotone_gate, parse_diff_tree
 from athome.research.journal import Journal, JournalRow, Verdict
@@ -57,6 +58,13 @@ class UnitOutcome:
     commit: str
     description: str
     cost: float
+
+
+@dataclass(frozen=True, slots=True)
+class Baseline:
+    commit: str
+    metric: float | None
+    spec_digest: str
 
 
 def hermetic_env() -> dict[str, str]:
@@ -137,6 +145,28 @@ def decide(metric: float | None, incumbent: float | None, *, direction: Literal[
 async def score_commit(spec: ExperimentSpec, *, repo: Path, score_dir: Path, commit: str) -> tuple[float | None, bytes]:
     await extract_tree(repo, commit, score_dir)
     return await measure(spec, score_dir)
+
+
+def baseline_digest(spec: ExperimentSpec) -> str:
+    return Hasher.digest([spec.metric_command, spec.metric_key, spec.metric_file])
+
+
+async def read_baseline(path: anyio.Path) -> Baseline | None:
+    if not await path.exists():
+        return None
+    record = json.loads(await path.read_text())
+    return Baseline(commit=record["commit"], metric=record["metric"], spec_digest=record["spec_digest"])
+
+
+async def frozen_baseline(
+    spec: ExperimentSpec, *, repo: Path, score_dir: Path, path: anyio.Path, commit: str
+) -> float | None:
+    digest = baseline_digest(spec)
+    if (cached := await read_baseline(path)) is not None and cached.commit == commit and cached.spec_digest == digest:
+        return cached.metric
+    metric, _log = await score_commit(spec, repo=repo, score_dir=score_dir, commit=commit)
+    await path.write_text(json.dumps({"commit": commit, "metric": metric, "spec_digest": digest}))
+    return metric
 
 
 async def evaluate_unit(
@@ -245,9 +275,16 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path) -> LoopResult
     *plain checkout materialized via ``git archive``* of the commit — only committed
     content runs, under a hard-kill timeout and hermetic git config — with the metric
     read from a regular ``spec.metric_file`` (freshly written by that run, never stdout,
-    never a candidate-planted FIFO) and the run log withheld from the next contract. A
-    strict monotone improvement is kept (branch advanced, incumbent updated); anything
-    else discards, and a crash or over-time unit is journaled and the loop continues.
+    never a candidate-planted FIFO) and the run log withheld from the next contract. On a
+    fresh run the untouched incumbent tree is scored once into a frozen baseline —
+    persisted to ``<git-common>/athome/<name>.baseline.json`` and reused only when the
+    incumbent commit and the scorer digest both match — which seeds the incumbent metric,
+    so even the first candidate must *strictly beat the untouched tree* rather than being
+    auto-kept. Each contract threads a harness-authored ``## History`` (baseline, current
+    incumbent, best-so-far, and the most recent units with their verdicts and discard
+    reasons), never the withheld run log. A strict monotone improvement is kept (branch
+    advanced, incumbent updated); anything else discards, and a crash or over-time unit is
+    journaled and the loop continues.
     Spend is measured per unit — including the spend recovered from a hung unit killed on
     timeout — and the run aborts when it crosses ``max_usd``; work is bounded within a
     unit by the remaining wall budget. A per-experiment ``flock`` serializes concurrent
@@ -278,15 +315,30 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path) -> LoopResult
         spent = sum(row.resources.get("usd", 0.0) for row in journal.rows())
 
         worktrees = Path(tempfile.mkdtemp(prefix=f"athome-{spec.name}-")).resolve()
-        started = time.monotonic()
         try:
+            baseline = incumbent_metric
+            if incumbent_metric is None:
+                baseline = incumbent_metric = await frozen_baseline(
+                    spec,
+                    repo=repo,
+                    score_dir=worktrees / "baseline",
+                    path=athome_dir / f"{spec.name}.baseline.json",
+                    commit=incumbent,
+                )
+            started = time.monotonic()
             for unit in range(journal.resume_unit(), spec.budget.max_units):
                 elapsed = time.monotonic() - started
                 if spec.budget.max_wall_s is not None and elapsed >= spec.budget.max_wall_s:
                     break
                 remaining = None if spec.budget.max_wall_s is None else spec.budget.max_wall_s - elapsed
                 unit_started = time.monotonic()
-                contract = build_contract(spec, budget_low=budget_low(spec.budget, unit=unit, elapsed=elapsed))
+                contract = build_contract(
+                    spec,
+                    budget_low=budget_low(spec.budget, unit=unit, elapsed=elapsed),
+                    memory=Memory.from_journal(
+                        journal, baseline=baseline, incumbent=incumbent_metric, direction=spec.direction
+                    ),
+                )
                 outcome: UnitOutcome | None = None
                 with anyio.move_on_after(remaining):
                     try:

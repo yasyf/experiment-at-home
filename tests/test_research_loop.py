@@ -6,17 +6,17 @@ import os
 import subprocess
 import sys
 import textwrap
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import anyio
 import pytest
 
-from athome.research.contract import build_contract
+from athome.research.contract import Memory, build_contract
 from athome.research.driver import StubDriver, StubProposal
 from athome.research.journal import Journal, JournalRow, Verdict
-from athome.research.loop import experiment_lock, measure, run, run_metric
+from athome.research.loop import baseline_digest, experiment_lock, measure, run, run_metric
 from athome.research.spec import (
     Budget,
     BudgetExhausted,
@@ -27,7 +27,7 @@ from athome.research.spec import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 EXPERIMENT_NAME = "toy"
 
@@ -141,6 +141,23 @@ class TimeoutDriver:
     async def propose(self, contract: str, workdir: Path) -> float:
         (Path(workdir) / "train.py").write_text("LOSS = 0.1\n")
         raise ProposalTimeout("simulated hang killed on timeout", cost=self.cost)
+
+
+@dataclass(frozen=True, slots=True)
+class RecordingDriver:
+    """Replays scripted edits like StubDriver while capturing every contract it receives."""
+
+    proposals: Iterator[StubProposal]
+    contracts: list[str] = field(default_factory=list)
+    label: str = "recording"
+
+    async def propose(self, contract: str, workdir: Path) -> float:
+        self.contracts.append(contract)
+        for relative, content in next(self.proposals).files.items():
+            target = anyio.Path(workdir) / relative
+            await target.parent.mkdir(parents=True, exist_ok=True)
+            await target.write_text(content)
+        return 0.0
 
 
 async def test_end_to_end_all_gates_in_one_run(tmp_path: Path) -> None:
@@ -284,18 +301,25 @@ async def test_run_metric_captures_combined_output(tmp_path: Path) -> None:
     assert b"out" in log and b"err" in log  # stderr folded into the captured (untrusted) log
 
 
+def empty_memory() -> Memory:
+    return Memory(baseline=None, incumbent=None, best=None, recent=())
+
+
 def test_contract_states_manifest_metric_and_keep_rule() -> None:
-    contract = build_contract(make_spec(budget=Budget(max_units=3)), budget_low=False)
+    contract = build_contract(make_spec(budget=Budget(max_units=3)), budget_low=False, memory=empty_memory())
     assert "minimize" in contract and "`loss`" in contract
     assert "- `train.py`" in contract and "- `score.py`" in contract
     assert ".athome-metric.json" in contract
     assert "must fall strictly below" in contract
     assert "Simplicity" in contract
+    assert "## History" in contract
     assert "Budget is nearly exhausted" not in contract
 
 
 def test_contract_maximize_wording_and_budget_low_warning() -> None:
-    contract = build_contract(make_spec(budget=Budget(max_units=1), direction="max"), budget_low=True)
+    contract = build_contract(
+        make_spec(budget=Budget(max_units=1), direction="max"), budget_low=True, memory=empty_memory()
+    )
     assert "maximize" in contract and "must strictly exceed" in contract
     assert "Budget is nearly exhausted" in contract
 
@@ -778,3 +802,102 @@ async def test_run_refuses_a_concurrent_writer(tmp_path: Path) -> None:
     async with experiment_lock(athome / f"{EXPERIMENT_NAME}.lock"):
         with pytest.raises(ConcurrentRun):
             await run(make_spec(budget=Budget(max_units=1)), driver=StubDriver(iter([loss_proposal(0.5)])), repo=repo)
+
+
+# --- A1: frozen baseline + contract history.
+
+
+def baseline_path(repo: Path) -> Path:
+    return repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.baseline.json"
+
+
+def seed_baseline(repo: Path, *, commit: str, metric: object, digest: str) -> None:
+    baseline_path(repo).parent.mkdir(parents=True, exist_ok=True)
+    baseline_path(repo).write_text(json.dumps({"commit": commit, "metric": metric, "spec_digest": digest}))
+
+
+async def test_history_carries_prior_discard_reason_and_baseline(tmp_path: Path) -> None:
+    # Unit 0 edits the immutable scorer (DISCARD, ImmutableViolation); unit 1's contract must
+    # thread that discard reason and the frozen baseline back to the agent as failure feedback.
+    repo = toy_repo(tmp_path, initial_loss=1.0)
+    driver = RecordingDriver(iter([StubProposal({"score.py": "HACKED = 1\n"}), loss_proposal(0.5)]))
+
+    await run(make_spec(budget=Budget(max_units=2)), driver=driver, repo=repo)
+
+    assert len(driver.contracts) == 2
+    unit0_history, unit1_history = driver.contracts
+    assert "## History" in unit0_history and "unit 0" not in unit0_history  # no prior rows on the first unit
+    assert "baseline (untouched tree): 1.0" in unit1_history
+    assert "[discard]" in unit1_history and "ImmutableViolation" in unit1_history
+
+
+async def test_history_never_leaks_the_run_log(tmp_path: Path) -> None:
+    # SCORE_PY prints a lying loss=999.0 to stdout (the withheld run log) while writing the real
+    # metric to the file. No captured contract may ever carry that run-log value.
+    repo = toy_repo(tmp_path, initial_loss=1.0)
+    driver = RecordingDriver(iter([loss_proposal(0.5), loss_proposal(0.3), loss_proposal(0.2)]))
+
+    await run(make_spec(budget=Budget(max_units=3)), driver=driver, repo=repo)
+
+    assert len(driver.contracts) == 3
+    assert all("999.0" not in contract for contract in driver.contracts)
+
+
+async def test_first_candidate_must_strictly_beat_the_frozen_baseline(tmp_path: Path) -> None:
+    # DELIBERATE semantics change: the first candidate no longer auto-keeps. A candidate that only
+    # ties the untouched tree's score (0.50 == 0.5, distinct text so it commits) is discarded.
+    repo = toy_repo(tmp_path, initial_loss=0.5)
+    result = await run(
+        make_spec(budget=Budget(max_units=1)), driver=StubDriver(iter([loss_proposal("0.50")])), repo=repo
+    )
+
+    (row,) = journal_rows(repo)
+    assert row.verdict is Verdict.DISCARD and row.metric == 0.5  # scored, then discarded for not beating 0.5
+    assert result.kept == 0 and result.best is None
+
+
+async def test_first_run_scores_and_persists_the_frozen_baseline(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path, initial_loss=1.0)
+    spec = make_spec(budget=Budget(max_units=1))
+    head = git(repo, "rev-parse", "HEAD")
+
+    result = await run(spec, driver=StubDriver(iter([loss_proposal(0.5)])), repo=repo)
+
+    assert json.loads(baseline_path(repo).read_text()) == {
+        "commit": head,
+        "metric": 1.0,
+        "spec_digest": baseline_digest(spec),
+    }
+    assert result.best is not None and result.best.metric == 0.5  # 0.5 strictly beat the frozen 1.0
+
+
+async def test_baseline_reused_when_commit_and_spec_digest_match(tmp_path: Path) -> None:
+    # A persisted baseline whose commit and scorer digest match is reused verbatim, not re-scored:
+    # a 0.4 baseline makes a 0.5 candidate a DISCARD (against a fresh 1.0 re-score it would keep).
+    repo = toy_repo(tmp_path, initial_loss=1.0)
+    spec = make_spec(budget=Budget(max_units=1))
+    seed_baseline(repo, commit=git(repo, "rev-parse", "HEAD"), metric=0.4, digest=baseline_digest(spec))
+
+    result = await run(spec, driver=StubDriver(iter([loss_proposal(0.5)])), repo=repo)
+
+    (row,) = journal_rows(repo)
+    assert row.verdict is Verdict.DISCARD and result.kept == 0  # reused 0.4, not a fresh 1.0
+
+
+async def test_baseline_rescored_when_spec_digest_changes(tmp_path: Path) -> None:
+    # A stale scorer digest invalidates the cached baseline: it is re-scored to the untouched
+    # tree's real 1.0 (so 0.5 keeps) and the file is rewritten with the current digest.
+    repo = toy_repo(tmp_path, initial_loss=1.0)
+    spec = make_spec(budget=Budget(max_units=1))
+    head = git(repo, "rev-parse", "HEAD")
+    seed_baseline(repo, commit=head, metric=0.4, digest="stale-digest")
+
+    result = await run(spec, driver=StubDriver(iter([loss_proposal(0.5)])), repo=repo)
+
+    (row,) = journal_rows(repo)
+    assert row.verdict is Verdict.KEEP and result.kept == 1  # re-scored to 1.0, so 0.5 beats it
+    assert json.loads(baseline_path(repo).read_text()) == {
+        "commit": head,
+        "metric": 1.0,
+        "spec_digest": baseline_digest(spec),
+    }
