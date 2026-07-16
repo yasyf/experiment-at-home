@@ -17,7 +17,16 @@ from athome.research.contract import Memory, build_contract
 from athome.research.driver import StubDriver, StubProposal
 from athome.research.failures import MAX_INFRA_RETRIES, InfraFailure
 from athome.research.journal import Journal, JournalRow, Verdict
-from athome.research.loop import baseline_digest, experiment_lock, measure, run, run_metric
+from athome.research.loop import (
+    baseline_digest,
+    experiment_lock,
+    measure,
+    run,
+    run_git,
+    run_metric,
+    run_unit,
+    stage_candidate,
+)
 from athome.research.preflight import PreflightFailure
 from athome.research.spec import (
     Budget,
@@ -1135,6 +1144,181 @@ async def test_infra_abort_bills_the_proposal_cost_once_for_resume(tmp_path: Pat
             driver=CostDriver(iter([loss_proposal(0.4)]), cost=0.6),
             repo=repo,
         )
+
+
+@pytest.mark.parametrize(
+    "metric_statement",
+    [
+        pytest.param('pathlib.Path(".athome-metric.json").write_text("[]")', id="non-object-root"),
+        pytest.param('pathlib.Path(".athome-metric.json").write_bytes(b"\\xff")', id="candidate-read-error"),
+    ],
+)
+async def test_billed_candidate_crash_journals_zero_cost(tmp_path: Path, metric_statement: str) -> None:
+    counter = tmp_path / "scorer-runs"
+    score_py = textwrap.dedent(f"""
+        import json, pathlib, sys
+        train = pathlib.Path("train.py").read_text()
+        if "RETRY_CRASH" in train:
+            if not pathlib.Path({str(counter)!r}).exists():
+                pathlib.Path({str(counter)!r}).write_text("infra")
+                print("connection reset by peer", file=sys.stderr)
+                sys.exit(1)
+            {metric_statement}
+        else:
+            namespace = {{}}
+            exec(train, namespace)
+            pathlib.Path(".athome-metric.json").write_text(json.dumps({{"loss": namespace["LOSS"]}}))
+    """).strip()
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = special_repo(repo_dir, score_py=score_py)
+
+    await run(
+        make_spec(budget=Budget(max_units=1)),
+        driver=HostileDriver(
+            lambda workdir: (workdir / "train.py").write_text("LOSS = 0.5\n# RETRY_CRASH\n"), cost=0.6
+        ),
+        repo=repo,
+    )
+
+    (row,) = journal_rows(repo)
+    records = infra_events(repo)
+    assert row.verdict is Verdict.CRASH and row.resources["usd"] == 0.0
+    assert [record["cost"] for record in records] == [0.6]
+    assert row.resources["usd"] + sum(record["cost"] for record in records) == pytest.approx(0.6)
+
+
+async def test_wall_cancel_after_proposal_records_cost_for_resume(tmp_path: Path) -> None:
+    score_py = textwrap.dedent("""
+        import json, pathlib, time
+        train = pathlib.Path("train.py").read_text()
+        if "SLOW_SCORE" in train:
+            time.sleep(30)
+        namespace = {}
+        exec(train, namespace)
+        pathlib.Path(".athome-metric.json").write_text(json.dumps({"loss": namespace["LOSS"]}))
+    """).strip()
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = special_repo(repo_dir, score_py=score_py)
+
+    with anyio.fail_after(3.0):
+        result = await run(
+            make_spec(budget=Budget(max_units=1, max_wall_s=0.3)),
+            driver=HostileDriver(
+                lambda workdir: (workdir / "train.py").write_text("LOSS = 0.5\n# SLOW_SCORE\n"), cost=0.6
+            ),
+            repo=repo,
+        )
+
+    assert result.kept == 0 and journal_rows(repo) == []
+    assert [record["cost"] for record in infra_events(repo)] == [0.6]
+
+    resume_driver = RecordingDriver(iter([loss_proposal(0.4)]))
+    with pytest.raises(BudgetExhausted, match=r"spend \$0\.6000 crossed max_usd \$0\.5000"):
+        await run(
+            make_spec(budget=Budget(max_units=1, max_usd=0.5)),
+            driver=resume_driver,
+            repo=repo,
+        )
+    assert resume_driver.contracts == []
+
+
+async def test_all_infra_reproposals_cross_max_usd_mid_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = toy_repo(tmp_path)
+    incumbent = git(repo, "rev-parse", "HEAD")
+    (worktrees := tmp_path / "worktrees").mkdir()
+    (events := repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl").parent.mkdir()
+    proposals: list[Path] = []
+
+    def paid_edit(workdir: Path) -> None:
+        proposals.append(workdir)
+        (workdir / "train.py").write_text("LOSS = 0.5\n")
+
+    async def fail_read_tree(
+        target: Path,
+        *args: str,
+        check: bool = True,
+        index: Path | None = None,
+        work_tree: Path | None = None,
+    ) -> str:
+        if args[0] == "read-tree":
+            raise subprocess.CalledProcessError(1, ["git", *args])
+        return await run_git(target, *args, check=check, index=index, work_tree=work_tree)
+
+    monkeypatch.setattr("athome.research.loop.run_git", fail_read_tree)
+
+    with pytest.raises(BudgetExhausted, match=r"spend \$0\.8000 crossed max_usd \$0\.5000"):
+        await run_unit(
+            make_spec(budget=Budget(max_units=1, max_usd=0.5)),
+            unit=0,
+            repo=repo,
+            worktrees=worktrees,
+            incumbent=incumbent,
+            incumbent_metric=1.0,
+            contract="contract",
+            driver=HostileDriver(paid_edit, cost=0.4),
+            events=events,
+            deadline=None,
+            spent=0.0,
+        )
+
+    assert len(proposals) == 2
+    assert [record["cost"] for record in infra_events(repo)] == [0.4, 0.4]
+    assert journal_rows(repo) == []
+
+
+async def test_incumbent_read_tree_failure_stays_infra(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = toy_repo(tmp_path)
+    failure = subprocess.CalledProcessError(1, ["git", "read-tree"])
+
+    async def fail_read_tree(
+        target: Path,
+        *args: str,
+        check: bool = True,
+        index: Path | None = None,
+        work_tree: Path | None = None,
+    ) -> str:
+        raise failure
+
+    monkeypatch.setattr("athome.research.loop.run_git", fail_read_tree)
+
+    with pytest.raises(subprocess.CalledProcessError) as caught:
+        await stage_candidate(
+            make_spec(budget=Budget(max_units=1)),
+            repo=repo,
+            workdir=repo,
+            index=tmp_path / "candidate.index",
+            incumbent=git(repo, "rev-parse", "HEAD"),
+            label="test",
+            cost=0.0,
+            reported=None,
+        )
+
+    assert caught.value is failure
+
+
+async def test_nonzero_scorer_with_metric_and_infra_marker_is_candidate_crash(tmp_path: Path) -> None:
+    score_py = textwrap.dedent("""
+        import json, pathlib, sys
+        train = pathlib.Path("train.py").read_text()
+        namespace = {}
+        exec(train, namespace)
+        pathlib.Path(".athome-metric.json").write_text(json.dumps({"loss": namespace["LOSS"]}))
+        if "EXIT_ONE" in train:
+            print("connection reset by peer", file=sys.stderr)
+            sys.exit(1)
+    """).strip()
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = special_repo(repo_dir, score_py=score_py)
+
+    result = await run(
+        make_spec(budget=Budget(max_units=1)),
+        driver=HostileDriver(lambda workdir: (workdir / "train.py").write_text("LOSS = 0.5\n# EXIT_ONE\n")),
+        repo=repo,
+    )
+
+    (row,) = journal_rows(repo)
+    assert row.verdict is Verdict.CRASH and row.metric is None
+    assert result.kept == 0 and infra_events(repo) == []
 
 
 @dataclass(frozen=True, slots=True)

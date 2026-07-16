@@ -86,3 +86,18 @@ async def test_torn_sidecar_line_never_loses_a_later_record(tmp_path: Path) -> N
     assert sorted(event["unit"] for event in infra_events(events)) == [0, 2, 3]  # fragment skipped, nothing else lost
     assert infra_retries(events) == 3
     assert infra_cost(events) == pytest.approx(1.8)  # 0.6 × 3, no undercount from the tear
+
+
+def test_corrupt_sidecar_lines_are_skipped_independently(tmp_path: Path) -> None:
+    events = tmp_path / "toy.events.jsonl"
+    events.write_bytes(
+        b'{"unit":0,"attempt":0,"reason":"ok","cost":0.2}\n'
+        b'{"unit":1,"reason":"torn \xe2\x82\n'
+        b"[]\n"
+        b'{"unit":2,"attempt":0,"reason":"missing"}\n'
+        b'{"unit":3,"attempt":0,"reason":"bad","cost":"nope"}\n'
+        b'{"unit":4,"attempt":0,"reason":"ok","cost":0.4}\n'
+    )
+
+    assert [event["unit"] for event in infra_events(events)] == [0, 2, 3, 4]
+    assert infra_cost(events) == pytest.approx(0.6)

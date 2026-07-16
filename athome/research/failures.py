@@ -112,15 +112,21 @@ async def record_infra_event(path: Path, *, unit: int, attempt: int, reason: str
 def infra_events(path: Path) -> list[dict[str, object]]:
     if not path.exists():
         return []
-    return [record for line in path.read_text().splitlines() if isinstance(record := parse_event(line, path), dict)]
+    return [record for line in path.read_bytes().splitlines() if (record := parse_event(line, path)) is not None]
 
 
-def parse_event(line: str, path: Path) -> dict[str, object] | None:
+def parse_event(line: bytes, path: Path) -> dict[str, object] | None:
     try:
-        return json.loads(line)
-    except json.JSONDecodeError:
+        record = json.loads(line.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError):
         logger.warning("skipping malformed infra sidecar line in {}", path)
         return None
+    match record:
+        case dict():
+            return record
+        case _:
+            logger.warning("skipping malformed infra sidecar line in {}", path)
+            return None
 
 
 def infra_retries(path: Path) -> int:
@@ -128,4 +134,8 @@ def infra_retries(path: Path) -> int:
 
 
 def infra_cost(path: Path) -> float:
-    return sum(float(event.get("cost", 0.0)) for event in infra_events(path))
+    return sum(
+        float(cost)
+        for event in infra_events(path)
+        if isinstance(cost := event.get("cost"), (int, float)) and not isinstance(cost, bool)
+    )

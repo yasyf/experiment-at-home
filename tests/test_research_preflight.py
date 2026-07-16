@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from athome.research.loop import baseline_digest
+from athome.research.loop import Measurement, baseline_digest
 from athome.research.preflight import PreflightFailure, PreflightReport, preflight
 from athome.research.spec import Budget, ExperimentSpec
 
@@ -143,7 +143,7 @@ async def test_known_good_reachability_uses_extracted_overlay_measurement(
     extracted_dirs: list[str] = []
     measured_dirs: list[str] = []
 
-    async def score_spy(*args: object, **kwargs: object) -> tuple[float | None, bytes]:
+    async def score_spy(*args: object, **kwargs: object) -> Measurement:
         score_dirs.append(Path(kwargs["score_dir"]).name)
         return await original_score(*args, **kwargs)
 
@@ -151,7 +151,7 @@ async def test_known_good_reachability_uses_extracted_overlay_measurement(
         extracted_dirs.append(dest.name)
         await original_extract(source, treeish, dest)
 
-    async def measure_spy(spec: ExperimentSpec, workdir: Path) -> tuple[float | None, bytes]:
+    async def measure_spy(spec: ExperimentSpec, workdir: Path) -> Measurement:
         measured_dirs.append(workdir.name)
         return await original_measure(spec, workdir)
 
@@ -182,7 +182,7 @@ async def test_missing_known_good_dir_fails_reachability_after_scoring(
     score_dirs: list[str] = []
     extracted_dirs: list[str] = []
 
-    async def score_spy(*args: object, **kwargs: object) -> tuple[float | None, bytes]:
+    async def score_spy(*args: object, **kwargs: object) -> Measurement:
         score_dirs.append(Path(kwargs["score_dir"]).name)
         return await original_score(*args, **kwargs)
 

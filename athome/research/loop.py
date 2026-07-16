@@ -138,7 +138,7 @@ async def run_metric(command: tuple[str, ...], workdir: Path, *, hard_kill_s: fl
 def finite_metric(text: str, key: str) -> float | None:
     try:
         value = json.loads(text)[key]
-    except (json.JSONDecodeError, KeyError):
+    except (json.JSONDecodeError, KeyError, TypeError):
         return None
     return float(value) if finite_number(value) else None
 
@@ -155,9 +155,12 @@ async def measure(spec: ExperimentSpec, workdir: Path) -> Measurement:
     metric_path = anyio.Path(workdir) / spec.metric_file
     await metric_path.unlink(missing_ok=True)
     returncode, log = await run_metric(spec.metric_command, workdir, hard_kill_s=spec.budget.hard_kill_s)
-    if returncode != 0 or not await regular_file(metric_path):
-        return Measurement(metric=None, log=log, produced=False)
-    return Measurement(finite_metric(await metric_path.read_text(), spec.metric_key), log, produced=True)
+    produced = await regular_file(metric_path)
+    return Measurement(
+        finite_metric(await metric_path.read_text(), spec.metric_key) if returncode == 0 and produced else None,
+        log,
+        produced,
+    )
 
 
 def decide(metric: float | None, incumbent: float | None, *, direction: Literal["min", "max"]) -> Verdict:
@@ -203,8 +206,8 @@ async def stage_candidate(
     cost: float,
     reported: float | None,
 ) -> UnitOutcome | Candidate:
+    await run_git(repo, "read-tree", incumbent, index=index)
     try:
-        await run_git(repo, "read-tree", incumbent, index=index)
         await run_git(repo, "add", "-A", index=index, work_tree=workdir)
         changes = parse_diff_tree(
             await run_git(repo, "diff-index", "--cached", "--no-renames", "-r", "-z", "--raw", incumbent, index=index)
@@ -316,16 +319,20 @@ async def run_unit(
     driver: Driver,
     events: Path,
     deadline: float | None,
+    spent: float,
 ) -> UnitOutcome | None:
     committed: Candidate | None = None
     billed = False
+    if spec.budget.max_usd is not None and spent > spec.budget.max_usd:
+        raise BudgetExhausted(f"spend ${spent:.4f} crossed max_usd ${spec.budget.max_usd:.4f} at unit {unit}")
     for attempt in range(MAX_INFRA_RETRIES + 1):
         remaining = None if deadline is None else deadline - time.monotonic()
         if remaining is not None and remaining <= 0:
             return None
         cost = 0.0
+        proposal_completed = False
         infra: BaseException | None = None
-        with anyio.move_on_after(remaining):
+        with anyio.move_on_after(remaining) as scope:
             try:
                 if committed is not None:
                     candidate = committed  # a prior attempt already built it: re-score the same commit
@@ -333,6 +340,7 @@ async def run_unit(
                     workdir = worktrees / f"unit-{unit}-{attempt}"
                     await extract_tree(repo, incumbent, workdir)
                     cost = await driver.propose(contract, workdir)
+                    proposal_completed = True
                     reported = await read_reported_metric(spec, workdir)
                     await (anyio.Path(workdir) / spec.metric_file).unlink(missing_ok=True)
                     match await stage_candidate(
@@ -366,17 +374,29 @@ async def run_unit(
                     case "candidate":
                         # Candidate crash: journaled with its proposal cost; the loop continues.
                         logger.warning("unit {} crashed: {!r}", unit, exc)
-                        crash_cost = committed.cost if committed is not None else cost
+                        crash_cost = 0.0 if billed else committed.cost if committed is not None else cost
                         return UnitOutcome(Verdict.CRASH, None, incumbent, f"crash: {exc!r}", crash_cost)
                     case "infra":
                         infra = exc
-        if infra is None:
-            return None  # the unit blew past the remaining wall budget and was cancelled
+        if scope.cancel_called:
+            if proposal_completed:
+                with anyio.CancelScope(shield=True):
+                    await record_infra_event(
+                        events,
+                        unit=unit,
+                        attempt=attempt,
+                        reason="wall deadline cancelled after proposal",
+                        cost=cost,
+                    )
+            return None
         # A committed candidate re-scores (bill its cost once); a pre-commit failure re-proposes.
         attempt_cost = (committed.cost if not billed else 0.0) if committed is not None else cost
         billed = billed or committed is not None
         await record_infra_event(events, unit=unit, attempt=attempt, reason=repr(infra), cost=attempt_cost)
+        spent += attempt_cost
         logger.warning("unit {} infra failure, attempt {}/{}: {!r}", unit, attempt, MAX_INFRA_RETRIES, infra)
+        if spec.budget.max_usd is not None and spent > spec.budget.max_usd:
+            raise BudgetExhausted(f"spend ${spent:.4f} crossed max_usd ${spec.budget.max_usd:.4f} at unit {unit}")
         if attempt == MAX_INFRA_RETRIES:
             raise InfraFailure(f"unit {unit} aborted after {MAX_INFRA_RETRIES} infra retries") from infra
 
@@ -489,6 +509,7 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
                     driver=driver,
                     events=events,
                     deadline=deadline,
+                    spent=spent,
                 )
                 if outcome is None:
                     break  # the unit blew past the remaining wall budget and was cancelled
