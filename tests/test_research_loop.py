@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -245,6 +246,26 @@ class OuterCancellingDriver:
                 raise exc
             case float() as cost:
                 return cost
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryCancellingDriver:
+    """Fails a proposal, then cancels its caller during cost recovery."""
+
+    scope: anyio.CancelScope
+    cost: float
+    label: str = "recovery-cancel"
+
+    async def preflight(self) -> None:
+        return None
+
+    async def propose(self, contract: str, workdir: Path) -> float:
+        raise OSError("pid-file write failed")
+
+    async def recover_cost(self) -> float:
+        self.scope.cancel()
+        await anyio.lowlevel.checkpoint()
+        return self.cost
 
 
 @dataclass(frozen=True, slots=True)
@@ -1044,6 +1065,77 @@ async def test_outer_cancellation_after_proposal_persists_known_cost(tmp_path: P
 
     assert journal_rows(repo) == []
     assert [(event["kind"], event["cost"]) for event in infra_events(repo)] == [("wall_cancel", 0.6)]
+
+
+async def test_outer_cancellation_coincident_with_wall_deadline_accounts_attempt(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    (worktrees := tmp_path / "worktrees").mkdir()
+    (athome := repo / ".git" / "athome").mkdir(parents=True)
+    events = athome / f"{EXPERIMENT_NAME}.events.jsonl"
+    abort = athome / f"{EXPERIMENT_NAME}.abort.json"
+    deadline = time.monotonic() + 0.2
+    scope = anyio.CancelScope(deadline=deadline)
+
+    with scope:
+        with pytest.raises(anyio.get_cancelled_exc_class()):
+            await run_unit(
+                make_spec(budget=Budget(max_units=1)),
+                unit=0,
+                repo=repo,
+                worktrees=worktrees,
+                incumbent=git(repo, "rev-parse", "HEAD"),
+                incumbent_metric=None,
+                contract="test contract",
+                driver=RecoveryCostDriver(0.6),
+                events=events,
+                abort=abort,
+                deadline=deadline,
+                spent=0.0,
+            )
+
+    records = infra_events(repo)
+    assert journal_rows(repo) == []
+    assert (
+        any(record["kind"] == "wall_cancel" and record.get("cost") == pytest.approx(0.6) for record in records)
+        or abort.exists()
+    )
+
+
+async def test_outer_cancellation_during_infra_recovery_accounts_attempt(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    scope = anyio.CancelScope()
+
+    with scope:
+        with pytest.raises(anyio.get_cancelled_exc_class()):
+            await run(
+                make_spec(budget=Budget(max_units=1)),
+                driver=RecoveryCancellingDriver(scope, cost=0.6),
+                repo=repo,
+            )
+
+    abort = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
+    records = infra_events(repo)
+    assert journal_rows(repo) == []
+    assert (
+        any(record["kind"] == "wall_cancel" and record.get("cost") == pytest.approx(0.6) for record in records)
+        or abort.exists()
+    )
+
+
+async def test_successful_attempt_has_one_accounting_record(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+
+    await run(
+        make_spec(budget=Budget(max_units=1)),
+        driver=CostDriver(iter([loss_proposal(0.5)]), cost=0.6),
+        repo=repo,
+    )
+
+    (row,) = journal_rows(repo)
+    abort = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
+    assert row.resources["usd"] == pytest.approx(0.6)
+    assert infra_events(repo) == []
+    assert not abort.exists()
 
 
 async def test_journal_append_failure_writes_abort_latch_and_blocks_restart(

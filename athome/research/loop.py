@@ -387,120 +387,125 @@ async def execute_unit(
         proposal_started = False
         proposal_completed = False
         infra: BaseException | None = None
-        with anyio.move_on_after(remaining) as scope:
+        recorded = False
+        try:
             try:
-                if committed is not None:
-                    candidate = committed  # a prior attempt already built it: re-score the same commit
-                else:
-                    workdir = worktrees / f"unit-{unit}-{attempt}"
-                    await extract_tree(repo, incumbent, workdir)
-                    proposal_started = True
-                    cost = validate_driver_cost(unit, await driver.propose(contract, workdir))
-                    proposal_completed = True
-                    reported = await read_reported_metric(spec, workdir)
-                    await (anyio.Path(workdir) / spec.metric_file).unlink(missing_ok=True)
-                    match await stage_candidate(
-                        spec,
-                        repo=repo,
-                        workdir=workdir,
-                        index=worktrees / f"unit-{unit}-{attempt}.index",
-                        incumbent=incumbent,
-                        label=driver.label,
-                        cost=cost,
-                        reported=reported,
-                    ):
-                        case UnitOutcome() as terminal:
-                            return terminal  # empty proposal or immutable violation: journaled with its cost
-                        case Candidate() as candidate:
-                            committed = candidate
-                return await score_candidate(
-                    spec,
-                    repo=repo,
-                    score_dir=worktrees / f"score-{unit}-{attempt}",
-                    candidate=candidate,
-                    incumbent_metric=incumbent_metric,
-                    cost=0.0 if billed else candidate.cost,
-                )
-            except ProposalTimeout as exc:
-                # A hung proposal killed on timeout still counts its recovered spend.
-                logger.warning("unit {} proposal timed out: {}", unit, exc)
-                return UnitOutcome(
-                    Verdict.CRASH,
-                    None,
-                    incumbent,
-                    f"proposal timeout: {exc}",
-                    validate_driver_cost(unit, exc.cost),
-                )
-            except anyio.get_cancelled_exc_class():
-                if not scope.cancel_called:
+                with anyio.move_on_after(remaining) as scope:
+                    try:
+                        if committed is not None:
+                            candidate = committed  # a prior attempt already built it: re-score the same commit
+                        else:
+                            workdir = worktrees / f"unit-{unit}-{attempt}"
+                            await extract_tree(repo, incumbent, workdir)
+                            proposal_started = True
+                            cost = validate_driver_cost(unit, await driver.propose(contract, workdir))
+                            proposal_completed = True
+                            reported = await read_reported_metric(spec, workdir)
+                            await (anyio.Path(workdir) / spec.metric_file).unlink(missing_ok=True)
+                            match await stage_candidate(
+                                spec,
+                                repo=repo,
+                                workdir=workdir,
+                                index=worktrees / f"unit-{unit}-{attempt}.index",
+                                incumbent=incumbent,
+                                label=driver.label,
+                                cost=cost,
+                                reported=reported,
+                            ):
+                                case UnitOutcome() as terminal:
+                                    recorded = True
+                                    return terminal  # empty proposal or immutable violation: journaled with its cost
+                                case Candidate() as candidate:
+                                    committed = candidate
+                        outcome = await score_candidate(
+                            spec,
+                            repo=repo,
+                            score_dir=worktrees / f"score-{unit}-{attempt}",
+                            candidate=candidate,
+                            incumbent_metric=incumbent_metric,
+                            cost=0.0 if billed else candidate.cost,
+                        )
+                        recorded = True
+                        return outcome
+                    except ProposalTimeout as exc:
+                        # A hung proposal killed on timeout still counts its recovered spend.
+                        logger.warning("unit {} proposal timed out: {}", unit, exc)
+                        outcome = UnitOutcome(
+                            Verdict.CRASH,
+                            None,
+                            incumbent,
+                            f"proposal timeout: {exc}",
+                            validate_driver_cost(unit, exc.cost),
+                        )
+                        recorded = True
+                        return outcome
+                    except Exception as exc:
+                        classification = classify(exc)
+                        if classification != "accounting" and proposal_started and not proposal_completed:
+                            cost = validate_driver_cost(unit, await driver.recover_cost())
+                        match classification:
+                            case "accounting":
+                                recorded = True
+                                raise
+                            case "candidate":
+                                # Candidate crash: journaled with its proposal cost; the loop continues.
+                                logger.warning("unit {} crashed: {!r}", unit, exc)
+                                crash_cost = 0.0 if billed else committed.cost if committed is not None else cost
+                                outcome = UnitOutcome(Verdict.CRASH, None, incumbent, f"crash: {exc!r}", crash_cost)
+                                recorded = True
+                                return outcome
+                            case "infra":
+                                infra = exc
+                if scope.cancel_called:
                     with anyio.CancelScope(shield=True):
-                        try:
-                            match proposal_started, proposal_completed:
-                                case True, False:
-                                    cost = validate_driver_cost(unit, await driver.recover_cost())
-                                    if cost > 0:
-                                        await record_infra_event(
-                                            events,
-                                            unit=unit,
-                                            attempt=attempt,
-                                            reason="outer cancellation during proposal",
-                                            cost=cost,
-                                            kind="wall_cancel",
-                                        )
-                                case _, True:
-                                    await record_infra_event(
-                                        events,
-                                        unit=unit,
-                                        attempt=attempt,
-                                        reason="outer cancellation after proposal completion",
-                                        cost=cost,
-                                        kind="wall_cancel",
-                                    )
-                                case _:
-                                    pass
-                        except AccountingIntegrityError as exc:
-                            await record_accounting_abort(abort, events, unit=unit, reason=str(exc))
-                raise
-            except Exception as exc:
-                classification = classify(exc)
-                if classification != "accounting" and proposal_started and not proposal_completed:
-                    cost = validate_driver_cost(unit, await driver.recover_cost())
-                match classification:
-                    case "accounting":
-                        raise
-                    case "candidate":
-                        # Candidate crash: journaled with its proposal cost; the loop continues.
-                        logger.warning("unit {} crashed: {!r}", unit, exc)
-                        crash_cost = 0.0 if billed else committed.cost if committed is not None else cost
-                        return UnitOutcome(Verdict.CRASH, None, incumbent, f"crash: {exc!r}", crash_cost)
-                    case "infra":
-                        infra = exc
-        if scope.cancel_called:
-            with anyio.CancelScope(shield=True):
-                if proposal_started and not proposal_completed:
-                    cost = validate_driver_cost(unit, await driver.recover_cost())
-                if proposal_completed or cost > 0:
-                    await record_infra_event(
-                        events,
-                        unit=unit,
-                        attempt=attempt,
-                        reason="wall deadline cancelled after proposal",
-                        cost=cost,
-                        kind="wall_cancel",
+                        if proposal_started and not proposal_completed:
+                            cost = validate_driver_cost(unit, await driver.recover_cost())
+                        if proposal_completed or cost > 0:
+                            await record_infra_event(
+                                events,
+                                unit=unit,
+                                attempt=attempt,
+                                reason="wall deadline cancelled after proposal",
+                                cost=cost,
+                                kind="wall_cancel",
+                            )
+                    recorded = True
+                    return None
+                # A committed candidate re-scores (bill its cost once); a pre-commit failure re-proposes.
+                attempt_cost = (committed.cost if not billed else 0.0) if committed is not None else cost
+                billed = billed or committed is not None
+                await record_infra_event(
+                    events, unit=unit, attempt=attempt, reason=repr(infra), cost=attempt_cost, kind="retry"
+                )
+                recorded = True
+                spent += attempt_cost
+                logger.warning("unit {} infra failure, attempt {}/{}: {!r}", unit, attempt, MAX_INFRA_RETRIES, infra)
+                if spec.budget.max_usd is not None and spent > spec.budget.max_usd:
+                    raise BudgetExhausted(
+                        f"spend ${spent:.4f} crossed max_usd ${spec.budget.max_usd:.4f} at unit {unit}"
                     )
-            return None
-        # A committed candidate re-scores (bill its cost once); a pre-commit failure re-proposes.
-        attempt_cost = (committed.cost if not billed else 0.0) if committed is not None else cost
-        billed = billed or committed is not None
-        await record_infra_event(
-            events, unit=unit, attempt=attempt, reason=repr(infra), cost=attempt_cost, kind="retry"
-        )
-        spent += attempt_cost
-        logger.warning("unit {} infra failure, attempt {}/{}: {!r}", unit, attempt, MAX_INFRA_RETRIES, infra)
-        if spec.budget.max_usd is not None and spent > spec.budget.max_usd:
-            raise BudgetExhausted(f"spend ${spent:.4f} crossed max_usd ${spec.budget.max_usd:.4f} at unit {unit}")
-        if attempt == MAX_INFRA_RETRIES:
-            raise InfraFailure(f"unit {unit} aborted after {MAX_INFRA_RETRIES} infra retries") from infra
+                if attempt == MAX_INFRA_RETRIES:
+                    raise InfraFailure(f"unit {unit} aborted after {MAX_INFRA_RETRIES} infra retries") from infra
+            except AccountingIntegrityError:
+                recorded = True
+                raise
+        finally:
+            if not recorded:
+                with anyio.CancelScope(shield=True):
+                    try:
+                        if proposal_started and not proposal_completed:
+                            cost = validate_driver_cost(unit, await driver.recover_cost())
+                        if proposal_completed or cost > 0:
+                            await record_infra_event(
+                                events,
+                                unit=unit,
+                                attempt=attempt,
+                                reason="attempt interrupted after proposal",
+                                cost=cost,
+                                kind="wall_cancel",
+                            )
+                    except AccountingIntegrityError as exc:
+                        await record_accounting_abort(abort, events, unit=unit, reason=str(exc))
 
 
 async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_notes: bool = False) -> LoopResult:

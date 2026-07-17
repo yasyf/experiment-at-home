@@ -37,8 +37,8 @@ the latch write itself fails I/O, the doubly-degraded F3 residue still aborts lo
 do unreadable billing evidence or a detached process that cannot be stopped; check and
 reconcile the ledger before resuming.
 
-Accepted limitation: if the latch write fails I/O while the sidecar breadcrumb succeeds,
-a restart is not blocked because reconciliation never clears append-only sidecar history.
+Accepted limitation: if the latch write fails, whether or not the best-effort breadcrumb
+succeeds, a restart is not blocked; reconciliation never uses sidecar history as restart authority.
 Journal/sidecar writes use os.write/close, not fsync: process-crash safe; power loss may erase costs after refs persist.
 """
 
