@@ -15,6 +15,7 @@ from functools import partial
 from pathlib import Path
 from subprocess import PIPE, STDOUT, CalledProcessError
 from typing import TYPE_CHECKING, Literal
+from uuid import uuid4
 
 import anyio
 from loguru import logger
@@ -306,6 +307,8 @@ async def experiment_lock(path: Path) -> AsyncIterator[None]:
         except BlockingIOError as exc:
             raise ConcurrentRun(f"another run already holds {path}") from exc
         try:
+            await anyio.to_thread.run_sync(os.pwrite, fd, uuid4().hex.encode(), 0)
+            await anyio.to_thread.run_sync(os.fsync, fd)
             yield
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)

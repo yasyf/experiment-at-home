@@ -55,11 +55,12 @@ def write_spec(root: Path) -> Path:
 
 
 @contextmanager
-def held_exclusive_lock(path: Path) -> Iterator[None]:
+def held_exclusive_lock(path: Path, holder_id: str = "a" * 32) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.pwrite(fd, holder_id.encode(), 0)
         yield
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
@@ -177,6 +178,30 @@ async def test_not_live_never_trips_and_a_new_live_episode_starts_fresh(
     assert first == watchdog.WatchResult(live=False, alarm=False)
     assert stale == watchdog.WatchResult(live=False, alarm=False)
     assert new_run == watchdog.WatchResult(live=True, alarm=False)
+
+
+async def test_replacement_live_holder_starts_fresh(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    journal = tmp_path / "athome" / "toy.jsonl"
+    alerts: list[str] = []
+
+    async def fake_journal_path(_repo: Path, _name: str) -> Path:
+        return journal
+
+    async def fake_alert(_journal: Path, *, unit: str, detail: str) -> None:
+        alerts.append(f"{unit}: {detail}")
+
+    monkeypatch.setattr(nightly, "journal_path", fake_journal_path)
+    monkeypatch.setattr(watchdog, "_alert", fake_alert)
+
+    lock = journal.with_suffix(".lock")
+    with held_exclusive_lock(lock, "a" * 32):
+        first = await watchdog.check(make_spec(), repo=tmp_path, quiet_s=100.0, now=lambda: 0.0)
+    with held_exclusive_lock(lock, "b" * 32):
+        replacement = await watchdog.check(make_spec(), repo=tmp_path, quiet_s=100.0, now=lambda: 101.0)
+
+    assert first == watchdog.WatchResult(live=True, alarm=False)
+    assert replacement == watchdog.WatchResult(live=True, alarm=False)
+    assert alerts == []
 
 
 async def test_install_wires_the_interval_agent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

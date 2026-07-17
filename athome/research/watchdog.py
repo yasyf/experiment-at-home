@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import time
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -11,6 +12,7 @@ from typing import TYPE_CHECKING
 import anyio
 
 from athome import launchd
+from athome.cache import atomic_write_text
 from athome.config import AthomeSettings, load
 from athome.progress import append_line
 from athome.research import nightly
@@ -19,7 +21,7 @@ from athome.research.journal import CC_NOTES_BIN
 from athome.research.spec import ExperimentSpec
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncIterator, Callable
 
 WATCH_INTERVAL = launchd.Interval(seconds=600)
 WATCH_LABEL_PREFIX = f"{launchd.LABEL_NAMESPACE}research.watch."
@@ -62,6 +64,27 @@ class WatchResult:
     alarm: bool
 
 
+def _probe_lock(lock_path: Path) -> tuple[bool, str | None]:
+    fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            holder_id = os.pread(fd, 32, 0)
+            return True, holder_id.decode() if len(holder_id) == 32 else None
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False, None
+    finally:
+        os.close(fd)
+
+
+def _probe_holder(lock_path: Path) -> str | None:
+    live, holder_id = _probe_lock(lock_path)
+    if live and holder_id is None:
+        raise WatchdogStateError(f"invalid holder identity in {lock_path}")
+    return holder_id
+
+
 def probe_live(lock_path: Path) -> bool:
     """Checks whether a writer holds ``lock_path`` without blocking or taking its lock.
 
@@ -71,16 +94,7 @@ def probe_live(lock_path: Path) -> bool:
     Returns:
         ``True`` when an exclusive holder prevents the shared probe, otherwise ``False``.
     """
-    fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT, 0o644)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        return False
-    finally:
-        os.close(fd)
+    return _probe_lock(lock_path)[0]
 
 
 def _state_path(path: Path) -> Path:
@@ -131,8 +145,20 @@ async def _read_offset_state(path: Path) -> OffsetState | None:
 
 
 async def _write_json(path: Path, record: object) -> None:
-    await anyio.Path(path.parent).mkdir(parents=True, exist_ok=True)
-    await anyio.Path(path).write_text(json.dumps(record) + "\n")
+    await atomic_write_text(anyio.Path(path), json.dumps(record) + "\n")
+
+
+@asynccontextmanager
+async def _state_lock(lock_path: Path) -> AsyncIterator[None]:
+    fd = os.open(Path(f"{_state_path(lock_path)}.lock"), os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        await anyio.to_thread.run_sync(fcntl.flock, fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 async def _snapshot(path: Path) -> tuple[int, int | None, int | None]:
@@ -178,17 +204,20 @@ async def observe_progress(path: Path, *, now: float) -> OffsetState:
     return state
 
 
-def _decode_live_since(record: object, path: Path) -> float | None:
+def _decode_live_since(record: object, path: Path) -> tuple[str, float] | None:
     match record:
-        case {"live_since_ts": None}:
+        case {"holder_id": None, "live_since_ts": None}:
             return None
-        case {"live_since_ts": int(live_since) | float(live_since)} if not isinstance(live_since, bool):
-            return float(live_since)
+        case {
+            "holder_id": str(holder_id),
+            "live_since_ts": int(live_since) | float(live_since),
+        } if len(holder_id) == 32 and not isinstance(live_since, bool):
+            return holder_id, float(live_since)
         case _:
             raise WatchdogStateError(f"invalid watchdog liveness state in {path}")
 
 
-async def _read_live_since(path: Path) -> float | None:
+async def _read_live_since(path: Path) -> tuple[str, float] | None:
     try:
         payload = await anyio.Path(path).read_text()
     except FileNotFoundError:
@@ -197,11 +226,11 @@ async def _read_live_since(path: Path) -> float | None:
     return _decode_live_since(record, path)
 
 
-async def _observe_live_since(lock_path: Path, *, live: bool, now: float) -> float | None:
+async def _observe_live_since(lock_path: Path, *, holder_id: str | None, now: float) -> float | None:
     state_path = _state_path(lock_path)
     previous = await _read_live_since(state_path)
-    live_since = previous if live and previous is not None else now if live else None
-    await _write_json(state_path, {"live_since_ts": live_since})
+    live_since = previous[1] if previous is not None and previous[0] == holder_id else now if holder_id else None
+    await _write_json(state_path, {"holder_id": holder_id, "live_since_ts": live_since})
     return live_since
 
 
@@ -247,28 +276,32 @@ async def check(
     Returns:
         Whether the run is live and whether this check raised a quiet alarm.
     """
-    checked_at = now()
     journal = await nightly.journal_path(repo, spec.name)
     await anyio.Path(journal.parent).mkdir(parents=True, exist_ok=True)
     lock_path = journal.with_suffix(".lock")
-    live = probe_live(lock_path)
-    progress = (
-        await observe_progress(journal, now=checked_at),
-        await observe_progress(_run_log_path(spec.name), now=checked_at),
-    )
-    live_since = await _observe_live_since(lock_path, live=live, now=checked_at)
-    quiet_since = max(
-        *(state.last_growth_ts for state in progress),
-        live_since if live_since is not None else checked_at,
-    )
-    alarm = live and checked_at - quiet_since >= quiet_s
-    if alarm:
-        await _alert(
-            journal,
-            unit=spec.name,
-            detail=f"no journal or launchd log growth for {checked_at - quiet_since:.0f}s while the experiment lock is held",
+    async with _state_lock(lock_path):
+        checked_at = now()
+        holder_id = _probe_holder(lock_path)
+        progress = (
+            await observe_progress(journal, now=checked_at),
+            await observe_progress(_run_log_path(spec.name), now=checked_at),
         )
-    return WatchResult(live=live, alarm=alarm)
+        live_since = await _observe_live_since(lock_path, holder_id=holder_id, now=checked_at)
+        quiet_since = max(
+            *(state.last_growth_ts for state in progress),
+            live_since if live_since is not None else checked_at,
+        )
+        alarm = holder_id is not None and checked_at - quiet_since >= quiet_s
+        if alarm:
+            await _alert(
+                journal,
+                unit=spec.name,
+                detail=(
+                    f"no journal or launchd log growth for {checked_at - quiet_since:.0f}s "
+                    "while the experiment lock is held"
+                ),
+            )
+        return WatchResult(live=holder_id is not None, alarm=alarm)
 
 
 async def install(spec_path: Path, *, interval: launchd.Interval = WATCH_INTERVAL) -> Path:

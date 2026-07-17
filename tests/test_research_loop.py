@@ -1359,9 +1359,17 @@ async def test_journal_present_zero_usd_is_valid_on_resume(tmp_path: Path) -> No
 async def test_experiment_lock_is_a_single_writer(tmp_path: Path) -> None:
     lock = tmp_path / "toy.lock"
     async with experiment_lock(lock):
+        first_holder = lock.read_text()
         with pytest.raises(ConcurrentRun):
             async with experiment_lock(lock):
                 pass
+        assert lock.read_text() == first_holder
+    async with experiment_lock(lock):
+        second_holder = lock.read_text()
+
+    assert len(first_holder) == 32
+    assert len(second_holder) == 32
+    assert second_holder != first_holder
 
 
 async def test_run_refuses_a_concurrent_writer(tmp_path: Path) -> None:
