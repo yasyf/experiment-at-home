@@ -48,6 +48,7 @@ if TYPE_CHECKING:
 
 EXPERIMENT_BRANCH_PREFIX = "athome"
 BUDGET_LOW_WALL_FRACTION = 0.75
+LOCK_RETRY_DELAY_S = 1.0
 HERMETIC_ENV = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_SYSTEM": "/dev/null"}
 
 
@@ -304,8 +305,14 @@ async def experiment_lock(path: Path) -> AsyncIterator[None]:
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise ConcurrentRun(f"another run already holds {path}") from exc
+        except BlockingIOError:
+            # The watchdog's momentary LOCK_SH probe can shadow the first attempt; one
+            # bounded retry outlasts it, while a genuine run holds LOCK_EX far longer.
+            await anyio.sleep(LOCK_RETRY_DELAY_S)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ConcurrentRun(f"another run already holds {path}") from exc
         try:
             await anyio.to_thread.run_sync(os.pwrite, fd, uuid4().hex.encode(), 0)
             await anyio.to_thread.run_sync(os.fsync, fd)
@@ -548,7 +555,8 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
     Spend is measured per unit — including the spend recovered from a hung unit killed on
     timeout — and the run aborts when it crosses ``max_usd``; work is bounded within a
     unit by the remaining wall budget. A per-experiment ``flock`` serializes concurrent
-    runs. Every unit is journaled, so a restart resumes from :meth:`Journal.resume_unit`
+    runs, retrying acquisition once after a bounded delay so a momentary watchdog probe
+    never masquerades as one. Every unit is journaled, so a restart resumes from :meth:`Journal.resume_unit`
     and reconciles the branch with the (validated) journaled best.
 
     Args:

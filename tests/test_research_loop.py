@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import os
@@ -25,6 +26,7 @@ from athome.research.failures import (
 )
 from athome.research.journal import Journal, JournalRow, Verdict
 from athome.research.loop import (
+    LOCK_RETRY_DELAY_S,
     baseline_digest,
     experiment_lock,
     measure,
@@ -1356,8 +1358,14 @@ async def test_journal_present_zero_usd_is_valid_on_resume(tmp_path: Path) -> No
 # --- WR2: per-experiment single-writer lock.
 
 
-async def test_experiment_lock_is_a_single_writer(tmp_path: Path) -> None:
+async def test_experiment_lock_is_a_single_writer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     lock = tmp_path / "toy.lock"
+    delays: list[float] = []
+
+    async def record_delay(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(anyio, "sleep", record_delay)
     async with experiment_lock(lock):
         first_holder = lock.read_text()
         with pytest.raises(ConcurrentRun):
@@ -1367,12 +1375,37 @@ async def test_experiment_lock_is_a_single_writer(tmp_path: Path) -> None:
     async with experiment_lock(lock):
         second_holder = lock.read_text()
 
+    assert delays == [LOCK_RETRY_DELAY_S]
     assert len(first_holder) == 32
     assert len(second_holder) == 32
     assert second_holder != first_holder
 
 
-async def test_run_refuses_a_concurrent_writer(tmp_path: Path) -> None:
+async def test_experiment_lock_outlasts_a_momentary_shared_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lock = tmp_path / "toy.lock"
+    probe_fd = os.open(lock, os.O_RDONLY | os.O_CREAT, 0o644)
+    fcntl.flock(probe_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    delays: list[float] = []
+
+    async def release_probe(delay: float) -> None:
+        delays.append(delay)
+        fcntl.flock(probe_fd, fcntl.LOCK_UN)
+
+    monkeypatch.setattr(anyio, "sleep", release_probe)
+    try:
+        async with experiment_lock(lock):
+            holder = lock.read_text()
+    finally:
+        os.close(probe_fd)
+
+    assert delays == [LOCK_RETRY_DELAY_S]
+    assert len(holder) == 32
+
+
+async def test_run_refuses_a_concurrent_writer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("athome.research.loop.LOCK_RETRY_DELAY_S", 0.0)
     repo = toy_repo(tmp_path)
     (athome := repo / ".git" / "athome").mkdir(parents=True, exist_ok=True)
 
