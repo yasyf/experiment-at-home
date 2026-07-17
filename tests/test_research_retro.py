@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, cast
 
 import anyio
 import pytest
+from pydantic import ValidationError
 
 from athome.research import judge as judge_mod
 from athome.research.journal import CC_NOTES_BIN, CC_NOTES_LABEL, JournalRow, Verdict
@@ -73,7 +74,7 @@ def test_build_prompt_projects_only_numeric_and_fixed_enum_evidence() -> None:
 
 
 def test_build_prompt_with_lying_stdout_never_includes_raw_log_text() -> None:
-    marker = "<<<RAW-RUN-STDOUT>>>" + ("\x00garbage" * 2_000)
+    marker = "<<<RAW-RUN-STDOUT>>>" + ("garbage" * 2_000)
     rows = (
         make_row(
             0,
@@ -183,7 +184,7 @@ def test_retro_record_uses_first_kept_metric_as_baseline() -> None:
 
 
 def test_retro_record_from_record_requires_every_field() -> None:
-    with pytest.raises(KeyError, match="best_metric"):
+    with pytest.raises(ValidationError, match="best_metric"):
         RetroRecord.from_record(
             {
                 "experiment": "toy",
@@ -192,6 +193,39 @@ def test_retro_record_from_record_requires_every_field() -> None:
                 "verdict": make_verdict().model_dump(mode="json"),
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("experiment", 7, id="experiment-int"),
+        pytest.param("baseline", "not-a-number", id="baseline-str"),
+        pytest.param("best_metric", [], id="best-metric-list"),
+        pytest.param("uplift", None, id="uplift-null"),
+    ],
+)
+def test_retro_record_from_record_rejects_wrong_field_types(field: str, value: object) -> None:
+    record = RetroRecord("toy", 1.0, 0.6, 0.4, make_verdict()).to_record()
+    record[field] = value
+
+    with pytest.raises(ValidationError, match=field):
+        RetroRecord.from_record(record)
+
+
+def test_retro_record_from_record_rejects_unknown_top_level_field() -> None:
+    record = RetroRecord("toy", 1.0, 0.6, 0.4, make_verdict()).to_record()
+    record["unexpected"] = True
+
+    with pytest.raises(ValidationError, match="unexpected"):
+        RetroRecord.from_record(record)
+
+
+def test_retro_record_from_record_rejects_unknown_verdict_field() -> None:
+    record = RetroRecord("toy", 1.0, 0.6, 0.4, make_verdict()).to_record()
+    record["verdict"] = make_verdict().model_dump(mode="json") | {"unexpected": True}
+
+    with pytest.raises(ValidationError, match="unexpected"):
+        RetroRecord.from_record(record)
 
 
 async def test_retro_journal_mirrors_to_cc_notes_by_default_with_exact_command(

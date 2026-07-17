@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import anyio
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from athome.progress import RunSink, load_journal
 from athome.research.errors import ResearchError
@@ -38,6 +38,16 @@ class RetroVerdict(BaseModel):
     summary: str = Field(description="Concise account of the experiment outcome without unsupported causal claims.")
     evidence: tuple[str, ...] = Field(description="Numeric or verdict-pattern observations supporting the summary.")
     next_steps: tuple[str, ...] = Field(description="Concrete follow-up experiments justified by the evidence.")
+
+
+class RetroRecordSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    experiment: str
+    baseline: float
+    best_metric: float
+    uplift: float
+    verdict: RetroVerdict
 
 
 class _MetricSummary(NamedTuple):
@@ -141,12 +151,13 @@ class RetroRecord:
     @classmethod
     def from_record(cls, record: Mapping[str, object]) -> RetroRecord:
         """Load one strict-schema persisted record."""
+        validated = RetroRecordSchema.model_validate(record, extra="forbid")
         return cls(
-            experiment=record["experiment"],
-            baseline=record["baseline"],
-            best_metric=record["best_metric"],
-            uplift=record["uplift"],
-            verdict=RetroVerdict.model_validate(record["verdict"]),
+            experiment=validated.experiment,
+            baseline=validated.baseline,
+            best_metric=validated.best_metric,
+            uplift=validated.uplift,
+            verdict=validated.verdict,
         )
 
     def to_record(self) -> dict[str, object]:
