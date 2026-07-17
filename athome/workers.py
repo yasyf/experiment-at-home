@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import sys
 import threading
 import traceback
@@ -142,9 +143,11 @@ class PipeWorker:
         return process
 
     async def reap(self, process: Process) -> None:
-        if process.returncode is None:
-            process.kill()
-            await process.wait()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await process.wait()
         if (thread := self.stderr_thread) is not None:
             self.stderr_thread = None
             await anyio.to_thread.run_sync(thread.join, STDERR_JOIN_TIMEOUT)
@@ -154,7 +157,7 @@ class PipeWorker:
             return
         read_fd, write_fd = os.pipe()
         self.process = await anyio.open_process(
-            self.spec.command, stderr=write_fd, cwd=self.spec.cwd, env=self.child_env()
+            self.spec.command, stderr=write_fd, cwd=self.spec.cwd, env=self.child_env(), start_new_session=True
         )
         os.close(write_fd)
         self.stdout = BufferedByteReceiveStream(self.process.stdout)

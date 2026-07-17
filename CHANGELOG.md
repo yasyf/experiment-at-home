@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `PipeWorker` now spawns each sidecar in its own session/process group (`start_new_session=True`) and `reap()` kills the whole group with `os.killpg` rather than signalling only the direct child. A worker launched behind a supervisor that forks without exec — `uv run <worker>` being the common case — previously left the real worker orphaned when only the supervisor was killed: the orphan kept the inherited stdin/stdout/stderr pipe ends open, so teardown of a poisoned worker (a cancelled in-flight `call()`) or a graceful-close timeout leaked the process and stalled on its still-open pipes. Killing the session group reaps the supervisor and its descendants together, so `poison()` and `aclose()` return promptly and leave no orphan.
+
 ## [0.5.0] - 2026-07-15
 
 ### Added

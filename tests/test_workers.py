@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import copyreg
+import os
 import pickle
+import signal
 import sys
-from contextlib import asynccontextmanager
+import time
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -82,6 +85,24 @@ class Handler:
 
 serve(Handler())
 """
+
+GRANDCHILD_SOURCE = """
+import os, time
+from athome.workers import serve
+
+class Handler:
+    def pid(self, payload):
+        return os.getpid()
+    def hang(self, payload):
+        time.sleep(300)
+
+serve(Handler())
+"""
+
+# Spawns the real worker as an inheriting child and waits, the way `uv run` forks without exec.
+SUPERVISOR_SOURCE = (
+    f"import subprocess, sys; sys.exit(subprocess.Popen([sys.executable, '-c', {GRANDCHILD_SOURCE!r}]).wait())"
+)
 
 
 def wire_side_effect(path: str) -> str:
@@ -342,6 +363,32 @@ async def test_call_cancel_poisons_worker_against_stale_reply() -> None:
         assert worker.stdout is None
         assert worker.stderr_thread is None
         assert await worker.call("slow_echo", {"delay": 0.0, "value": "FRESH"}) == "FRESH"
+
+
+async def test_poison_kills_supervisor_wrapped_grandchild() -> None:
+    async def reaped(pid: int) -> bool:
+        for _ in range(100):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            await anyio.sleep(0.02)
+        return False
+
+    worker = PipeWorker(WorkerSpec((sys.executable, "-c", SUPERVISOR_SOURCE)))
+    grandchild = await worker.call("pid", None)
+    try:
+        started = time.monotonic()
+        with anyio.move_on_after(0.1):
+            await worker.call("hang", None)
+        elapsed = time.monotonic() - started
+        assert worker.process is None
+        assert elapsed < 1.0
+        assert await reaped(grandchild)
+    finally:
+        with suppress(ProcessLookupError):
+            os.kill(grandchild, signal.SIGKILL)
+        await worker.aclose()
 
 
 async def test_lease_release_survives_cancel_under_contention() -> None:
