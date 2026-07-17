@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Literal, TypedDict, overload
 
 from anyio import to_thread
 
-from athome.train.spec import SEED, HfDatasetRef, LocalJsonlRef
+from athome.train.spec import SEED, HfDatasetRef, LocalJsonlRef, Rows
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -152,6 +152,8 @@ async def normalize(source: DatasetSource, *, method: Method) -> list[TrainExamp
             return await from_hf(source, method=method)
         case LocalJsonlRef():
             return from_local_jsonl(source, method=method)
+        case Rows():
+            return list(source.examples)
 
 
 async def from_hf(ref: HfDatasetRef, *, method: Method) -> list[TrainExample]:

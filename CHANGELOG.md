@@ -6,6 +6,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-17
+
+### Added
+- **`athome.train.engine`** — the Tinker lane rebuilt from scratch as an ordered op stream over the SDK's clock-cycle model. A schedule is data — `TrainOp` (one optimization step: `forward_backward` + `optim_step` as a single inseparable value, so the sequential await-between-them mistake has no representation), `ScoreOp` (one batched prefill-billed forward), `SnapshotOp` (`save_weights_for_sampler` with optional eval datums scored against those same weights) — and `execute()` is the only code in the package that ever holds an SDK future: it submits each step's pair together before awaiting either, keeps a submit-ahead queue so the worker never idles between steps, and drains results strictly in submission order. One step now costs one clock cycle where the old lock-step loop paid ~3. `projection()` prices a schedule by folding over the same value `execute()` runs, so a run can never bill differently than it projected.
+- **`TinkerBackend.fit(spec, *, sink, checkpoints, eval_rows) -> TrainReport`** — the one training entry point. `CheckpointPolicy` places intermediate snapshots at fractions of the run (7-day TTL; the final save is always taken and kept forever), and pre-tokenized `EvalRow`s are scored against every snapshot's exact weights by riding the op stream — one batched forward per checkpoint instead of hundreds of serial round trips. The report carries per-step `StepRecord`s and per-checkpoint `SavedCheckpoint`s with `ScoredSequence` arrays, so checkpoint selection is caller-side math over evidence, not a second network pass.
+- **`TinkerBackend.materialize` / `fuse` split** — `materialize` downloads a saved checkpoint and converts it to a servable non-fused mlx-lm `Adapter`; `fuse` folds an adapter into the base model as the fused `Checkpoint` when a consumer needs one. Consumers that serve the bare adapter no longer pay a base-model load and multi-GB fuse they never use. `train()` is unchanged in contract: `fit` + `materialize` + `fuse`.
+- **`TinkerBackend.score(path, rows, *, base, max_usd)`** — post-hoc scoring of what Tinker actually serves: a sampling client against any saved checkpoint path, rows fanned out under bounded concurrency, reduced with the same weighted arithmetic as `fit`'s in-train eval so the two are directly comparable (serving-drift checks are a subtraction).
+- **`athome.train.retrain`** — the retrain pipeline shape, hosted: `fit` → argmax a caller-supplied `select` over the saved checkpoints → `materialize` the winner → a caller-supplied `artifact_scorer` reads the local artifact → a caller-supplied `gate` returns the `GateVerdict`. `RetrainOutcome` carries the full evidence chain; `retrain` itself takes no side effect — registration, promotion, and journaling stay with the caller, in the caller's registry.
+- **`athome.train.gate`** (new `gate` extra: numpy, scipy, scikit-learn) — promotion-gate statistics: exact sign test, budget-matched fire thresholds with conservative tie handling, sentinel AUC, and the corrected paired gate. Every score input has an explicit higher-is-fire contract — the silent `1 - p` orientation flips in the donor implementation are gone — and domain strata arrive as one caller-supplied `warranted` mask. Budget matching also fixes a latent donor defect: an integer fire budget no longer round-trips through a per-100 float rate, which could floor away one fire (19 scores at budget 5 fired only 4).
+- **`Rows`** — an in-memory `DatasetSource` for pools the caller already holds, ending the write-a-temp-JSONL detour.
+- `InsufficientData` — a pool smaller than one batch now raises before any billable call (it previously trained silently on an under-filled batch); `OverlongEvalRows` rejects eval rows longer than `max_seq_len` up front.
+
+### Changed
+- **Spend projection is single and complete**: `fit` runs exactly one spend-guard check covering training tokens (twice for DPO's two-pass custom loss), the DPO reference prefill, and every checkpoint's eval prefill — before any client exists. Spend is recorded and journaled only as results drain, in step order.
+- DPO reference logprobs now ride the batched scorer (`ScoreOp` on the frozen client) instead of a per-pair loop, and are fully consumed before the training schedule is compiled.
+- `gather_bounded` moved from `athome.research.judge` to **`athome.concurrency`**, with `concurrency` now a required keyword — no compat re-export.
+
+### Removed
+- `TinkerBackend.run_sft` / `run_dpo` — the lock-step loops are gone; schedule compilers behind `fit()` replaced them, and there is no public surface that can express the sequential shape.
+
 ## [0.5.1] - 2026-07-16
 
 ### Fixed

@@ -20,13 +20,14 @@ import json
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal, NewType, cast
+from typing import TYPE_CHECKING, Literal, NewType
 from uuid import uuid4
 
 import anyio
 from loguru import logger
 from pydantic import BaseModel
 
+from athome.concurrency import gather_bounded
 from athome.research.common import canonical_json
 from athome.research.errors import ResearchError
 from athome.research.golden import GoldenProof, VerifiedManifest
@@ -171,23 +172,6 @@ async def with_backoff[T](call: Callable[[], Awaitable[T]], *, label: str, attem
         if attempt + 1 < attempts:
             await anyio.sleep(BACKOFF_BASE_S * 2**attempt)
     raise JudgeError(f"judge call {label!r} failed after {attempts} attempts") from last
-
-
-async def gather_bounded[T](
-    tasks: Sequence[Callable[[], Awaitable[T]]], *, concurrency: int = DEFAULT_CONCURRENCY
-) -> list[T]:
-    """Run the task factories under a capacity limiter, preserving input order in the results."""
-    results: list[T | None] = [None] * len(tasks)
-    limiter = anyio.CapacityLimiter(concurrency)
-
-    async def one(index: int) -> None:
-        async with limiter:
-            results[index] = await tasks[index]()
-
-    async with anyio.create_task_group() as group:
-        for index in range(len(tasks)):
-            group.start_soon(one, index)
-    return cast("list[T]", results)
 
 
 @dataclass(frozen=True, slots=True)

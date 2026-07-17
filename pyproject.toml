@@ -35,6 +35,7 @@ hf = ["huggingface-hub>=0.26"]
 embed = ["numpy>=2", "sentence-transformers>=3"]
 embed-voyage = ["voyageai>=0.3.7", "numpy>=2"]
 research = ["numpy>=2"]
+gate = ["numpy>=2", "scipy>=1.14.1", "scikit-learn>=1.5"]
 # mlx / mlx-lm run in a uvx sidecar, and trl / peft only exist inside the Modal
 # image — none of those belong in the installed set. transformers does: the tinker
 # path tokenizes prompt/completion (and chosen/rejected) locally through
@@ -52,6 +53,8 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.8",
     "numpy>=2",
+    "scipy>=1.14.1",
+    "scikit-learn>=1.5",
 ]
 
 [project.scripts]

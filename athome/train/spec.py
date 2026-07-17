@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from math import ceil
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, NewType
 
@@ -12,6 +13,7 @@ from athome.errors import AthomeError
 if TYPE_CHECKING:
     from athome.bakeoff import Leaderboard
     from athome.registry import VersionInfo
+    from athome.train.data import SftExample
 
 MlxModelId = NewType("MlxModelId", str)
 TinkerModelId = NewType("TinkerModelId", str)
@@ -32,6 +34,7 @@ STD_MODULES: tuple[str, ...] = (
 ATTN_PREFIX = "self_attn."
 MLP_PREFIX = "mlp."
 SEED = 1729
+INTERMEDIATE_TTL_S = 604_800
 
 
 class UnservableBase(AthomeError):
@@ -40,6 +43,31 @@ class UnservableBase(AthomeError):
 
 class UnsupportedLoraShape(AthomeError):
     """Raised when a :class:`LoraSpec` asks for an adapter the MLX fuse path cannot express."""
+
+
+class InsufficientData(AthomeError):
+    """Raised when the surviving training pool holds fewer examples than one batch.
+
+    Carries the surviving ``count`` so the caller can report how far short the pool fell.
+    It fires before the spend guard reserves anything and before any training client is
+    constructed, so an under-filled run aborts having spent nothing.
+    """
+
+    def __init__(self, count: int, batch_size: int) -> None:
+        self.count = count
+        super().__init__(f"{count} surviving examples cannot fill a batch of {batch_size}")
+
+
+class OverlongEvalRows(AthomeError):
+    """Raised when any eval row exceeds ``max_seq_len``; the whole frozen set fails up-front.
+
+    Carries how many rows overran, checked before any billable call so an ill-sized eval
+    set never rides a snapshot's prefill.
+    """
+
+    def __init__(self, count: int, max_seq_len: int) -> None:
+        self.count = count
+        super().__init__(f"{count} eval rows exceed max_seq_len={max_seq_len}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +150,18 @@ class LocalJsonlRef:
     path: Path
 
 
-type DatasetSource = HfDatasetRef | LocalJsonlRef
+@dataclass(frozen=True, slots=True)
+class Rows:
+    """An in-memory SFT corpus: examples a caller already holds, with no jsonl detour.
+
+    Attributes:
+        examples: The SFT examples to train on directly.
+    """
+
+    examples: tuple[SftExample, ...]
+
+
+type DatasetSource = HfDatasetRef | LocalJsonlRef | Rows
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +234,54 @@ class Hyperparams:
 
 
 @dataclass(frozen=True, slots=True)
+class EvalRow:
+    """A pre-tokenized weighted scoring row, mapping one-to-one onto a Tinker ``Datum``.
+
+    The row's ``tokens`` are the full sequence; the weight-carrying positions are the ones a
+    checkpoint's forward pass scores. Unlike a message-level example, this can weight a single
+    sentinel-token position, which is what a next-token discriminator scores.
+
+    Attributes:
+        tokens: The full token sequence, prompt and completion.
+        weights: One weight per token; a nonzero weight marks a scored position.
+    """
+
+    tokens: tuple[int, ...]
+    weights: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointPolicy:
+    """Which fractions of a run to snapshot as intermediate checkpoints, and for how long.
+
+    The final step is always snapshotted separately and kept forever; these fractions place the
+    intermediate saves before it. ``at`` holds fractions in ``(0, 1]``, strictly increasing.
+
+    Example:
+        >>> CheckpointPolicy(at=(0.25, 0.5, 0.75)).steps_for(12)
+        (3, 6, 9)
+    """
+
+    at: tuple[float, ...] = ()
+    ttl_seconds: int = INTERMEDIATE_TTL_S
+
+    def __post_init__(self) -> None:
+        if any(not (0.0 < fraction <= 1.0) for fraction in self.at):
+            raise ValueError(f"checkpoint fractions must lie in (0, 1]: {self.at}")
+        if list(self.at) != sorted(set(self.at)):
+            raise ValueError(f"checkpoint fractions must be strictly increasing and unique: {self.at}")
+
+    def steps_for(self, total: int) -> tuple[int, ...]:
+        """The intermediate step numbers for a run of ``total`` steps, ascending and unique.
+
+        Each fraction rounds up to at least step 1; the final step is excluded because it is
+        always snapshotted on its own. Fractions that collapse onto the same step or onto the
+        final step drop out.
+        """
+        return tuple(sorted({max(1, ceil(fraction * total)) for fraction in self.at} - {total}))
+
+
+@dataclass(frozen=True, slots=True)
 class TrainSpec:
     """One fine-tuning request, backend-agnostic.
 
@@ -230,13 +317,29 @@ def spend_cap(spec: TrainSpec, default: float) -> float:
 
 
 @dataclass(frozen=True, slots=True)
+class Adapter:
+    """A materialized non-fused MLX adapter that can be served or fused later.
+
+    Attributes:
+        step: The training step whose weights this adapter carries.
+        adapter_dir: The mlx-lm adapter directory.
+        train_cost_usd: What the training run spent to produce the saved weights.
+    """
+
+    step: int
+    adapter_dir: Path
+    train_cost_usd: float
+
+
+@dataclass(frozen=True, slots=True)
 class Checkpoint:
     """The servable artifact one backend produced: a standalone 4-bit MLX model directory.
 
     ``mlx_path`` is the only serve path — ``rapid-mlx serve`` takes a single model
     and has no adapter flag, so every backend fuses its LoRA into the base.
     ``adapter_dir`` is the intermediate adapter kept for provenance (tinker and
-    modal train a PEFT adapter first); it is never served.
+    modal train a PEFT adapter first); consumers with adapter support can also
+    serve it directly.
 
     Attributes:
         base: The base model the LoRA was trained over.
@@ -255,6 +358,81 @@ class Checkpoint:
     mlx_path: Path
     adapter_dir: Path | None
     train_cost_usd: float
+
+
+@dataclass(frozen=True, slots=True)
+class ScoredSequence:
+    """One eval row's score against a checkpoint's weights.
+
+    Attributes:
+        logprob: The weighted sum of per-token logprobs over the scored positions.
+        weight: The exact weight mass, so a caller can normalize ``logprob`` per scored weight.
+    """
+
+    logprob: float
+    weight: float
+
+
+@dataclass(frozen=True, slots=True)
+class SavedCheckpoint:
+    """A Tinker sampler checkpoint saved mid-run, with its eval scores against those weights.
+
+    Attributes:
+        step: The training step whose weights this snapshot captured.
+        path: The opaque ``tinker://`` address the weights were saved to.
+        final: True for the run's last checkpoint, which is kept forever.
+        scores: The eval rows scored against these weights, order-preserving, or None when
+            the run carried no eval rows.
+    """
+
+    step: int
+    path: str
+    final: bool
+    scores: tuple[ScoredSequence, ...] | None
+
+
+@dataclass(frozen=True, slots=True)
+class StepRecord:
+    """One training step's telemetry.
+
+    Attributes:
+        step: The one-based step number.
+        tokens: The step's trained token count.
+        usd: What this step alone cost, not the running total.
+        metrics: The loss and any method-specific metrics (SFT ``loss``; DPO
+            ``loss``/``margin``/``accuracy``).
+    """
+
+    step: int
+    tokens: int
+    usd: float
+    metrics: dict[str, float]
+
+
+@dataclass(frozen=True, slots=True)
+class TrainReport:
+    """Everything one ``fit`` produced: its per-step records and its saved checkpoints.
+
+    Attributes:
+        method: The method trained.
+        steps: The per-step records, ascending.
+        checkpoints: The saved checkpoints, ascending by step; the last is the final.
+        dropped: How many examples were dropped for exceeding ``max_seq_len``.
+        wall_s: Wall-clock seconds spent executing the schedule.
+        train_cost_usd: The run's total metered spend.
+    """
+
+    method: Method
+    steps: tuple[StepRecord, ...]
+    checkpoints: tuple[SavedCheckpoint, ...]
+    dropped: int
+    wall_s: float
+    train_cost_usd: float
+
+    @property
+    def final(self) -> SavedCheckpoint:
+        """The run's final checkpoint."""
+        return self.checkpoints[-1]
 
 
 @dataclass(frozen=True, slots=True)

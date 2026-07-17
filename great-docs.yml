@@ -171,13 +171,26 @@ reference:
       - train.TrainSpec
       - train.TrainResult
       - train.Checkpoint
+      - train.Adapter
       - train.BaseModelSpec
       - train.Hyperparams
       - train.LoraSpec
       - train.HfDatasetRef
       - train.LocalJsonlRef
+      - train.Rows
       - train.TrainSettings
+      - train.TinkerSettings
+      - train.TinkerPrice
       - train.TrainBackend
+      - train.tinker.TinkerBackend
+      - train.CheckpointPolicy
+      - train.EvalRow
+      - train.ScoredSequence
+      - train.SavedCheckpoint
+      - train.StepRecord
+      - train.TrainReport
+      - train.retrain
+      - train.RetrainOutcome
       - train.run
       - train.evaluate
       - train.register
@@ -189,6 +202,32 @@ reference:
       - train.NoBackendAvailable
       - train.UnservableBase
       - train.UnsupportedLoraShape
+      - train.InsufficientData
+      - train.OverlongEvalRows
+  - title: Tinker engine
+    desc: The ordered op stream over Tinker's clock-cycle model — forward/backward and optimizer step as one inseparable op, submit-ahead execution, and a cost projection folded over the same schedule the executor runs.
+    contents:
+      - train.engine.TrainOp
+      - train.engine.ScoreOp
+      - train.engine.SnapshotOp
+      - train.engine.CrossEntropy
+      - train.engine.Custom
+      - train.engine.TrainDone
+      - train.engine.ScoreDone
+      - train.engine.SnapshotDone
+      - train.engine.execute
+      - train.engine.projection
+      - train.engine.token_count
+  - title: Gate
+    desc: Promotion-gate statistics with an explicit higher-is-fire contract; behind the gate extra.
+    contents:
+      - train.gate.GateVerdict
+      - train.gate.GateResult
+      - train.gate.corrected_gate
+      - train.gate.sentinel_auc
+      - train.gate.sign_test_p
+      - train.gate.threshold_for_budget
+      - train.gate.matched_fire_mask
   - title: OCR types
     desc: Protocols for token- and document-level OCR engines.
     contents:

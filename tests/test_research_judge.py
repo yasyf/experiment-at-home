@@ -4,7 +4,6 @@ import hashlib
 import inspect
 from typing import TYPE_CHECKING
 
-import anyio
 import pytest
 
 from athome.research import judge as judge_mod
@@ -38,7 +37,6 @@ from athome.research.judge import (
     coin,
     ensure_cross_family,
     family_of,
-    gather_bounded,
     judge_candidates,
     pairwise_vote,
     run_controls,
@@ -732,14 +730,6 @@ async def test_with_backoff_exhausts_and_raises_judge_error(monkeypatch: pytest.
 
     with pytest.raises(JudgeError, match="after 2 attempts"):
         await with_backoff(call, label="t", attempts=2)
-
-
-async def test_gather_bounded_preserves_input_order() -> None:
-    async def make(index: int) -> int:
-        await anyio.sleep(0)
-        return index
-
-    assert await gather_bounded([lambda i=i: make(i) for i in range(10)], concurrency=3) == list(range(10))
 
 
 @pytest.mark.live

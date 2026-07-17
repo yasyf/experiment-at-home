@@ -690,6 +690,8 @@ dev = [
     { name = "numpy" },
     { name = "pytest" },
     { name = "ruff" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
 ]
 embed = [
     { name = "numpy" },
@@ -698,6 +700,11 @@ embed = [
 embed-voyage = [
     { name = "numpy" },
     { name = "voyageai" },
+]
+gate = [
+    { name = "numpy" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
 ]
 hf = [
     { name = "huggingface-hub" },
@@ -751,6 +758,7 @@ requires-dist = [
     { name = "numpy", marker = "extra == 'dev'", specifier = ">=2" },
     { name = "numpy", marker = "extra == 'embed'", specifier = ">=2" },
     { name = "numpy", marker = "extra == 'embed-voyage'", specifier = ">=2" },
+    { name = "numpy", marker = "extra == 'gate'", specifier = ">=2" },
     { name = "numpy", marker = "extra == 'research'", specifier = ">=2" },
     { name = "ocrmac", marker = "extra == 'ocr'", specifier = ">=1.0" },
     { name = "openai", marker = "extra == 'serve'", specifier = ">=1.50" },
@@ -758,6 +766,10 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.10" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8" },
+    { name = "scikit-learn", marker = "extra == 'dev'", specifier = ">=1.5" },
+    { name = "scikit-learn", marker = "extra == 'gate'", specifier = ">=1.5" },
+    { name = "scipy", marker = "extra == 'dev'", specifier = ">=1.14.1" },
+    { name = "scipy", marker = "extra == 'gate'", specifier = ">=1.14.1" },
     { name = "sentence-transformers", marker = "extra == 'embed'", specifier = ">=3" },
     { name = "spawnllm", marker = "extra == 'llm'", specifier = ">=0.6.1" },
     { name = "tinker", marker = "extra == 'train'", specifier = ">=0.22" },
@@ -765,7 +777,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'train'", specifier = ">=4.42" },
     { name = "voyageai", marker = "extra == 'embed-voyage'", specifier = ">=0.3.7" },
 ]
-provides-extras = ["serve", "llm", "ocr", "modal", "hf", "embed", "embed-voyage", "research", "train", "train-dpo", "dev"]
+provides-extras = ["serve", "llm", "ocr", "modal", "hf", "embed", "embed-voyage", "research", "gate", "train", "train-dpo", "dev"]
 
 [package.metadata.requires-dev]
 docs = [

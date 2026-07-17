@@ -6,25 +6,29 @@ import importlib.util
 import inspect
 import json
 import math
-import sys
 import tarfile
-from dataclasses import dataclass, field
-from types import ModuleType
 from typing import TYPE_CHECKING
 
+import anyio
 import httpx
 import pytest
 
 from athome.config import load
-from athome.llm.spend import SpendExceeded
+from athome.llm.spend import SpendExceeded, SpendGuard
 from athome.progress import RunSink, load_journal
 from athome.train import data, sidecar, tinker
 from athome.train.spec import (
     BASE_MODELS,
     STD_MODULES,
+    Adapter,
+    CheckpointPolicy,
+    EvalRow,
     Hyperparams,
+    InsufficientData,
     LocalJsonlRef,
     LoraSpec,
+    OverlongEvalRows,
+    SavedCheckpoint,
     TinkerModelId,
     TrainSpec,
 )
@@ -37,171 +41,65 @@ from athome.train.tinker import (
     UnsupportedLoraShape,
     download_adapter,
     dpo_loss,
+    score_sequence,
     tinker_lora,
+)
+from tests import tinker_fakes
+from tests.tinker_fakes import (
+    CANNED,
+    LOGPROB,
+    Boom,
+    FakeAdamParams,
+    FakeModelInput,
+    FakeService,
+    FakeTokenizer,
+    FakeUrl,
+    install_sdk,
+    make_datum,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Iterator, Sequence
     from pathlib import Path
+    from types import ModuleType
 
     from athome.train.data import TinkerPreference
     from athome.train.spec import Method
 
-LOGPROB = -0.5
-CANNED = {"loss": 0.61, "margin": 0.2, "accuracy": 1.0}
-type LossFn = Callable[..., tuple[object, dict[str, float]]]
+
+@dataclasses.dataclass(slots=True)
+class FakeSampling:
+    outputs: dict[tuple[int, ...], list[float | None]] = dataclasses.field(default_factory=dict)
+    calls: list[tuple[int, ...]] = dataclasses.field(default_factory=list)
+    finished: list[tuple[int, ...]] = dataclasses.field(default_factory=list)
+    slow: tuple[int, ...] | None = None
+    release: anyio.Event | None = None
+
+    async def compute_logprobs_async(self, prompt: FakeModelInput) -> list[float | None]:
+        key = tuple(prompt.ids)
+        self.calls.append(key)
+        if self.release is not None:
+            if key == self.slow:
+                await self.release.wait()
+            else:
+                self.release.set()
+        self.finished.append(key)
+        return self.outputs.get(key, [None, *([LOGPROB] * (len(key) - 1))])
 
 
-@dataclass(frozen=True, slots=True)
-class FakeTensor:
-    data: list[float] | list[int]
-    dtype: str
-    shape: list[int]
+@dataclasses.dataclass(slots=True)
+class FakeSamplingService(FakeService):
+    sampling: FakeSampling = dataclasses.field(default_factory=FakeSampling)
+    sampling_paths: list[str] = dataclasses.field(default_factory=list)
 
-
-@dataclass(frozen=True, slots=True)
-class FakeModelInput:
-    ids: list[int]
-
-    @staticmethod
-    def from_ints(ids: list[int]) -> FakeModelInput:
-        return FakeModelInput(ids)
-
-    @property
-    def length(self) -> int:
-        return len(self.ids)
-
-
-@dataclass(frozen=True, slots=True)
-class FakeDatum:
-    model_input: FakeModelInput
-    loss_fn_inputs: dict[str, FakeTensor]
-
-
-@dataclass(frozen=True, slots=True)
-class FakeAdamParams:
-    learning_rate: float
-
-
-@dataclass(frozen=True, slots=True)
-class FakeFuture[T]:
-    value: T
-
-    async def result_async(self) -> T:
-        return self.value
-
-
-@dataclass(frozen=True, slots=True)
-class FakeOutput:
-    loss_fn_outputs: list[dict[str, FakeTensor]]
-    metrics: dict[str, float] = field(default_factory=dict)
-
-
-@dataclass(frozen=True, slots=True)
-class FakeSaved:
-    path: str
-
-
-@dataclass(frozen=True, slots=True)
-class FakeUrl:
-    url: str
-
-
-@dataclass(frozen=True, slots=True)
-class CustomCall:
-    datums: list[FakeDatum]
-    loss_fn: LossFn
-    loss_type_input: str
-
-
-def logprobs_for(datums: Sequence[FakeDatum]) -> list[dict[str, FakeTensor]]:
-    return [
-        {
-            "logprobs": FakeTensor(
-                data=[LOGPROB] * len(datum.loss_fn_inputs["target_tokens"].data),
-                dtype="float32",
-                shape=[len(datum.loss_fn_inputs["target_tokens"].data)],
-            )
-        }
-        for datum in datums
-    ]
-
-
-@dataclass(slots=True)
-class FakeTraining:
-    """Records every call and answers each forward with a flat ``LOGPROB`` per target token."""
-
-    base_model: str
-    rank: int
-    seed: int
-    toggles: tuple[bool, bool, bool]
-    forward_backward: list[tuple[list[FakeDatum], str]] = field(default_factory=list)
-    custom: list[CustomCall] = field(default_factory=list)
-    forward: list[list[FakeDatum]] = field(default_factory=list)
-    optim: list[FakeAdamParams] = field(default_factory=list)
-    saved: list[str] = field(default_factory=list)
-
-    async def forward_backward_async(self, datums: list[FakeDatum], loss_fn: str) -> FakeFuture[FakeOutput]:
-        self.forward_backward.append((datums, loss_fn))
-        return FakeFuture(FakeOutput(logprobs_for(datums)))
-
-    async def forward_async(self, datums: list[FakeDatum], loss_fn: str) -> FakeFuture[FakeOutput]:
-        self.forward.append(datums)
-        return FakeFuture(FakeOutput(logprobs_for(datums)))
-
-    async def forward_backward_custom_async(
-        self, datums: list[FakeDatum], loss_fn: LossFn, *, loss_type_input: str = "logprobs"
-    ) -> FakeFuture[FakeOutput]:
-        self.custom.append(CustomCall(datums, loss_fn, loss_type_input))
-        return FakeFuture(FakeOutput(logprobs_for(datums), metrics=dict(CANNED)))
-
-    async def optim_step_async(self, adam_params: FakeAdamParams) -> FakeFuture[None]:
-        self.optim.append(adam_params)
-        return FakeFuture(None)
-
-    async def save_weights_for_sampler_async(self, name: str) -> FakeFuture[FakeSaved]:
-        self.saved.append(name)
-        return FakeFuture(FakeSaved(f"tinker://run/{name}"))
-
-
-@dataclass(slots=True)
-class FakeService:
-    api_key: str
-    clients: list[FakeTraining] = field(default_factory=list)
-
-    async def create_lora_training_client_async(
-        self, base_model: str, rank: int, seed: int, train_mlp: bool, train_attn: bool, train_unembed: bool
-    ) -> FakeTraining:
-        """Tinker's trainer takes a rank and the three toggles — no alpha, dropout, or module list."""
-        self.clients.append(
-            FakeTraining(base_model=base_model, rank=rank, seed=seed, toggles=(train_mlp, train_attn, train_unembed))
-        )
-        return self.clients[-1]
-
-
-class FakeTokenizer:
-    """A char-level chat tokenizer: the templated prompt is always a prefix of the full text."""
-
-    def apply_chat_template(
-        self, messages: list[dict[str, str]], *, tokenize: bool, add_generation_prompt: bool, enable_thinking: bool
-    ) -> str:
-        rendered = "".join(f"<{message['role']}>{message['content']}" for message in messages)
-        return f"{rendered}<assistant>" if add_generation_prompt else rendered
-
-    def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
-        return [ord(char) for char in text]
+    def create_sampling_client(self, model_path: str) -> FakeSampling:
+        self.sampling_paths.append(model_path)
+        return self.sampling
 
 
 @pytest.fixture(autouse=True)
 def sdk(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
-    module = ModuleType("tinker")
-    module.__spec__ = importlib.machinery.ModuleSpec("tinker", None)
-    module.Datum = FakeDatum
-    module.ModelInput = FakeModelInput
-    module.TensorData = FakeTensor
-    module.AdamParams = FakeAdamParams
-    monkeypatch.setitem(sys.modules, "tinker", module)
-    return module
+    return install_sdk(monkeypatch)
 
 
 @pytest.fixture(autouse=True)
@@ -222,6 +120,13 @@ def tinker_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None
 @pytest.fixture
 def service(sdk: ModuleType) -> FakeService:
     instance = FakeService("sk-tinker-test")
+    sdk.ServiceClient = lambda api_key: instance
+    return instance
+
+
+@pytest.fixture
+def sampling_service(sdk: ModuleType) -> FakeSamplingService:
+    instance = FakeSamplingService("sk-tinker-test")
     sdk.ServiceClient = lambda api_key: instance
     return instance
 
@@ -298,6 +203,14 @@ def sink(tmp_path: Path) -> RunSink:
     return RunSink.open(tmp_path / "run.jsonl")
 
 
+def step_records(path: Path) -> list[dict[str, object]]:
+    return [record for record in load_journal(path) if record.get("event") != "checkpoint"]
+
+
+def checkpoint_events(path: Path) -> list[dict[str, object]]:
+    return [record for record in load_journal(path) if record.get("event") == "checkpoint"]
+
+
 async def pairs_of(request: TrainSpec) -> list[TinkerPreference]:
     return [
         data.render_tinker_dpo(example, request.base.mlx)
@@ -305,7 +218,7 @@ async def pairs_of(request: TrainSpec) -> list[TinkerPreference]:
     ]
 
 
-def completion_of(datum: FakeDatum) -> str:
+def completion_of(datum: object) -> str:
     return bytes(
         token
         for token, weight in zip(datum.loss_fn_inputs["target_tokens"].data, tinker.weights_of(datum), strict=True)
@@ -326,8 +239,10 @@ def show(monkeypatch: pytest.MonkeyPatch, present: str) -> None:
     ways in a run that does not have it — the free-threaded job installs no torch.
     """
     real = importlib.util.find_spec
-    spec = importlib.machinery.ModuleSpec(present, None)
-    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *args: spec if name == present else real(name, *args))
+    module_spec = importlib.machinery.ModuleSpec(present, None)
+    monkeypatch.setattr(
+        importlib.util, "find_spec", lambda name, *args: module_spec if name == present else real(name, *args)
+    )
 
 
 def test_supports_sft_always_and_the_name_is_stable() -> None:
@@ -402,7 +317,7 @@ async def test_sft_runs_cross_entropy_and_one_optim_step_per_step(
     assert [loss_fn for _, loss_fn in training.forward_backward] == ["cross_entropy"] * 3
     assert [len(batch) for batch, _ in training.forward_backward] == [2, 2, 2]
     assert training.optim == [FakeAdamParams(learning_rate=2e-4)] * 3
-    assert training.saved == ["watcher-sft-3"]
+    assert training.saves == [("watcher-sft-3", None)]
     assert [completion_of(datum) for batch, _ in training.forward_backward for datum in batch] == ["yes"] * 6
     assert (checkpoint.method, checkpoint.step, checkpoint.backend) == ("sft", 3, "tinker")
 
@@ -416,7 +331,7 @@ async def test_sft_journals_loss_tokens_and_running_spend(
         spec(corpus(tmp_path, method="sft")), sink=run, work_dir=tmp_path / "run"
     )
 
-    records = load_journal(run.path)
+    records = step_records(run.path)
     tokens = [tinker.token_count(batch) for batch, _ in service.clients[0].forward_backward]
     assert [record["step"] for record in records] == [1, 2, 3]
     assert [record["loss"] for record in records] == [-LOGPROB] * 3
@@ -440,10 +355,11 @@ async def test_over_long_examples_never_reach_a_batch(
     )
     request = spec(LocalJsonlRef(path=path), hyperparams=Hyperparams(steps=2, batch_size=1, max_seq_len=32))
 
-    await TinkerBackend.from_settings().train(request, sink=sink(tmp_path), work_dir=tmp_path / "run")
+    report = await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path))
 
     lengths = {datum.model_input.length for batch, _ in service.clients[0].forward_backward for datum in batch}
     assert lengths == {len("<user>q<assistant>ok") - 1}
+    assert report.dropped == 1
 
 
 async def test_the_spend_cap_aborts_before_any_billable_call(
@@ -534,6 +450,130 @@ async def test_the_toggles_reach_the_trainer_and_no_requested_shape_reaches_the_
     assert "lora" not in inspect.signature(sidecar.convert_peft_to_mlx).parameters
 
 
+async def test_an_under_filled_pool_aborts_before_the_guard_and_client(
+    service: FakeService, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The InsufficientData floor precedes the spend guard and any client, and carries the count."""
+    checked: list[float] = []
+
+    async def spy_check(self: SpendGuard, projected: float) -> None:
+        checked.append(projected)
+
+    monkeypatch.setattr(SpendGuard, "check", spy_check)
+    request = spec(
+        corpus(tmp_path, method="sft", rows=2), hyperparams=Hyperparams(steps=3, batch_size=4, max_seq_len=64)
+    )
+
+    with pytest.raises(InsufficientData) as raised:
+        await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path))
+
+    assert raised.value.count == 2
+    assert service.clients == []
+    assert checked == []
+
+
+async def test_an_overlong_eval_row_fails_the_whole_set_up_front(service: FakeService, tmp_path: Path) -> None:
+    rows = (
+        EvalRow(tokens=tuple(range(100)), weights=(0.0,) * 99 + (1.0,)),
+        EvalRow(tokens=(1, 2, 3), weights=(0.0, 0.0, 1.0)),
+    )
+    request = spec(corpus(tmp_path, method="sft"), hyperparams=Hyperparams(steps=3, batch_size=2, max_seq_len=32))
+
+    with pytest.raises(OverlongEvalRows) as raised:
+        await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path), eval_rows=rows)
+
+    assert raised.value.count == 1
+    assert service.clients == []
+
+
+async def test_fit_snapshots_at_the_cadence_with_names_ttls_and_eval_scores(
+    service: FakeService, tmp_path: Path
+) -> None:
+    rows = (EvalRow(tokens=(10, 20, 30), weights=(0.0, 0.0, 1.0)),)
+    request = spec(
+        corpus(tmp_path, method="sft", rows=8), hyperparams=Hyperparams(steps=4, batch_size=2, max_seq_len=64)
+    )
+
+    report = await TinkerBackend.from_settings().fit(
+        request, sink=sink(tmp_path), checkpoints=CheckpointPolicy(at=(0.5,)), eval_rows=rows
+    )
+
+    assert service.clients[0].saves == [("watcher-step00002", 604_800), ("watcher-sft-4", None)]
+    assert [(checkpoint.step, checkpoint.final) for checkpoint in report.checkpoints] == [(2, False), (4, True)]
+    assert report.final.step == 4
+    assert all(checkpoint.scores is not None and len(checkpoint.scores) == 1 for checkpoint in report.checkpoints)
+    assert report.final.scores[0].logprob == pytest.approx(LOGPROB)
+    assert report.final.scores[0].weight == 1.0
+
+
+async def test_the_sink_interleaves_step_records_and_checkpoint_events_in_order(
+    service: FakeService, tmp_path: Path
+) -> None:
+    run = sink(tmp_path)
+    request = spec(
+        corpus(tmp_path, method="sft", rows=8), hyperparams=Hyperparams(steps=4, batch_size=2, max_seq_len=64)
+    )
+
+    await TinkerBackend.from_settings().fit(request, sink=run, checkpoints=CheckpointPolicy(at=(0.5,)))
+
+    kinds = ["checkpoint" if record.get("event") == "checkpoint" else "step" for record in load_journal(run.path)]
+    assert kinds == ["step", "step", "checkpoint", "step", "step", "checkpoint"]
+    costs = [record["cost_usd"] for record in step_records(run.path)]
+    assert costs == sorted(costs)
+    assert len(set(costs)) == len(costs)
+    assert [event["step"] for event in checkpoint_events(run.path)] == [2, 4]
+    assert [event["final"] for event in checkpoint_events(run.path)] == [False, True]
+
+
+async def test_the_report_orders_checkpoints_and_totals_the_spend(service: FakeService, tmp_path: Path) -> None:
+    request = spec(
+        corpus(tmp_path, method="sft", rows=8), hyperparams=Hyperparams(steps=4, batch_size=2, max_seq_len=64)
+    )
+
+    report = await TinkerBackend.from_settings().fit(
+        request, sink=sink(tmp_path), checkpoints=CheckpointPolicy(at=(0.25, 0.75))
+    )
+
+    assert [checkpoint.step for checkpoint in report.checkpoints] == [1, 3, 4]
+    assert report.final is report.checkpoints[-1]
+    assert report.checkpoints[-1].final
+    assert not any(checkpoint.final for checkpoint in report.checkpoints[:-1])
+    assert report.train_cost_usd == pytest.approx(sum(record.tokens for record in report.steps) / 1e6 * 0.40)
+    assert (report.method, report.dropped, len(report.steps)) == ("sft", 0, 4)
+
+
+async def test_eval_prefill_is_billed_into_the_run_cost(service: FakeService, tmp_path: Path) -> None:
+    rows = (EvalRow(tokens=(1, 2, 3, 4, 5), weights=(0.0, 0.0, 0.0, 0.0, 1.0)),)
+    request = spec(
+        corpus(tmp_path, method="sft", rows=8), hyperparams=Hyperparams(steps=2, batch_size=2, max_seq_len=64)
+    )
+
+    report = await TinkerBackend.from_settings().fit(
+        request, sink=sink(tmp_path), checkpoints=CheckpointPolicy(at=(0.5,)), eval_rows=rows
+    )
+
+    train_tokens = sum(record.tokens for record in report.steps)
+    eval_tokens = 4 * len(report.checkpoints)
+    assert report.train_cost_usd == pytest.approx((train_tokens * 0.40 + eval_tokens * 0.13) / 1e6)
+
+
+async def test_a_mid_stream_failure_leaves_the_sink_with_only_the_drained_steps(
+    sdk: ModuleType, tmp_path: Path
+) -> None:
+    instance = FakeService("sk-tinker-test", fail_fb=3)
+    sdk.ServiceClient = lambda api_key: instance
+    run = sink(tmp_path)
+    request = spec(
+        corpus(tmp_path, method="sft", rows=8), hyperparams=Hyperparams(steps=5, batch_size=2, max_seq_len=64)
+    )
+
+    with pytest.raises(Boom):
+        await TinkerBackend.from_settings().fit(request, sink=run)
+
+    assert [record["step"] for record in step_records(run.path)] == [1, 2]
+    assert checkpoint_events(run.path) == []
+
+
 async def test_dpo_scores_against_a_frozen_reference_client(
     service: FakeService, converged: dict[str, object], torch_present: None, tmp_path: Path
 ) -> None:
@@ -580,7 +620,7 @@ async def test_dpo_journals_the_custom_loss_metrics(
         spec(corpus(tmp_path, method="dpo"), method="dpo"), sink=run, work_dir=tmp_path / "run"
     )
 
-    records = load_journal(run.path)
+    records = step_records(run.path)
     assert [record["step"] for record in records] == [1, 2, 3]
     assert all(record["method"] == "dpo" for record in records)
     assert all(record["loss"] == CANNED["loss"] and record["margin"] == CANNED["margin"] for record in records)
@@ -627,21 +667,11 @@ async def test_sft_runs_without_torch(
     assert checkpoint.method == "sft"
 
 
-def datum_of(length: int) -> FakeDatum:
-    return FakeDatum(
-        model_input=FakeModelInput([1] * length),
-        loss_fn_inputs={
-            "target_tokens": FakeTensor([1] * length, "int64", [length]),
-            "weights": FakeTensor([1.0] * length, "float32", [length]),
-        },
-    )
-
-
 def test_dpo_loss_is_the_log_sigmoid_of_the_reference_corrected_margin() -> None:
     torch = pytest.importorskip("torch")
     logprobs = [torch.tensor([-1.0], requires_grad=True), torch.tensor([-2.0], requires_grad=True)]
 
-    loss, metrics = dpo_loss([datum_of(1), datum_of(1)], logprobs, reference=[-1.5, -1.5], beta=0.1)
+    loss, metrics = dpo_loss([make_datum(1), make_datum(1)], logprobs, reference=[-1.5, -1.5], beta=0.1)
 
     margin = 0.1 * ((-1.0 - -1.5) - (-2.0 - -1.5))
     assert margin == pytest.approx(0.1)
@@ -655,7 +685,7 @@ def test_a_better_than_reference_chosen_lowers_the_dpo_loss() -> None:
 
     def loss_for(chosen: float) -> float:
         logprobs = [torch.tensor([chosen], requires_grad=True), torch.tensor([-2.0], requires_grad=True)]
-        return dpo_loss([datum_of(1), datum_of(1)], logprobs, reference=[-1.5, -1.5], beta=0.1)[0].item()
+        return dpo_loss([make_datum(1), make_datum(1)], logprobs, reference=[-1.5, -1.5], beta=0.1)[0].item()
 
     assert loss_for(-0.5) < loss_for(-1.0) < loss_for(-1.6)
     assert loss_for(-1.5) == pytest.approx(math.log1p(math.exp(-0.1 * 0.5)), rel=1e-5)
@@ -665,7 +695,7 @@ def test_the_surrogate_weights_push_chosen_up_and_rejected_down() -> None:
     torch = pytest.importorskip("torch")
     logprobs = [torch.tensor([-1.0, -1.0], requires_grad=True), torch.tensor([-1.0, -1.0], requires_grad=True)]
 
-    loss, metrics = dpo_loss([datum_of(2), datum_of(2)], logprobs, reference=[-1.0, -1.0], beta=BETA)
+    loss, metrics = dpo_loss([make_datum(2), make_datum(2)], logprobs, reference=[-1.0, -1.0], beta=BETA)
     loss.backward()
 
     assert loss.item() == pytest.approx(-math.log(0.5), rel=1e-5)
@@ -674,6 +704,40 @@ def test_the_surrogate_weights_push_chosen_up_and_rejected_down() -> None:
     assert all(weight > 0 for weight in chosen.tolist())
     assert all(weight < 0 for weight in rejected.tolist())
     assert chosen.tolist() == pytest.approx([-weight for weight in rejected.tolist()])
+
+
+def test_score_sequence_carries_the_exact_fractional_weight_mass() -> None:
+    scored = score_sequence([0.0, -1.0, -2.0], [0.0, 0.25, 0.25])
+
+    assert scored.weight == 0.5
+
+
+async def test_materialize_converts_any_saved_checkpoint_without_fusing(
+    service: FakeService, converged: dict[str, object], tmp_path: Path
+) -> None:
+    request = spec(corpus(tmp_path, method="sft"))
+    saved = SavedCheckpoint(step=2, path="tinker://run/watcher-step00002", final=False, scores=None)
+
+    adapter = await TinkerBackend.from_settings().materialize(saved, request, work_dir=tmp_path / "run", cost=1.25)
+
+    assert adapter == Adapter(step=2, adapter_dir=tmp_path / "run" / "adapter", train_cost_usd=1.25)
+    assert converged["tinker_path"] == saved.path
+    assert converged["peft"] == tmp_path / "run" / "peft"
+    assert converged["convert_from"] == tmp_path / "run" / "peft"
+    assert "fuse_from" not in converged
+
+
+async def test_fuse_preserves_the_materialized_adapter_step(converged: dict[str, object], tmp_path: Path) -> None:
+    request = spec(corpus(tmp_path, method="sft"))
+    adapter = Adapter(step=2, adapter_dir=tmp_path / "adapter", train_cost_usd=1.25)
+
+    checkpoint = await TinkerBackend.from_settings().fuse(adapter, request, work_dir=tmp_path / "run")
+
+    assert checkpoint.step == adapter.step
+    assert checkpoint.adapter_dir == adapter.adapter_dir
+    assert checkpoint.mlx_path == tmp_path / "run" / "mlx"
+    assert checkpoint.train_cost_usd == adapter.train_cost_usd
+    assert converged["fuse_from"] == adapter.adapter_dir
 
 
 async def test_the_checkpoint_fuses_the_downloaded_adapter_into_mlx(
@@ -691,6 +755,113 @@ async def test_the_checkpoint_fuses_the_downloaded_adapter_into_mlx(
     assert checkpoint.mlx_path == run / "mlx"
     assert checkpoint.adapter_dir == run / "adapter"
     assert checkpoint.base == BASE_MODELS["qwen3-8b"]
+
+
+async def test_score_preserves_row_order_and_reduces_the_shifted_token_positions(
+    sampling_service: FakeSamplingService,
+) -> None:
+    rows = (
+        EvalRow(tokens=(1, 2, 3, 4), weights=(7.0, 0.0, 2.0, 1.0)),
+        EvalRow(tokens=(9, 8, 7), weights=(4.0, 1.0, 3.0)),
+    )
+    first, second = (row.tokens for row in rows)
+    sampling_service.sampling.outputs = {
+        first: [None, -0.1, -0.2, -0.3],
+        second: [None, -0.4, -0.5],
+    }
+    sampling_service.sampling.slow = first
+    sampling_service.sampling.release = anyio.Event()
+
+    scores = await TinkerBackend.from_settings().score("tinker://run/step2", rows, base=BASE_MODELS["qwen3-8b"])
+
+    assert sampling_service.sampling.finished == [second, first]
+    assert sampling_service.sampling_paths == ["tinker://run/step2"]
+    assert [score.logprob for score in scores] == pytest.approx([-0.7, -1.9])
+    assert [score.weight for score in scores] == [3.0, 4.0]
+
+
+async def test_fit_and_post_hoc_score_have_identical_weighted_reductions(
+    sampling_service: FakeSamplingService, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def positioned_logprobs(
+        datums: Sequence[tinker_fakes.FakeDatum],
+    ) -> list[dict[str, tinker_fakes.FakeTensor]]:
+        outputs = []
+        for datum in datums:
+            length = len(datum.loss_fn_inputs["target_tokens"].data)
+            outputs.append(
+                {
+                    "logprobs": tinker_fakes.FakeTensor(
+                        data=[-(index + 1) / 10 for index in range(length)],
+                        dtype="float32",
+                        shape=[length],
+                    )
+                }
+            )
+        return outputs
+
+    monkeypatch.setattr(tinker_fakes, "logprobs_for", positioned_logprobs)
+    row = EvalRow(tokens=(10, 20, 30, 40), weights=(9.0, 0.0, 2.0, 1.0))
+    sampling_service.sampling.outputs[row.tokens] = [None, -0.1, -0.2, -0.3]
+    backend = TinkerBackend.from_settings()
+    request = spec(corpus(tmp_path, method="sft"))
+
+    report = await backend.fit(request, sink=sink(tmp_path), eval_rows=(row,))
+    scores = await backend.score(report.final.path, (row,), base=request.base)
+
+    assert report.final.scores is not None
+    assert scores == report.final.scores
+    assert scores[0].logprob == pytest.approx(-0.7)
+    assert scores[0].weight == 3.0
+
+
+async def test_score_projects_full_prefill_plus_one_sample_token_per_row(
+    sampling_service: FakeSamplingService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, object] = {}
+
+    class RecordingGuard:
+        def __init__(self, *, max_usd: float) -> None:
+            seen["max_usd"] = max_usd
+
+        async def check(self, projected: float) -> None:
+            seen["checked"] = projected
+
+        async def record(self, reserved: float, actual: float) -> None:
+            seen["recorded"] = (reserved, actual)
+
+    monkeypatch.setattr(tinker, "SpendGuard", RecordingGuard)
+    rows = (
+        EvalRow(tokens=(1, 2, 3), weights=(0.0, 0.0, 1.0)),
+        EvalRow(tokens=(4, 5), weights=(0.0, 1.0)),
+    )
+    backend = TinkerBackend.from_settings()
+
+    await backend.score("tinker://run/final", rows, base=BASE_MODELS["qwen3-8b"])
+
+    projected = backend.cost(model=TinkerModelId("Qwen/Qwen3-8B"), prefill=5, sample=2)
+    assert seen["max_usd"] == backend.settings.spend_cap_usd
+    assert seen["checked"] == pytest.approx(projected)
+    assert seen["recorded"] == pytest.approx((projected, projected))
+    assert sampling_service.sampling.calls == [row.tokens for row in rows]
+
+
+async def test_score_rejects_an_over_cap_projection_before_creating_a_service_client(
+    sdk: ModuleType,
+) -> None:
+    service_calls: list[str] = []
+
+    def create_service(api_key: str) -> FakeSamplingService:
+        service_calls.append(api_key)
+        return FakeSamplingService(api_key)
+
+    sdk.ServiceClient = create_service
+    rows = (EvalRow(tokens=(1, 2, 3), weights=(0.0, 0.0, 1.0)),)
+
+    with pytest.raises(SpendExceeded):
+        await TinkerBackend.from_settings().score("tinker://run/final", rows, base=BASE_MODELS["qwen3-8b"], max_usd=0.0)
+
+    assert service_calls == []
 
 
 async def test_a_base_with_no_mlx_lm_counterpart_aborts_before_the_service_client(
@@ -730,4 +901,3 @@ async def test_download_adapter_unpacks_the_signed_archive(monkeypatch: pytest.M
     out = await download_adapter(RestService(), "tinker://run/step3", tmp_path / "peft")
 
     assert (out / "adapter_model.safetensors").read_bytes() == b"weights"
-    assert not (out / "checkpoint.tar").exists()

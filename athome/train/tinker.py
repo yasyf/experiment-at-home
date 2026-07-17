@@ -6,20 +6,42 @@ import random
 import tarfile
 from dataclasses import dataclass
 from functools import partial
+from time import perf_counter
 from typing import TYPE_CHECKING, ClassVar
 
 import httpx
 from anyio import to_thread
 
+from athome.concurrency import gather_bounded
 from athome.config import load
 from athome.errors import AthomeError
 from athome.llm.spend import SpendGuard
 from athome.train import data, sidecar
 from athome.train.backend import TINKER_ENV
+from athome.train.engine import (
+    CrossEntropy,
+    Custom,
+    ScoreOp,
+    SnapshotDone,
+    SnapshotOp,
+    TrainDone,
+    TrainOp,
+    execute,
+    projection,
+    token_count,
+)
 from athome.train.spec import (
+    Adapter,
     Checkpoint,
+    CheckpointPolicy,
+    InsufficientData,
     LoraSpec,
+    OverlongEvalRows,
+    SavedCheckpoint,
+    ScoredSequence,
+    StepRecord,
     TinkerSettings,
+    TrainReport,
     UnservableBase,
     UnsupportedLoraShape,
     lora_keys,
@@ -28,7 +50,7 @@ from athome.train.spec import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Sequence
     from pathlib import Path
 
     import tinker
@@ -36,10 +58,18 @@ if TYPE_CHECKING:
 
     from athome.progress import RunSink
     from athome.train.data import TinkerPreference
-    from athome.train.spec import BackendName, BaseModelSpec, Method, TinkerModelId, TrainSpec
+    from athome.train.engine import Loss, Op
+    from athome.train.spec import (
+        BackendName,
+        BaseModelSpec,
+        EvalRow,
+        Method,
+        TinkerModelId,
+        TinkerPrice,
+        TrainSpec,
+    )
 
 BETA = 0.1
-DPO_PASSES = 2
 DOWNLOAD_TIMEOUT = httpx.Timeout(30.0, read=600.0)
 TORCH_HINT = (
     "tinker DPO needs torch locally (its custom loss backprops in-process): "
@@ -127,16 +157,19 @@ def fits(datum: tinker.Datum, max_seq_len: int) -> bool:
     return datum.model_input.length + 1 <= max_seq_len
 
 
-def token_count(datums: Iterable[tinker.Datum]) -> int:
-    return sum(datum.model_input.length for datum in datums)
-
-
 def weights_of(datum: tinker.Datum) -> Sequence[float]:
     return datum.loss_fn_inputs["weights"].data
 
 
 def sequence_logprob(output: dict[str, tinker.TensorData], datum: tinker.Datum) -> float:
     return sum(logprob * weight for logprob, weight in zip(output["logprobs"].data, weights_of(datum), strict=True))
+
+
+def score_sequence(logprobs: Sequence[float], weights: Sequence[float]) -> ScoredSequence:
+    return ScoredSequence(
+        logprob=sum(logprob * weight for logprob, weight in zip(logprobs, weights, strict=True)),
+        weight=sum(weights),
+    )
 
 
 def masked_loss(outputs: Sequence[dict[str, tinker.TensorData]], batch: Sequence[tinker.Datum]) -> float:
@@ -189,6 +222,132 @@ def dpo_loss(
     }
 
 
+def eval_datum(row: EvalRow) -> tinker.Datum:
+    """One scoring ``Datum`` from a pre-tokenized eval row, shifted like a masked completion.
+
+    The full sequence is the input up to its last token; the targets are the sequence shifted
+    by one, weighted so only the row's marked positions are scored.
+    """
+    import tinker
+
+    return tinker.Datum(
+        model_input=tinker.ModelInput.from_ints(list(row.tokens[:-1])),
+        loss_fn_inputs={
+            "weights": tinker.TensorData(data=list(row.weights[1:]), dtype="float32", shape=[len(row.weights) - 1]),
+            "target_tokens": tinker.TensorData(data=list(row.tokens[1:]), dtype="int64", shape=[len(row.tokens) - 1]),
+        },
+    )
+
+
+def step_metrics(loss: Loss, output: tinker.ForwardBackwardOutput, datums: Sequence[tinker.Datum]) -> dict[str, float]:
+    match loss:
+        case CrossEntropy():
+            return {"loss": masked_loss(output.loss_fn_outputs, datums)}
+        case Custom():
+            return {name: output.metrics[name] for name in ("loss", "margin", "accuracy")}
+
+
+def reduce_eval(
+    outputs: Sequence[dict[str, tinker.TensorData]], eval_datums: Sequence[tinker.Datum]
+) -> tuple[ScoredSequence, ...]:
+    return tuple(
+        score_sequence(output["logprobs"].data, weights_of(datum))
+        for output, datum in zip(outputs, eval_datums, strict=True)
+    )
+
+
+def assemble(
+    spec: TrainSpec,
+    steps: Sequence[tuple[tuple[tinker.Datum, ...], Loss]],
+    *,
+    checkpoints: CheckpointPolicy,
+    eval_datums: tuple[tinker.Datum, ...],
+) -> tuple[tuple[Op, ...], list[tuple[int, bool]]]:
+    """The schedule for ``steps``: a train op per step, snapshots at the policy's cadence and the end.
+
+    Returns the ops in submission order and the ``(step, final)`` metadata for each snapshot in
+    that same order, so the fold can label each :class:`SavedCheckpoint` as its result drains.
+    """
+    total = spec.hyperparams.steps
+    intermediate = set(checkpoints.steps_for(total))
+    ops: list[Op] = []
+    meta: list[tuple[int, bool]] = []
+    for step, (datums, loss) in enumerate(steps, start=1):
+        ops.append(TrainOp(datums, loss, spec.hyperparams.learning_rate))
+        if step in intermediate:
+            ops.append(SnapshotOp(f"{spec.name}-step{step:05d}", checkpoints.ttl_seconds, eval_datums))
+            meta.append((step, False))
+    ops.append(SnapshotOp(f"{spec.name}-{spec.method}-{total}", None, eval_datums))
+    meta.append((total, True))
+    return tuple(ops), meta
+
+
+async def reference_pass(
+    frozen: tinker.TrainingClient, datums: Sequence[tinker.Datum], *, guard: SpendGuard, price: TinkerPrice
+) -> list[tuple[float, float]]:
+    """The frozen policy's chosen/rejected sequence logprobs, scored on the batched scorer.
+
+    Runs as a single :class:`ScoreOp` fully consumed before the training schedule is compiled,
+    since its values are baked into the DPO loss closures.
+    """
+    [scored] = [result async for result in execute(frozen, (ScoreOp(tuple(datums)),))]
+    spent = price.prefill * token_count(datums) / 1e6
+    await guard.record(spent, spent)
+    scores = [sequence_logprob(output, datum) for output, datum in zip(scored.outputs, datums, strict=True)]
+    return list(zip(scores[0::2], scores[1::2], strict=True))
+
+
+async def run_schedule(
+    spec: TrainSpec,
+    client: tinker.TrainingClient,
+    schedule: Sequence[Op],
+    meta: Sequence[tuple[int, bool]],
+    dropped: int,
+    *,
+    guard: SpendGuard,
+    price: TinkerPrice,
+    sink: RunSink,
+    eval_datums: Sequence[tinker.Datum],
+) -> TrainReport:
+    """Fold the executor's result stream into a :class:`TrainReport`, recording spend and journaling.
+
+    Every side effect — spend reconciliation, the journal line — lands at a drain point, so the
+    journal stays step-ordered and the executor tops the queue up before each yield.
+    """
+    records: list[StepRecord] = []
+    saved: list[SavedCheckpoint] = []
+    snapshots = iter(meta)
+    start = perf_counter()
+    async for result in execute(client, schedule):
+        match result:
+            case TrainDone(op=op, output=output):
+                tokens = token_count(op.datums)
+                cost = price.train * tokens * op.loss.passes / 1e6
+                await guard.record(cost, cost)
+                metrics = step_metrics(op.loss, output, op.datums)
+                step = len(records) + 1
+                await sink.append(
+                    {"step": step, "method": spec.method, "tokens": tokens, "cost_usd": guard.spent} | metrics
+                )
+                records.append(StepRecord(step, tokens, cost, metrics))
+            case SnapshotDone(op=op, path=path, outputs=outputs):
+                step, final = next(snapshots)
+                if outputs is not None:
+                    eval_cost = price.prefill * token_count(op.eval) / 1e6
+                    await guard.record(eval_cost, eval_cost)
+                scores = reduce_eval(outputs, eval_datums) if outputs is not None else None
+                saved.append(SavedCheckpoint(step=step, path=path, final=final, scores=scores))
+                await sink.append({"event": "checkpoint", "step": step, "path": path, "final": final})
+    return TrainReport(
+        method=spec.method,
+        steps=tuple(records),
+        checkpoints=tuple(saved),
+        dropped=dropped,
+        wall_s=perf_counter() - start,
+        train_cost_usd=guard.spent,
+    )
+
+
 def extract(archive: Path, out_dir: Path) -> None:
     with tarfile.open(archive) as tar:
         tar.extractall(out_dir, filter="data")
@@ -221,8 +380,11 @@ class TinkerBackend:
     logprobs come back as torch tensors, :func:`dpo_loss` scores them against a frozen
     reference policy's cached logprobs, and the SDK backpropagates the client-side gradient.
 
-    Every run is projected against ``spend_cap_usd`` before its first billable call and
-    charged step by step, so a run that cannot fit the cap aborts having spent nothing.
+    Every op runs through the pipelined :func:`~athome.train.engine.execute` stream, which keeps
+    the server's turnstile full so a step costs one clock cycle instead of three, and lets
+    checkpoint saves and their eval scoring ride between steps without stalling. Every run is
+    projected against ``spend_cap_usd`` before its first billable call and charged step by step,
+    so a run that cannot fit the cap aborts having spent nothing.
 
     Example:
         >>> checkpoint = await TinkerBackend.from_settings().train(spec, sink=sink)
@@ -262,51 +424,6 @@ class TinkerBackend:
         load_key()
         return cls(load(TinkerSettings))
 
-    async def train(self, spec: TrainSpec, *, sink: RunSink, work_dir: Path) -> Checkpoint:
-        """Train ``spec`` on Tinker and fuse the resulting adapter into a servable MLX model.
-
-        Args:
-            spec: The fine-tuning request: base, dataset, hyperparams, method, LoRA, spend cap.
-            sink: The run journal; one record lands per step with its loss, tokens, and spend.
-            work_dir: This run's own directory; the adapter and the fused model are written under it.
-
-        Returns:
-            The checkpoint, whose ``mlx_path`` is the fused standalone 4-bit MLX model.
-
-        Raises:
-            UnservableBase: The base has no Tinker id, or no mlx-lm counterpart to fuse into.
-            UnsupportedLoraShape: The LoRA shape asks for something Tinker cannot train.
-            TorchRequired: The method is ``dpo`` and torch is not installed locally.
-            SpendExceeded: The projected run cost crosses the spend cap.
-        """
-        import tinker
-
-        model = tinker_model(spec.base)
-        tinker_lora(spec.lora)
-        guard = SpendGuard(max_usd=spend_cap(spec, self.settings.spend_cap_usd))
-        service = tinker.ServiceClient(api_key=self.settings.api_key.get_secret_value())
-        match spec.method:
-            case "sft":
-                client = await self.run_sft(service, spec, model=model, guard=guard, sink=sink)
-            case "dpo":
-                client = await self.run_dpo(service, spec, model=model, guard=guard, sink=sink)
-        saved = await client.save_weights_for_sampler_async(name=f"{spec.name}-{spec.method}-{spec.hyperparams.steps}")
-        return await self.converge(
-            service, spec, (await saved.result_async()).path, cost=guard.spent, work_dir=work_dir
-        )
-
-    async def lora_client(
-        self, service: tinker.ServiceClient, spec: TrainSpec, *, model: TinkerModelId
-    ) -> tinker.TrainingClient:
-        return await service.create_lora_training_client_async(
-            base_model=model,
-            rank=spec.lora.rank,
-            seed=spec.hyperparams.seed,
-            train_mlp=spec.lora.train_mlp,
-            train_attn=spec.lora.train_attn,
-            train_unembed=spec.lora.train_unembed,
-        )
-
     def cost(self, *, model: TinkerModelId, prefill: int = 0, sample: int = 0, train: int = 0) -> float:
         """What ``model`` bills for these token counts, each class at its own per-Mtok rate.
 
@@ -322,118 +439,260 @@ class TinkerBackend:
         price = self.settings.price_per_mtok[model]
         return (prefill * price.prefill + sample * price.sample + train * price.train) / 1e6
 
-    async def run_sft(
+    async def lora_client(
+        self, service: tinker.ServiceClient, spec: TrainSpec, *, model: TinkerModelId
+    ) -> tinker.TrainingClient:
+        return await service.create_lora_training_client_async(
+            base_model=model,
+            rank=spec.lora.rank,
+            seed=spec.hyperparams.seed,
+            train_mlp=spec.lora.train_mlp,
+            train_attn=spec.lora.train_attn,
+            train_unembed=spec.lora.train_unembed,
+        )
+
+    def service(self) -> tinker.ServiceClient:
+        import tinker
+
+        return tinker.ServiceClient(api_key=self.settings.api_key.get_secret_value())
+
+    async def fit(
         self,
-        service: tinker.ServiceClient,
+        spec: TrainSpec,
+        *,
+        sink: RunSink,
+        checkpoints: CheckpointPolicy = CheckpointPolicy(),
+        eval_rows: Sequence[EvalRow] | None = None,
+    ) -> TrainReport:
+        """Train ``spec`` on Tinker, journaling each step and saving checkpoints at the cadence.
+
+        The pool is rendered and under-filled runs aborted before anything billable; the whole
+        schedule — training, the DPO reference pass, and every checkpoint's eval scoring — is
+        projected against the spend cap in one reservation. The stream then runs, spend and the
+        journal reconciling at each drain point.
+
+        Args:
+            spec: The fine-tuning request: base, dataset, hyperparams, method, LoRA, spend cap.
+            sink: The run journal; one record lands per step, plus a checkpoint event per save.
+            checkpoints: Which fractions of the run to snapshot as intermediates; the final step
+                is always snapshotted and kept forever.
+            eval_rows: Pre-tokenized rows scored against every checkpoint's weights, or None.
+
+        Returns:
+            The report: per-step records, the saved checkpoints with their eval scores, the drop
+            count, the wall-clock, and the total metered spend.
+
+        Raises:
+            UnservableBase: The base has no Tinker id, or no mlx-lm counterpart to fuse into.
+            UnsupportedLoraShape: The LoRA shape asks for something Tinker cannot train.
+            TorchRequired: The method is ``dpo`` and torch is not installed locally.
+            InsufficientData: The surviving pool is smaller than one batch.
+            OverlongEvalRows: An eval row exceeds ``max_seq_len``.
+            SpendExceeded: The projected run cost crosses the spend cap.
+        """
+        model = tinker_model(spec.base)
+        tinker_lora(spec.lora)
+        if spec.method == "dpo":
+            require_torch()
+        price = self.settings.price_per_mtok[model]
+        eval_datums = tuple(eval_datum(row) for row in (eval_rows or ()))
+        if overlong := sum(not fits(datum, spec.hyperparams.max_seq_len) for datum in eval_datums):
+            raise OverlongEvalRows(overlong, spec.hyperparams.max_seq_len)
+
+        guard = SpendGuard(max_usd=spend_cap(spec, self.settings.spend_cap_usd))
+        match spec.method:
+            case "sft":
+                schedule, meta, dropped, client = await self.prepare_sft(
+                    spec, model=model, checkpoints=checkpoints, eval_datums=eval_datums, guard=guard, price=price
+                )
+            case "dpo":
+                schedule, meta, dropped, client = await self.prepare_dpo(
+                    spec, model=model, checkpoints=checkpoints, eval_datums=eval_datums, guard=guard, price=price
+                )
+        return await run_schedule(
+            spec, client, schedule, meta, dropped, guard=guard, price=price, sink=sink, eval_datums=eval_datums
+        )
+
+    async def prepare_sft(
+        self,
         spec: TrainSpec,
         *,
         model: TinkerModelId,
+        checkpoints: CheckpointPolicy,
+        eval_datums: tuple[tinker.Datum, ...],
         guard: SpendGuard,
-        sink: RunSink,
-    ) -> tinker.TrainingClient:
-        import tinker
-
+        price: TinkerPrice,
+    ) -> tuple[tuple[Op, ...], list[tuple[int, bool]], int, tinker.TrainingClient]:
         examples = await data.normalize(spec.dataset, method="sft")
         pool = [
             datum
             for example in examples
             if fits(datum := data.render_tinker_sft(example, spec.base.mlx), spec.hyperparams.max_seq_len)
         ]
+        if len(pool) < spec.hyperparams.batch_size:
+            raise InsufficientData(len(pool), spec.hyperparams.batch_size)
         plan = batches(pool, size=spec.hyperparams.batch_size, steps=spec.hyperparams.steps, seed=spec.hyperparams.seed)
-        await guard.check(self.cost(model=model, train=sum(token_count(batch) for batch in plan)))
+        schedule, meta = assemble(
+            spec, [(batch, CrossEntropy()) for batch in plan], checkpoints=checkpoints, eval_datums=eval_datums
+        )
+        await guard.check(projection(schedule, price))
+        client = await self.lora_client(self.service(), spec, model=model)
+        return schedule, meta, len(examples) - len(pool), client
 
-        client = await self.lora_client(service, spec, model=model)
-        adam = tinker.AdamParams(learning_rate=spec.hyperparams.learning_rate)
-        for step, batch in enumerate(plan, start=1):
-            forward = await client.forward_backward_async(list(batch), "cross_entropy")
-            output = await forward.result_async()
-            await (await client.optim_step_async(adam)).result_async()
-            spent = self.cost(model=model, train=token_count(batch))
-            await guard.record(spent, spent)
-            await sink.append(
-                {
-                    "step": step,
-                    "method": "sft",
-                    "loss": masked_loss(output.loss_fn_outputs, batch),
-                    "tokens": token_count(batch),
-                    "cost_usd": guard.spent,
-                }
-            )
-        return client
-
-    async def run_dpo(
+    async def prepare_dpo(
         self,
-        service: tinker.ServiceClient,
         spec: TrainSpec,
         *,
         model: TinkerModelId,
+        checkpoints: CheckpointPolicy,
+        eval_datums: tuple[tinker.Datum, ...],
         guard: SpendGuard,
-        sink: RunSink,
-    ) -> tinker.TrainingClient:
-        import tinker
-
-        require_torch()
+        price: TinkerPrice,
+    ) -> tuple[tuple[Op, ...], list[tuple[int, bool]], int, tinker.TrainingClient]:
         examples = await data.normalize(spec.dataset, method="dpo")
+        max_seq_len = spec.hyperparams.max_seq_len
         pool = [
             pref
             for example in examples
-            if fits((pref := data.render_tinker_dpo(example, spec.base.mlx)).chosen, spec.hyperparams.max_seq_len)
-            and fits(pref.rejected, spec.hyperparams.max_seq_len)
+            if fits((pref := data.render_tinker_dpo(example, spec.base.mlx)).chosen, max_seq_len)
+            and fits(pref.rejected, max_seq_len)
         ]
+        if len(pool) < spec.hyperparams.batch_size:
+            raise InsufficientData(len(pool), spec.hyperparams.batch_size)
         plan = batches(
             range(len(pool)), size=spec.hyperparams.batch_size, steps=spec.hyperparams.steps, seed=spec.hyperparams.seed
         )
-        stepped = sum(token_count(pair_datums([pool[index] for index in batch])) for batch in plan)
-        await guard.check(self.cost(model=model, prefill=token_count(pair_datums(pool)), train=DPO_PASSES * stepped))
+        reference_datums = pair_datums(pool)
+        shape, meta = assemble(
+            spec,
+            [(tuple(pair_datums([pool[i] for i in batch])), Custom(dpo_loss)) for batch in plan],
+            checkpoints=checkpoints,
+            eval_datums=eval_datums,
+        )
+        await guard.check(projection(shape, price) + price.prefill * token_count(reference_datums) / 1e6)
 
-        reference = await self.reference_logprobs(service, spec, pool, model=model, guard=guard)
+        service = self.service()
+        reference = await reference_pass(
+            await self.lora_client(service, spec, model=model), reference_datums, guard=guard, price=price
+        )
         client = await self.lora_client(service, spec, model=model)
-        adam = tinker.AdamParams(learning_rate=spec.hyperparams.learning_rate)
-        for step, batch in enumerate(plan, start=1):
-            datums = pair_datums([pool[index] for index in batch])
-            frozen = [score for index in batch for score in reference[index]]
-            loss_fn = partial(dpo_loss, reference=frozen, beta=BETA)
-            forward = await client.forward_backward_custom_async(datums, loss_fn, loss_type_input="logprobs")
-            output = await forward.result_async()
-            await (await client.optim_step_async(adam)).result_async()
-            spent = self.cost(model=model, train=DPO_PASSES * token_count(datums))
-            await guard.record(spent, spent)
-            await sink.append(
-                {"step": step, "method": "dpo", "tokens": token_count(datums), "cost_usd": guard.spent}
-                | {name: output.metrics[name] for name in ("loss", "margin", "accuracy")}
-            )
-        return client
+        schedule, _ = assemble(
+            spec,
+            [
+                (
+                    tuple(pair_datums([pool[i] for i in batch])),
+                    Custom(partial(dpo_loss, reference=[score for i in batch for score in reference[i]], beta=BETA)),
+                )
+                for batch in plan
+            ],
+            checkpoints=checkpoints,
+            eval_datums=eval_datums,
+        )
+        return schedule, meta, len(examples) - len(pool), client
 
-    async def reference_logprobs(
-        self,
-        service: tinker.ServiceClient,
-        spec: TrainSpec,
-        pool: Sequence[TinkerPreference],
-        *,
-        model: TinkerModelId,
-        guard: SpendGuard,
-    ) -> list[tuple[float, float]]:
-        frozen = await self.lora_client(service, spec, model=model)
-        datums = pair_datums(pool)
-        output = await (await frozen.forward_async(datums, "cross_entropy")).result_async()
-        spent = self.cost(model=model, prefill=token_count(datums))
-        await guard.record(spent, spent)
-        scores = [
-            sequence_logprob(logprobs, datum) for logprobs, datum in zip(output.loss_fn_outputs, datums, strict=True)
-        ]
-        return list(zip(scores[0::2], scores[1::2], strict=True))
+    async def train(self, spec: TrainSpec, *, sink: RunSink, work_dir: Path) -> Checkpoint:
+        """Train ``spec`` on Tinker and fuse the resulting final adapter into a servable MLX model.
 
-    async def converge(
-        self, service: tinker.ServiceClient, spec: TrainSpec, path: str, *, cost: float, work_dir: Path
-    ) -> Checkpoint:
-        peft = await download_adapter(service, path, work_dir / "peft")
-        adapter = await sidecar.convert_peft_to_mlx(peft, work_dir / "adapter", base=spec.base)
+        Args:
+            spec: The fine-tuning request: base, dataset, hyperparams, method, LoRA, spend cap.
+            sink: The run journal; one record lands per step with its loss, tokens, and spend.
+            work_dir: This run's own directory; the adapter and the fused model are written under it.
+
+        Returns:
+            The checkpoint, whose ``mlx_path`` is the fused standalone 4-bit MLX model.
+
+        Raises:
+            UnservableBase: The base has no Tinker id, or no mlx-lm counterpart to fuse into.
+            UnsupportedLoraShape: The LoRA shape asks for something Tinker cannot train.
+            TorchRequired: The method is ``dpo`` and torch is not installed locally.
+            InsufficientData: The surviving pool is smaller than one batch.
+            SpendExceeded: The projected run cost crosses the spend cap.
+        """
+        report = await self.fit(spec, sink=sink)
+        adapter = await self.materialize(report.final, spec, work_dir=work_dir, cost=report.train_cost_usd)
+        return await self.fuse(adapter, spec, work_dir=work_dir)
+
+    async def materialize(self, saved: SavedCheckpoint, spec: TrainSpec, *, work_dir: Path, cost: float) -> Adapter:
+        """Download and convert one saved Tinker checkpoint into a non-fused MLX adapter.
+
+        Args:
+            saved: Any saved checkpoint from :meth:`fit`, including an intermediate.
+            spec: The fine-tuning request whose base model the adapter targets.
+            work_dir: This materialization's directory; PEFT and MLX adapter files land under it.
+            cost: The training spend attributed to the adapter.
+
+        Returns:
+            The non-fused MLX adapter, ready for direct adapter serving or a later :meth:`fuse`.
+        """
+        peft = await download_adapter(self.service(), saved.path, work_dir / "peft")
+        adapter_dir = await sidecar.convert_peft_to_mlx(peft, work_dir / "adapter", base=spec.base)
+        return Adapter(step=saved.step, adapter_dir=adapter_dir, train_cost_usd=cost)
+
+    async def fuse(self, adapter: Adapter, spec: TrainSpec, *, work_dir: Path) -> Checkpoint:
+        """Fuse a materialized adapter into a standalone servable MLX checkpoint.
+
+        Args:
+            adapter: The non-fused MLX adapter to merge into its base model.
+            spec: The fine-tuning request whose base and method describe the checkpoint.
+            work_dir: This fusion's directory; the standalone model is written under it.
+
+        Returns:
+            The fused checkpoint, preserving the adapter's step and training cost.
+        """
         return Checkpoint(
             base=spec.base,
             backend="tinker",
             method=spec.method,
-            step=spec.hyperparams.steps,
-            mlx_path=await sidecar.fuse(adapter, work_dir / "mlx", base=spec.base),
-            adapter_dir=adapter,
-            train_cost_usd=cost,
+            step=adapter.step,
+            mlx_path=await sidecar.fuse(adapter.adapter_dir, work_dir / "mlx", base=spec.base),
+            adapter_dir=adapter.adapter_dir,
+            train_cost_usd=adapter.train_cost_usd,
+        )
+
+    async def score(
+        self,
+        path: str,
+        rows: Sequence[EvalRow],
+        *,
+        base: BaseModelSpec,
+        max_usd: float | None = None,
+    ) -> tuple[ScoredSequence, ...]:
+        """Score weighted token sequences against a saved Tinker sampling checkpoint.
+
+        Args:
+            path: The opaque ``tinker://`` sampler checkpoint path.
+            rows: Pre-tokenized weighted rows to score, in return order.
+            base: The base model identity used to price the sampling requests.
+            max_usd: The scoring spend cap, or None for the configured Tinker cap.
+
+        Returns:
+            One weighted sequence score per row, preserving input order.
+
+        Raises:
+            UnservableBase: The base has no Tinker identity.
+            SpendExceeded: The projected prefill and one sampled token per row cross the cap.
+        """
+        import tinker
+
+        model = tinker_model(base)
+        projected = self.cost(
+            model=model,
+            prefill=sum(len(row.tokens) for row in rows),
+            sample=len(rows),
+        )
+        guard = SpendGuard(max_usd=self.settings.spend_cap_usd if max_usd is None else max_usd)
+        await guard.check(projected)
+        client = self.service().create_sampling_client(model_path=path)
+        prompts = [tinker.ModelInput.from_ints(list(row.tokens)) for row in rows]
+        outputs = await gather_bounded(
+            [partial(client.compute_logprobs_async, prompt) for prompt in prompts],
+            concurrency=64,
+        )
+        await guard.record(projected, projected)
+        return tuple(
+            score_sequence(
+                tuple(logprob for logprob in output[1:] if logprob is not None),
+                row.weights[1:],
+            )
+            for output, row in zip(outputs, rows, strict=True)
         )
