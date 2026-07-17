@@ -8,7 +8,7 @@ import click
 
 from athome import launchd
 from athome.cli import coro, emit, json_option
-from athome.research import loop, nightly
+from athome.research import loop, nightly, watchdog
 from athome.research.driver import ClaudeCodeDriver
 from athome.research.spec import ExperimentSpec
 
@@ -92,6 +92,20 @@ async def run_command(spec_path: Path, repo: Path | None, *, mirror_cc_notes: bo
     emit({"kept": result.kept, "best": asdict(result.best) if result.best is not None else None}, as_json=as_json)
 
 
+@cli.command("watch")
+@spec_argument
+@repo_option
+@json_option
+@coro
+async def watch_command(spec_path: Path, repo: Path | None, *, as_json: bool) -> None:
+    """Check SPEC_PATH's live run for quiet journal and log progress."""
+    spec = ExperimentSpec.load(spec_path)
+    result = await watchdog.check(spec, repo=await resolve_repo(spec_path, repo))
+    emit({"live": result.live, "alarm": result.alarm}, as_json=as_json)
+    if result.alarm:
+        raise SystemExit(1)
+
+
 @cli.command("status")
 @spec_argument
 @repo_option
@@ -137,3 +151,12 @@ async def nightly_install_command(
         mirror_cc_notes=mirror_cc_notes,
     )
     emit({"installed": str(path)}, as_json=as_json)
+
+
+@nightly_group.command("install-watch")
+@spec_argument
+@json_option
+@coro
+async def nightly_install_watch_command(spec_path: Path, *, as_json: bool) -> None:
+    """Install a launchd agent checking SPEC_PATH's quiet alarm every ten minutes."""
+    emit({"installed": str(await watchdog.install(spec_path))}, as_json=as_json)
