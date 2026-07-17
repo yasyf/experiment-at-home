@@ -218,6 +218,36 @@ class RecoveryCostDriver:
 
 
 @dataclass(frozen=True, slots=True)
+class OuterCancellingDriver:
+    """Cancels its caller during or immediately after a proposal and exposes recovery evidence."""
+
+    scope: anyio.CancelScope
+    recovered: float | AccountingIntegrityError
+    completed_cost: float | None = None
+    label: str = "outer-cancel"
+
+    async def preflight(self) -> None:
+        return None
+
+    async def propose(self, contract: str, workdir: Path) -> float:
+        self.scope.cancel()
+        match self.completed_cost:
+            case float() as cost:
+                (workdir / "train.py").write_text("LOSS = 0.5\n")
+                return cost
+            case None:
+                await anyio.lowlevel.checkpoint()
+                raise AssertionError("unreachable")
+
+    async def recover_cost(self) -> float:
+        match self.recovered:
+            case AccountingIntegrityError() as exc:
+                raise exc
+            case float() as cost:
+                return cost
+
+
+@dataclass(frozen=True, slots=True)
 class RecordingDriver:
     """Replays scripted edits like StubDriver while capturing every contract it receives."""
 
@@ -965,6 +995,80 @@ async def test_accounting_abort_restart_preserves_prior_sidecar_spend(tmp_path: 
         ("wall_cancel", 0.4),
         ("accounting_abort", None),
     ]
+
+
+async def test_outer_cancellation_mid_proposal_persists_recovered_cost(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    scope = anyio.CancelScope()
+
+    with scope:
+        with pytest.raises(anyio.get_cancelled_exc_class()):
+            await run(
+                make_spec(budget=Budget(max_units=1)),
+                driver=OuterCancellingDriver(scope, recovered=0.6),
+                repo=repo,
+            )
+
+    assert journal_rows(repo) == []
+    assert [(event["kind"], event["cost"]) for event in infra_events(repo)] == [("wall_cancel", 0.6)]
+
+
+async def test_outer_cancellation_mid_proposal_latches_unknown_spend(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    scope = anyio.CancelScope()
+
+    with scope:
+        with pytest.raises(anyio.get_cancelled_exc_class()):
+            await run(
+                make_spec(budget=Budget(max_units=1)),
+                driver=OuterCancellingDriver(scope, recovered=AccountingIntegrityError("partial billing envelope")),
+                repo=repo,
+            )
+
+    latch = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
+    assert json.loads(latch.read_text())["reason"] == "partial billing envelope"
+    assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
+
+
+async def test_outer_cancellation_after_proposal_persists_known_cost(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    scope = anyio.CancelScope()
+
+    with scope:
+        with pytest.raises(anyio.get_cancelled_exc_class()):
+            await run(
+                make_spec(budget=Budget(max_units=1)),
+                driver=OuterCancellingDriver(scope, recovered=0.0, completed_cost=0.6),
+                repo=repo,
+            )
+
+    assert journal_rows(repo) == []
+    assert [(event["kind"], event["cost"]) for event in infra_events(repo)] == [("wall_cancel", 0.6)]
+
+
+async def test_journal_append_failure_writes_abort_latch_and_blocks_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = toy_repo(tmp_path)
+
+    async def fail_append(_journal: Journal, _row: JournalRow) -> None:
+        raise OSError("journal append failed")
+
+    monkeypatch.setattr(Journal, "append", fail_append)
+
+    with pytest.raises(AccountingIntegrityError, match="could not append journal row for unit 0"):
+        await run(
+            make_spec(budget=Budget(max_units=1)),
+            driver=CostDriver(iter([loss_proposal(0.5)]), cost=0.6),
+            repo=repo,
+        )
+
+    latch = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
+    assert json.loads(latch.read_text())["unit"] == 0
+    resume_driver = RecordingDriver(iter([loss_proposal(0.4)]))
+    with pytest.raises(AccountingIntegrityError, match="unreconciled accounting abort latch"):
+        await run(make_spec(budget=Budget(max_units=1)), driver=resume_driver, repo=repo)
+    assert resume_driver.contracts == []
 
 
 async def test_poisoned_sidecar_cost_does_not_disable_max_usd(tmp_path: Path) -> None:

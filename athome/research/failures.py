@@ -39,6 +39,7 @@ reconcile the ledger before resuming.
 
 Accepted limitation: if the latch write fails I/O while the sidecar breadcrumb succeeds,
 a restart is not blocked because reconciliation never clears append-only sidecar history.
+Journal/sidecar writes use os.write/close, not fsync: process-crash safe; power loss may erase costs after refs persist.
 """
 
 from __future__ import annotations
@@ -162,7 +163,12 @@ def append_event(path: Path, event: dict[str, object], *, kind: SidecarKind) -> 
 def infra_events(path: Path) -> list[dict[str, object]]:
     if not path.exists():
         return []
-    return [record for line in path.read_bytes().splitlines() if (record := parse_event(line, path)) is not None]
+    lines = path.read_bytes().splitlines()
+    records = [parse_event(line, path) for line in lines]
+    final = next((index for index in range(len(lines) - 1, -1, -1) if lines[index].strip()), None)
+    if final is not None and records[final] is None:
+        raise AccountingIntegrityError(f"infra spend sidecar {path} has a malformed final line")
+    return [record for record in records if record is not None]
 
 
 def parse_event(line: bytes, path: Path) -> dict[str, object] | None:

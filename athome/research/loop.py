@@ -351,6 +351,7 @@ async def run_unit(
             contract=contract,
             driver=driver,
             events=events,
+            abort=abort,
             deadline=deadline,
             spent=spent,
         )
@@ -370,6 +371,7 @@ async def execute_unit(
     contract: str,
     driver: Driver,
     events: Path,
+    abort: Path,
     deadline: float | None,
     spent: float,
 ) -> UnitOutcome | None:
@@ -429,6 +431,36 @@ async def execute_unit(
                     f"proposal timeout: {exc}",
                     validate_driver_cost(unit, exc.cost),
                 )
+            except anyio.get_cancelled_exc_class():
+                if not scope.cancel_called:
+                    with anyio.CancelScope(shield=True):
+                        try:
+                            match proposal_started, proposal_completed:
+                                case True, False:
+                                    cost = validate_driver_cost(unit, await driver.recover_cost())
+                                    if cost > 0:
+                                        await record_infra_event(
+                                            events,
+                                            unit=unit,
+                                            attempt=attempt,
+                                            reason="outer cancellation during proposal",
+                                            cost=cost,
+                                            kind="wall_cancel",
+                                        )
+                                case _, True:
+                                    await record_infra_event(
+                                        events,
+                                        unit=unit,
+                                        attempt=attempt,
+                                        reason="outer cancellation after proposal completion",
+                                        cost=cost,
+                                        kind="wall_cancel",
+                                    )
+                                case _:
+                                    pass
+                        except AccountingIntegrityError as exc:
+                            await record_accounting_abort(abort, events, unit=unit, reason=str(exc))
+                raise
             except Exception as exc:
                 classification = classify(exc)
                 if classification != "accounting" and proposal_started and not proposal_completed:
@@ -592,16 +624,20 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
                 )
                 if outcome is None:
                     break  # the unit blew past the remaining wall budget and was cancelled
-                await journal.append(
-                    JournalRow(
-                        unit=unit,
-                        commit=outcome.commit,
-                        metric=outcome.metric,
-                        verdict=outcome.verdict,
-                        resources={"wall_s": time.monotonic() - unit_started, "usd": outcome.cost},
-                        description=outcome.description,
-                    )
+                row = JournalRow(
+                    unit=unit,
+                    commit=outcome.commit,
+                    metric=outcome.metric,
+                    verdict=outcome.verdict,
+                    resources={"wall_s": time.monotonic() - unit_started, "usd": outcome.cost},
+                    description=outcome.description,
                 )
+                try:
+                    await journal.append(row)
+                except OSError as exc:
+                    reason = f"could not append journal row for unit {unit} to {journal.sink.path}"
+                    await record_accounting_abort(abort, events, unit=unit, reason=reason)
+                    raise AccountingIntegrityError(reason) from exc
                 if outcome.verdict is Verdict.KEEP:
                     await run_git(repo, "branch", "-f", branch, outcome.commit)
                     incumbent, incumbent_metric = outcome.commit, outcome.metric

@@ -105,7 +105,7 @@ async def test_accounting_abort_writes_latch_before_breadcrumb(tmp_path: Path, m
     assert observed == [(events, {"unit": 7, "reason": "unrecoverable spend"}, "accounting_abort")]
 
 
-async def test_torn_sidecar_line_never_loses_a_later_record(tmp_path: Path) -> None:
+async def test_torn_middle_sidecar_line_never_loses_a_later_record(tmp_path: Path) -> None:
     # Finding #4: a torn (newline-less) prior line must not swallow the next appends. The writer
     # heals the fragment onto its own line; the reader skips only that malformed line.
     events = tmp_path / "toy.events.jsonl"
@@ -119,6 +119,21 @@ async def test_torn_sidecar_line_never_loses_a_later_record(tmp_path: Path) -> N
     assert sorted(event["unit"] for event in infra_events(events)) == [0, 2, 3]  # fragment skipped, nothing else lost
     assert infra_retries(events) == 3
     assert infra_cost(events) == pytest.approx(1.8)  # 0.6 × 3, no undercount from the tear
+
+
+@pytest.mark.parametrize(
+    "final_line",
+    [
+        pytest.param(b'{"unit":1,"attempt":0,"reason":"torn","cost":', id="torn-cost"),
+        pytest.param(b'{"unit":1,"attempt":0,"reason":"unknown","cost":0.4,"kind":"legacy"}', id="unknown-kind"),
+    ],
+)
+def test_malformed_final_sidecar_line_fails_closed(tmp_path: Path, final_line: bytes) -> None:
+    events = tmp_path / "toy.events.jsonl"
+    events.write_bytes(b'{"unit":0,"attempt":0,"reason":"ok","cost":0.2,"kind":"retry"}\n' + final_line)
+
+    with pytest.raises(AccountingIntegrityError, match="malformed final line"):
+        infra_events(events)
 
 
 def test_corrupt_sidecar_lines_are_skipped_independently(tmp_path: Path) -> None:
