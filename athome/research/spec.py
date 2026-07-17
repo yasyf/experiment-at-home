@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Literal
 
 from athome.research.errors import ResearchError
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
 
 class ImmutableViolation(ResearchError):
     """A candidate edited a path the scoring boundary declares immutable."""
+
+
+class UnknownSpecField(ResearchError):
+    """A TOML carried a field its target dataclass does not declare; refused, never splatted through."""
 
 
 class BudgetExhausted(ResearchError):
@@ -37,6 +42,21 @@ class ProposalTimeout(ResearchError):
 
 def unbounded_glob(pattern: str) -> bool:
     return PurePosixPath(pattern).parts[0] in {"*", "**"}
+
+
+def reject_unknown_fields(cls: type, data: Mapping[str, object], *, source: str) -> None:
+    """Refuse any mapping key the target dataclass does not declare as a field.
+
+    The splat-construction loaders (:meth:`ExperimentSpec.load` and the policy
+    loader) call this before ``cls(**data)``, so a hostile TOML cannot smuggle a
+    field past the declared schema and fails with a named refusal instead of an
+    incidental ``TypeError``.
+
+    Raises:
+        UnknownSpecField: ``data`` carries keys ``cls`` does not declare.
+    """
+    if unknown := sorted(set(data) - {field.name for field in fields(cls)}):
+        raise UnknownSpecField(f"{source} carries fields {cls.__name__} does not declare: {unknown}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +85,9 @@ class ExperimentSpec:
 
     The metric is read from ``metric_file`` (a structured JSON channel the
     ``metric_command`` writes), never grepped from stdout. The ``immutable_paths``
-    globs are the scoring boundary the candidate must not touch.
+    globs are the scoring boundary the candidate must not touch. An optional
+    ``hypothesis`` (free text) renders into the contract's ``## Hypothesis``
+    section and nowhere else — never a shell, path, or key.
 
     Example:
         >>> spec = ExperimentSpec.load(Path("experiment.toml"))
@@ -79,6 +101,7 @@ class ExperimentSpec:
     immutable_paths: tuple[str, ...]
     budget: Budget
     metric_file: str = ".athome-metric.json"
+    hypothesis: str | None = None
 
     def __post_init__(self) -> None:
         if bad := [pattern for pattern in self.mutable_paths if unbounded_glob(pattern)]:
@@ -86,11 +109,18 @@ class ExperimentSpec:
 
     @classmethod
     def load(cls, path: Path) -> ExperimentSpec:
-        """Loads the experiment from a TOML file; the ``[budget]`` table becomes a :class:`Budget`."""
+        """Loads the experiment from a TOML file; the ``[budget]`` table becomes a :class:`Budget`.
+
+        Raises:
+            UnknownSpecField: the TOML carries a field the spec or its budget does not declare.
+        """
         with path.open("rb") as file:
             data = tomllib.load(file)
+        budget = data.pop("budget")
+        reject_unknown_fields(Budget, budget, source=str(path))
+        reject_unknown_fields(cls, data, source=str(path))
         return cls(
-            budget=Budget(**data.pop("budget")),
+            budget=Budget(**budget),
             **{key: tuple(value) if isinstance(value, list) else value for key, value in data.items()},
         )
 

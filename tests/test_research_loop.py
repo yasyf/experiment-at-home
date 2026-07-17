@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -298,6 +298,14 @@ def test_contract_maximize_wording_and_budget_low_warning() -> None:
     contract = build_contract(make_spec(budget=Budget(max_units=1), direction="max"), budget_low=True)
     assert "maximize" in contract and "must strictly exceed" in contract
     assert "Budget is nearly exhausted" in contract
+
+
+def test_contract_renders_hypothesis_only_when_set() -> None:
+    spec = make_spec(budget=Budget(max_units=3))
+    assert "## Hypothesis" not in build_contract(spec, budget_low=False)
+    contract = build_contract(replace(spec, hypothesis="a lower LR converges further"), budget_low=False)
+    assert "## Hypothesis\na lower LR converges further" in contract
+    assert contract.index("## Hypothesis") < contract.index("## Files you MAY edit")
 
 
 def special_repo(root: Path, *, score_py: str, extra: dict[str, str] | None = None, gitignore: str = "") -> Path:

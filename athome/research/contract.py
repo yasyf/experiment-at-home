@@ -22,9 +22,10 @@ def build_contract(spec: ExperimentSpec, *, budget_low: bool) -> str:
     """Generates the agent instruction contract (the ``program.md`` role) for a proposal.
 
     The contract states the mutable/immutable manifest (the scoring boundary), the
-    metric command and its structured JSON file, the keep/discard rule, the
-    simplicity criterion, and — when ``budget_low`` — a warning to make a small,
-    finishable change. The agent reports its metric only through the JSON file.
+    proposer's hypothesis when the spec carries one, the metric command and its
+    structured JSON file, the keep/discard rule, the simplicity criterion, and —
+    when ``budget_low`` — a warning to make a small, finishable change. The agent
+    reports its metric only through the JSON file.
 
     Args:
         spec: The experiment whose manifest, metric, and direction shape the contract.
@@ -38,6 +39,7 @@ def build_contract(spec: ExperimentSpec, *, budget_low: bool) -> str:
     sections = [
         f"# Experiment: {spec.name}",
         f"Improve the system to **{goal}** `{spec.metric_key}`. Change only what earns a better metric.",
+        *([f"## Hypothesis\n{spec.hypothesis}"] if spec.hypothesis else []),
         f"## Files you MAY edit\n{bullets(spec.mutable_paths)}",
         f"## Files you MUST NOT edit (the scoring boundary)\n{bullets(spec.immutable_paths)}\n"
         "Any proposal that changes an immutable path is discarded without being scored.",

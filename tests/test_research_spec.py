@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from athome.research.spec import Budget, ExperimentSpec, ImmutableViolation, unbounded_glob
+from athome.research.spec import Budget, ExperimentSpec, ImmutableViolation, UnknownSpecField, unbounded_glob
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -62,6 +62,26 @@ def test_load_applies_metric_file_default_and_optional_budget_fields(tmp_path: P
     assert spec.direction == "min"
     assert spec.budget == Budget(max_units=5)
     assert spec.budget.max_wall_s is None and spec.budget.hard_kill_s is None and spec.budget.max_usd is None
+
+
+def test_load_refuses_unknown_spec_fields(tmp_path: Path) -> None:
+    path = tmp_path / "experiment.toml"
+    path.write_text(MINIMAL_TOML.replace("[budget]", 'smuggled = "x"\n\n[budget]'))
+    with pytest.raises(UnknownSpecField, match="smuggled"):
+        ExperimentSpec.load(path)
+
+
+def test_load_refuses_unknown_budget_fields(tmp_path: Path) -> None:
+    path = tmp_path / "experiment.toml"
+    path.write_text(MINIMAL_TOML + "max_gpus = 4\n")
+    with pytest.raises(UnknownSpecField, match="max_gpus"):
+        ExperimentSpec.load(path)
+
+
+def test_load_round_trips_hypothesis(tmp_path: Path) -> None:
+    path = tmp_path / "experiment.toml"
+    path.write_text(MINIMAL_TOML.replace("[budget]", 'hypothesis = "smaller batches help"\n\n[budget]'))
+    assert ExperimentSpec.load(path).hypothesis == "smaller batches help"
 
 
 def test_lists_become_tuples(tmp_path: Path) -> None:
