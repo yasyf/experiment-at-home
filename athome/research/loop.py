@@ -291,7 +291,9 @@ def validate_journal(rows: list[JournalRow]) -> None:
     for row in rows:
         if row.metric is not None and not finite_number(row.metric):
             raise PoisonedJournal(f"unit {row.unit}: non-finite metric {row.metric!r}")
-        if not (finite_number(usd := row.resources.get("usd", 0.0)) and usd >= 0):
+        if "usd" not in row.resources:
+            raise PoisonedJournal(f"unit {row.unit}: missing usd")
+        if not (finite_number(usd := row.resources["usd"]) and usd >= 0):
             raise PoisonedJournal(f"unit {row.unit}: invalid usd {usd!r}")
 
 
@@ -428,7 +430,10 @@ async def execute_unit(
                     validate_driver_cost(unit, exc.cost),
                 )
             except Exception as exc:
-                match classify(exc):
+                classification = classify(exc)
+                if classification != "accounting" and proposal_started and not proposal_completed:
+                    cost = validate_driver_cost(unit, await driver.recover_cost())
+                match classification:
                     case "accounting":
                         raise
                     case "candidate":
@@ -541,7 +546,7 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
         branch = f"{EXPERIMENT_BRANCH_PREFIX}/{spec.name}"
         incumbent, incumbent_metric = await resume(repo, branch, journal, direction=spec.direction)
         resumed = bool(journal.rows())
-        spent = sum(row.resources.get("usd", 0.0) for row in journal.rows()) + infra_cost(events)
+        spent = sum(row.resources["usd"] for row in journal.rows()) + infra_cost(events)
 
         worktrees = Path(tempfile.mkdtemp(prefix=f"athome-{spec.name}-")).resolve()
         try:
@@ -600,7 +605,7 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
                 if outcome.verdict is Verdict.KEEP:
                     await run_git(repo, "branch", "-f", branch, outcome.commit)
                     incumbent, incumbent_metric = outcome.commit, outcome.metric
-                spent = sum(row.resources.get("usd", 0.0) for row in journal.rows()) + infra_cost(events)
+                spent = sum(row.resources["usd"] for row in journal.rows()) + infra_cost(events)
                 if spec.budget.max_usd is not None and spent > spec.budget.max_usd:
                     raise BudgetExhausted(
                         f"spend ${spent:.4f} crossed max_usd ${spec.budget.max_usd:.4f} at unit {unit}"

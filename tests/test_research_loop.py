@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import anyio
 import pytest
 
+import athome.research.failures as failures
 from athome.research.contract import Memory, build_contract
 from athome.research.driver import ClaudeCodeDriver, StubDriver, StubProposal
 from athome.research.failures import (
@@ -1064,6 +1065,51 @@ async def test_poisoned_journal_is_rejected_on_resume(tmp_path: Path, metric: ob
         await run(make_spec(budget=Budget(max_units=2)), driver=StubDriver(iter([loss_proposal(0.3)])), repo=repo)
 
 
+def test_journal_open_rejects_a_torn_final_line(tmp_path: Path) -> None:
+    path = tmp_path / "toy.jsonl"
+    row = JournalRow(0, "abc", 0.5, Verdict.KEEP, {"wall_s": 1.0, "usd": 0.2}, "intact")
+    path.write_text(json.dumps(row.to_record()) + '\n{"unit":1,"commit":"def"')
+
+    with pytest.raises(PoisonedJournal):
+        Journal.open(path)
+
+
+def test_journal_open_accepts_an_intact_file(tmp_path: Path) -> None:
+    path = tmp_path / "toy.jsonl"
+    row = JournalRow(0, "abc", 0.5, Verdict.KEEP, {"wall_s": 1.0, "usd": 0.2}, "intact")
+    path.write_text(json.dumps(row.to_record()) + "\n")
+
+    assert Journal.open(path).rows() == [row]
+
+
+def test_journal_open_accepts_an_empty_file(tmp_path: Path) -> None:
+    path = tmp_path / "toy.jsonl"
+    path.write_text("")
+
+    assert Journal.open(path).rows() == []
+
+
+async def test_journal_missing_usd_is_rejected_on_resume(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    await run(make_spec(budget=Budget(max_units=1)), driver=StubDriver(iter([loss_proposal(0.5)])), repo=repo)
+    path = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.jsonl"
+    row = json.loads(path.read_text())
+    del row["resources"]["usd"]
+    path.write_text(json.dumps(row) + "\n")
+
+    with pytest.raises(PoisonedJournal, match="missing usd"):
+        await run(make_spec(budget=Budget(max_units=2)), driver=StubDriver(iter([loss_proposal(0.3)])), repo=repo)
+
+
+async def test_journal_present_zero_usd_is_valid_on_resume(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    await run(make_spec(budget=Budget(max_units=1)), driver=StubDriver(iter([loss_proposal(0.5)])), repo=repo)
+
+    result = await run(make_spec(budget=Budget(max_units=1)), driver=StubDriver(iter([])), repo=repo)
+
+    assert result.best is not None and result.best.resources["usd"] == 0.0
+
+
 # --- WR2: per-experiment single-writer lock.
 
 
@@ -1316,6 +1362,33 @@ async def test_infra_marked_scorer_is_retried_then_aborts(tmp_path: Path) -> Non
     assert [record["attempt"] for record in records] == list(range(MAX_INFRA_RETRIES + 1))  # every attempt
     assert all(record["unit"] == 0 for record in records)
     assert len(counter.read_text()) == MAX_INFRA_RETRIES + 1  # re-scored the same commit, never re-proposed
+
+
+async def test_infra_event_write_failure_aborts_accounting_and_latches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counter = tmp_path / "scorer-runs"
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = special_repo(repo_dir, score_py=infra_score_py(counter))
+
+    def fail_append(path: Path, event: dict[str, object], *, kind: object) -> None:
+        raise OSError("sidecar append failed")
+
+    monkeypatch.setattr(failures, "append_event", fail_append)
+
+    with pytest.raises(AccountingIntegrityError):
+        await run(
+            make_spec(budget=Budget(max_units=1)),
+            driver=HostileDriver(write_infra_candidate, cost=0.6),
+            repo=repo,
+        )
+
+    athome = repo / ".git" / "athome"
+    latch = athome / f"{EXPERIMENT_NAME}.abort.json"
+    assert journal_rows(repo) == []
+    assert counter.read_text() == "x"
+    assert json.loads(latch.read_text())["unit"] == 0
+    assert not (athome / f"{EXPERIMENT_NAME}.events.jsonl").exists()
 
 
 async def test_plain_exit1_scorer_is_a_crash_not_infra(tmp_path: Path) -> None:

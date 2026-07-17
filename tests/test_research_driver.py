@@ -24,7 +24,7 @@ from athome.research.gate import TreeChange
 from athome.research.journal import Journal, Verdict
 from athome.research.loop import run
 from athome.research.preflight import PreflightFailure
-from athome.research.spec import Budget, ExperimentSpec, ProposalTimeout
+from athome.research.spec import Budget, BudgetExhausted, ExperimentSpec, ProposalTimeout
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -751,6 +751,171 @@ async def test_wall_cancel_during_pidfile_write_stops_retained_run_and_recovers_
     assert stopped == [detached]
     assert journal_rows(repo) == []
     assert [(event["kind"], event["cost"]) for event in infra_events(events)] == [("wall_cancel", 0.6)]
+
+
+async def test_pidfile_write_failure_recovers_complete_cost_as_infra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = toy_repo(repo_dir)
+    spec = make_spec(budget=Budget(max_units=1, max_usd=0.5))
+    (log := tmp_path / "fake-run.log").write_text('{"type":"result","total_cost_usd":0.6}\n')
+    detached = DetachedRun(name="spawned", pid=1234, log_path=log)
+    stopped: list[DetachedRun] = []
+
+    async def fail_pidfile_write(
+        command: object,
+        *,
+        name: str,
+        on_spawn: Callable[[DetachedRun], None] | None = None,
+    ) -> DetachedRun:
+        if on_spawn is not None:
+            on_spawn(detached)
+        raise OSError("pid-file write failed")
+
+    monkeypatch.setattr(driver_module, "launch", fail_pidfile_write)
+    monkeypatch.setattr(driver_module, "stop", stopped.append)
+
+    with pytest.raises(BudgetExhausted):
+        await run(
+            spec,
+            driver=ClaudeCodeDriver(spec, command=fake_claude(tmp_path, FAKE_CLAUDE_HANGS)),
+            repo=repo,
+        )
+
+    events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
+    assert stopped == [detached]
+    assert journal_rows(repo) == []
+    assert [(event["kind"], event["cost"]) for event in infra_events(events)] == [("retry", 0.6)]
+    assert not events.with_name(f"{EXPERIMENT_NAME}.abort.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("body", "read_fails"),
+    [
+        pytest.param("", False, id="no-envelope"),
+        pytest.param('{"type":"result","total_cost_usd":', False, id="partial-envelope"),
+        pytest.param('{"type":"result","total_cost_usd":0.6}\n', True, id="unreadable-log"),
+    ],
+)
+async def test_pidfile_write_failure_without_recoverable_cost_aborts_accounting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body: str,
+    read_fails: bool,
+) -> None:
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = toy_repo(repo_dir)
+    spec = make_spec(budget=Budget(max_units=1))
+    (log := tmp_path / "fake-run.log").write_text(body)
+    detached = DetachedRun(name="spawned", pid=1234, log_path=log)
+    stopped: list[DetachedRun] = []
+    if read_fails:
+        make_run_log_unreadable(monkeypatch)
+
+    async def fail_pidfile_write(
+        command: object,
+        *,
+        name: str,
+        on_spawn: Callable[[DetachedRun], None] | None = None,
+    ) -> DetachedRun:
+        if on_spawn is not None:
+            on_spawn(detached)
+        raise OSError("pid-file write failed")
+
+    monkeypatch.setattr(driver_module, "launch", fail_pidfile_write)
+    monkeypatch.setattr(driver_module, "stop", stopped.append)
+
+    with pytest.raises(AccountingIntegrityError):
+        await run(
+            spec,
+            driver=ClaudeCodeDriver(spec, command=fake_claude(tmp_path, FAKE_CLAUDE_HANGS)),
+            repo=repo,
+        )
+
+    assert stopped == [detached]
+    assert journal_rows(repo) == []
+    assert_accounting_abort_recorded(repo)
+
+
+async def test_await_exit_pidfile_oserror_recovers_complete_cost_as_infra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = toy_repo(repo_dir)
+    spec = make_spec(budget=Budget(max_units=1, max_usd=0.5))
+    (log := tmp_path / "fake-run.log").write_text('{"type":"result","total_cost_usd":0.6}\n')
+    detached = DetachedRun(name="spawned", pid=1234, log_path=log)
+    stopped: list[DetachedRun] = []
+
+    async def fake_launch(
+        command: object,
+        *,
+        name: str,
+        on_spawn: Callable[[DetachedRun], None] | None = None,
+    ) -> DetachedRun:
+        if on_spawn is not None:
+            on_spawn(detached)
+        return detached
+
+    def fail_running(name: str) -> int | None:
+        raise OSError("pid-file read failed")
+
+    monkeypatch.setattr(driver_module, "launch", fake_launch)
+    monkeypatch.setattr(driver_module, "running", fail_running)
+    monkeypatch.setattr(driver_module, "stop", stopped.append)
+
+    with pytest.raises(BudgetExhausted):
+        await run(
+            spec,
+            driver=ClaudeCodeDriver(spec, command=fake_claude(tmp_path, FAKE_CLAUDE_HANGS)),
+            repo=repo,
+        )
+
+    events = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.events.jsonl"
+    assert stopped == [detached]
+    assert journal_rows(repo) == []
+    assert [(event["kind"], event["cost"]) for event in infra_events(events)] == [("retry", 0.6)]
+
+
+async def test_await_exit_pidfile_value_error_recovers_complete_cost_as_candidate_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = toy_repo(repo_dir)
+    spec = make_spec(budget=Budget(max_units=1))
+    (log := tmp_path / "fake-run.log").write_text('{"type":"result","total_cost_usd":0.6}\n')
+    detached = DetachedRun(name="spawned", pid=1234, log_path=log)
+    stopped: list[DetachedRun] = []
+
+    async def fake_launch(
+        command: object,
+        *,
+        name: str,
+        on_spawn: Callable[[DetachedRun], None] | None = None,
+    ) -> DetachedRun:
+        if on_spawn is not None:
+            on_spawn(detached)
+        return detached
+
+    def fail_running(name: str) -> int | None:
+        raise ValueError("invalid pid")
+
+    monkeypatch.setattr(driver_module, "launch", fake_launch)
+    monkeypatch.setattr(driver_module, "running", fail_running)
+    monkeypatch.setattr(driver_module, "stop", stopped.append)
+
+    result = await run(
+        spec,
+        driver=ClaudeCodeDriver(spec, command=fake_claude(tmp_path, FAKE_CLAUDE_HANGS)),
+        repo=repo,
+    )
+
+    (row,) = journal_rows(repo)
+    assert stopped == [detached]
+    assert result.kept == 0
+    assert row.verdict is Verdict.CRASH and row.resources["usd"] == 0.6
+    assert "ValueError" in row.description
 
 
 @pytest.mark.live

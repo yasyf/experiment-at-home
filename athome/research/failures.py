@@ -125,7 +125,10 @@ async def record_infra_event(
     cost: float,
     kind: Literal["retry", "wall_cancel"],
 ) -> None:
-    append_event(path, {"unit": unit, "attempt": attempt, "reason": reason, "cost": cost}, kind=kind)
+    try:
+        append_event(path, {"unit": unit, "attempt": attempt, "reason": reason, "cost": cost}, kind=kind)
+    except OSError as exc:
+        raise AccountingIntegrityError(f"could not record {kind} spend in {path}") from exc
 
 
 async def record_accounting_abort(latch: Path, events: Path, *, unit: int, reason: str) -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from json import JSONDecodeError
+from json import JSONDecodeError, loads
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -88,6 +88,14 @@ class Journal:
     @classmethod
     def open(cls, path: Path, *, mirror_cc_notes: bool = False) -> Journal:
         try:
+            if (
+                path.exists()
+                and (
+                    final_line := next((line for line in reversed(path.read_text().splitlines()) if line.strip()), None)
+                )
+                is not None
+            ):
+                loads(final_line)
             sink = RunSink.open(path)
             rows = [JournalRow.from_record(record) for record in load_journal(path)]
         except (OSError, UnicodeDecodeError, JSONDecodeError, AttributeError, KeyError, TypeError, ValueError) as exc:
