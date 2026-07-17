@@ -504,7 +504,7 @@ async def execute_unit(
                                 cost=cost,
                                 kind="wall_cancel",
                             )
-                    except AccountingIntegrityError as exc:
+                    except (Exception, anyio.get_cancelled_exc_class()) as exc:
                         await record_accounting_abort(abort, events, unit=unit, reason=str(exc))
 
 

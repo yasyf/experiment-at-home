@@ -223,9 +223,10 @@ class OuterCancellingDriver:
     """Cancels its caller during or immediately after a proposal and exposes recovery evidence."""
 
     scope: anyio.CancelScope
-    recovered: float | AccountingIntegrityError
+    recovered: float | BaseException
     completed_cost: float | None = None
     label: str = "outer-cancel"
+    proposal_errors: list[BaseException] = field(default_factory=list)
 
     async def preflight(self) -> None:
         return None
@@ -237,12 +238,16 @@ class OuterCancellingDriver:
                 (workdir / "train.py").write_text("LOSS = 0.5\n")
                 return cost
             case None:
-                await anyio.lowlevel.checkpoint()
+                try:
+                    await anyio.lowlevel.checkpoint()
+                except anyio.get_cancelled_exc_class() as exc:
+                    self.proposal_errors.append(exc)
+                    raise
                 raise AssertionError("unreachable")
 
     async def recover_cost(self) -> float:
         match self.recovered:
-            case AccountingIntegrityError() as exc:
+            case BaseException() as exc:
                 raise exc
             case float() as cost:
                 return cost
@@ -1048,6 +1053,47 @@ async def test_outer_cancellation_mid_proposal_latches_unknown_spend(tmp_path: P
 
     latch = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
     assert json.loads(latch.read_text())["reason"] == "partial billing envelope"
+    assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
+
+
+@pytest.mark.parametrize(
+    "recovery_error",
+    [KeyError("custom recovery bug"), ValueError("custom recovery bug")],
+    ids=["key-error", "value-error"],
+)
+async def test_outer_cancellation_mid_proposal_latches_unexpected_recovery_failure(
+    tmp_path: Path, recovery_error: Exception
+) -> None:
+    repo = toy_repo(tmp_path)
+    scope = anyio.CancelScope()
+    driver = OuterCancellingDriver(scope, recovered=recovery_error)
+
+    with scope:
+        with pytest.raises(anyio.get_cancelled_exc_class()) as propagated:
+            await run(make_spec(budget=Budget(max_units=1)), driver=driver, repo=repo)
+
+    assert propagated.value is driver.proposal_errors[0]
+    latch = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
+    assert json.loads(latch.read_text())["reason"] == str(recovery_error)
+    assert journal_rows(repo) == []
+    assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
+
+
+async def test_outer_cancellation_mid_proposal_latches_recovery_cancellation(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path)
+    scope = anyio.CancelScope()
+    recovery_error = anyio.get_cancelled_exc_class()("recovery cancellation")
+    driver = OuterCancellingDriver(scope, recovered=recovery_error)
+
+    with scope:
+        with pytest.raises(anyio.get_cancelled_exc_class()) as propagated:
+            await run(make_spec(budget=Budget(max_units=1)), driver=driver, repo=repo)
+
+    assert propagated.value is driver.proposal_errors[0]
+    assert propagated.value is not recovery_error
+    latch = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
+    assert json.loads(latch.read_text())["reason"] == str(recovery_error)
+    assert journal_rows(repo) == []
     assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
 
 

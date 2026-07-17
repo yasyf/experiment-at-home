@@ -58,6 +58,9 @@ class Driver(Protocol):
     prerequisites without incurring proposal spend.
     If cancellation interrupts :meth:`propose`, :meth:`recover_cost` returns any billed
     cost the interrupted proposal persisted before it could return.
+    Implementations should raise an :class:`AccountingIntegrityError` subtype for unknown
+    or unrecoverable spend. The loop converts any ordinary recovery exception or backend
+    cancellation into a durable abort latch instead of depending on that convention.
     """
 
     label: str
