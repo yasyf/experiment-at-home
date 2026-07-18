@@ -17,11 +17,12 @@ from athome.research import meta
 from athome.research.cli import cli
 from athome.research.driver import StubProposal
 from athome.research.errors import PreflightFailure
+from athome.research.loop import experiment_lock
 from athome.research.meta import CampaignEvent, Ledger, LedgerRow, PoisonedLedger
 from athome.research.policy import CampaignBudget, ExperimentTemplate, ProposalPolicy
 from athome.research.propose import MAX_PROPOSAL_ATTEMPTS, Proposal
 from athome.research.retro import RetroJournal, RetroVerdict
-from athome.research.spec import Budget, ExperimentSpec
+from athome.research.spec import Budget, ConcurrentRun, ExperimentSpec
 from tests.test_research_propose import scripted_backend
 
 if TYPE_CHECKING:
@@ -451,6 +452,89 @@ async def test_approve_refuses_a_drifted_pending_spec(tmp_path: Path) -> None:
     with pytest.raises(meta.CampaignError, match="digest"):
         await meta.approve(root, 1)
     assert pending.exists()
+
+
+async def test_gated_run_refuses_a_spec_dropped_into_the_queue(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path / "repo")
+    root = tmp_path / "meta"
+    await meta.run_campaign(
+        make_campaign_policy(mode="gated"),
+        repo=repo,
+        root=root,
+        backend=scripted_backend([make_proposal(1)]),
+        driver_factory=forbidden_factory,
+    )
+    (queue := root / meta.QUEUE_DIR).mkdir(parents=True)
+    (queue / "009-rogue.toml").write_text((root / meta.PENDING_DIR / "001-round1.toml").read_text())
+
+    with pytest.raises(meta.CampaignError, match="no approved ledger row"):
+        await meta.run_campaign(
+            make_campaign_policy(mode="gated"),
+            repo=repo,
+            root=root,
+            backend=scripted_backend([]),
+            driver_factory=forbidden_factory,
+        )
+    assert [row.event for row in ledger_rows(root)] == [CampaignEvent.PROPOSED, CampaignEvent.PENDING]
+
+
+async def test_gated_run_refuses_a_queue_spec_drifted_after_approval(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path / "repo")
+    root = tmp_path / "meta"
+    policy = make_campaign_policy(mode="gated")
+    await meta.run_campaign(
+        policy, repo=repo, root=root, backend=scripted_backend([make_proposal(1)]), driver_factory=forbidden_factory
+    )
+    queued = await meta.approve(root, 1)
+    queued.write_text(queued.read_text().replace("max_usd = 2.0", "max_usd = 9000.0"))
+
+    with pytest.raises(meta.CampaignError, match="drifted"):
+        await meta.run_campaign(
+            policy, repo=repo, root=root, backend=scripted_backend([]), driver_factory=forbidden_factory
+        )
+    assert queued.exists()
+
+
+async def test_gated_run_refuses_to_replay_a_launched_spec(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path / "repo")
+    root = tmp_path / "meta"
+    policy = make_campaign_policy(mode="gated")
+    await meta.run_campaign(
+        policy, repo=repo, root=root, backend=scripted_backend([make_proposal(1)]), driver_factory=forbidden_factory
+    )
+    queued = await meta.approve(root, 1)
+    text = queued.read_text()
+    contracts: list[str] = []
+    backend = scripted_backend([make_verdict("round one improved"), make_proposal(2)])
+    result = await meta.run_campaign(
+        policy, repo=repo, root=root, backend=backend, driver_factory=paid_factory([0.9], contracts)
+    )
+    assert result.completed == 1
+
+    queued.write_text(text)
+    with pytest.raises(meta.CampaignError, match="already launched"):
+        await meta.run_campaign(
+            policy, repo=repo, root=root, backend=scripted_backend([]), driver_factory=forbidden_factory
+        )
+
+
+async def test_approve_and_reject_refuse_while_a_runner_holds_the_lock(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path / "repo")
+    root = tmp_path / "meta"
+    await meta.run_campaign(
+        make_campaign_policy(mode="gated"),
+        repo=repo,
+        root=root,
+        backend=scripted_backend([make_proposal(1)]),
+        driver_factory=forbidden_factory,
+    )
+
+    async with experiment_lock(root / meta.LOCK_NAME):
+        with pytest.raises(ConcurrentRun):
+            await meta.approve(root, 1)
+        with pytest.raises(ConcurrentRun):
+            await meta.reject(root, 1, reason="racing")
+    assert (root / meta.PENDING_DIR / "001-round1.toml").exists()
 
 
 async def test_reject_removes_the_pending_spec_and_ledgers_why(tmp_path: Path) -> None:

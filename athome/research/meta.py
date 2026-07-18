@@ -8,7 +8,9 @@ the reservation to journal-measured actuals in the ledger. An infra-aborted
 experiment never consumes a candidate-experiment slot — it counts toward the
 consecutive-failure stop instead. Gated mode writes the admitted spec to
 ``pending/`` and never runs it; :func:`approve` digest-verifies the file into the
-queue, after which the codepath is identical. The stop file halts the campaign at
+queue, and the gated drain re-verifies every queued spec against its ``approved``
+ledger row — refusing a drifted or unledgered file, and refusing to replay a
+sequence whose launch already began — after which the codepath is identical. The stop file halts the campaign at
 the experiment boundary, like the A3 restart latch: the current experiment
 finishes, nothing new launches, and the file persists until the operator removes
 it. Proposer and retro LLM spend is count-bounded (at most
@@ -80,8 +82,9 @@ class CampaignEvent(StrEnum):
     """One kind of append-only campaign ledger row.
 
     ``TERMINAL`` events release a reservation to actuals, ``FAILURES`` feed the
-    consecutive-failure stop, and ``RUNS`` consume a candidate-experiment slot
-    (and reset the failure streak).
+    consecutive-failure stop, ``RUNS`` consume a candidate-experiment slot
+    (and reset the failure streak), and ``LAUNCHED`` events mark a sequence
+    whose launch already began, barring a queue replay.
     """
 
     PROPOSED = "proposed"
@@ -98,6 +101,7 @@ class CampaignEvent(StrEnum):
 
     TERMINAL = nonmember(frozenset({COMPLETED, ABORTED, INFRA_ABORTED, PREFLIGHT_FAILED}))
     FAILURES = nonmember(frozenset({REJECTED, PREFLIGHT_FAILED, INFRA_ABORTED}))
+    LAUNCHED = nonmember(frozenset({RESERVED, STARTED, COMPLETED, ABORTED, INFRA_ABORTED, PREFLIGHT_FAILED}))
     RUNS = nonmember(frozenset({COMPLETED, ABORTED}))
 
 
@@ -400,7 +404,7 @@ class Campaign:
         for path in sorted((self.root / QUEUE_DIR).glob("*.toml")):
             if (reason := await self.boundary()) is not None:
                 return await self.halt(reason)
-            spec = ExperimentSpec.load(path)
+            spec = self.verified_queue_spec(path)
             if (refusal := self.reservation_refusal(spec)) is not None:
                 return await self.halt(refusal)
             await self.launch(spec)
@@ -480,6 +484,23 @@ class Campaign:
                 f"to {reserved_wall:.0f}s, over max_wall_s {campaign.max_wall_s:.0f}s"
             )
         return None
+
+    def verified_queue_spec(self, path: Path) -> ExperimentSpec:
+        seq = spec_seq(path.stem)
+        if any(row.seq == seq and row.event in CampaignEvent.LAUNCHED for row in self.ledger.rows()):
+            raise CampaignError(f"queued spec {path.name} for seq {seq} was already launched; refusing to run it again")
+        approved = next(
+            (row for row in reversed(self.ledger.rows()) if row.seq == seq and row.event is CampaignEvent.APPROVED),
+            None,
+        )
+        if approved is None:
+            raise CampaignError(f"queued spec {path.name} has no approved ledger row for seq {seq}")
+        if (digest := sha256(path.read_bytes()).hexdigest()) != approved.extra["sha256"]:
+            raise CampaignError(
+                f"queued spec {path.name} digest {digest} does not match the approved {approved.extra['sha256']}; "
+                "refusing to launch a drifted spec"
+            )
+        return ExperimentSpec.load(path)
 
     async def materialize(self, round_: ProposalRound, *, seq: int, context: ProposerContext) -> str:
         audit = anyio.Path(self.root / EXPERIMENTS_DIR / round_.spec.name)
@@ -657,32 +678,36 @@ async def approve(root: Path, seq: int) -> Path:
     Raises:
         CampaignError: No, or an ambiguous, pending spec for ``seq``; no
             ``pending`` ledger row; or a digest mismatch.
+        ConcurrentRun: A live campaign runner holds the campaign lock.
     """
-    path = pending_spec(root, seq)
-    ledger = Ledger.open(root / LEDGER_NAME)
-    row = next((row for row in reversed(ledger.rows()) if row.seq == seq and row.event is CampaignEvent.PENDING), None)
-    if row is None:
-        raise CampaignError(f"no pending ledger row for seq {seq}")
-    text = await anyio.Path(path).read_text()
-    if (digest := sha256(text.encode()).hexdigest()) != row.extra["sha256"]:
-        raise CampaignError(
-            f"pending spec {path.name} digest {digest} does not match the ledgered {row.extra['sha256']}; "
-            "refusing to queue a drifted spec"
+    async with experiment_lock(root / LOCK_NAME):
+        path = pending_spec(root, seq)
+        ledger = Ledger.open(root / LEDGER_NAME)
+        row = next(
+            (row for row in reversed(ledger.rows()) if row.seq == seq and row.event is CampaignEvent.PENDING), None
         )
-    queue = anyio.Path(root / QUEUE_DIR)
-    await queue.mkdir(parents=True, exist_ok=True)
-    await anyio.Path(path).rename(target := Path(queue) / path.name)
-    await ledger.append(
-        LedgerRow(
-            seq=seq,
-            event=CampaignEvent.APPROVED,
-            usd=0.0,
-            wall_s=0.0,
-            reason="",
-            extra={"name": path.stem, "sha256": digest},
+        if row is None:
+            raise CampaignError(f"no pending ledger row for seq {seq}")
+        text = await anyio.Path(path).read_text()
+        if (digest := sha256(text.encode()).hexdigest()) != row.extra["sha256"]:
+            raise CampaignError(
+                f"pending spec {path.name} digest {digest} does not match the ledgered {row.extra['sha256']}; "
+                "refusing to queue a drifted spec"
+            )
+        queue = anyio.Path(root / QUEUE_DIR)
+        await queue.mkdir(parents=True, exist_ok=True)
+        await anyio.Path(path).rename(target := Path(queue) / path.name)
+        await ledger.append(
+            LedgerRow(
+                seq=seq,
+                event=CampaignEvent.APPROVED,
+                usd=0.0,
+                wall_s=0.0,
+                reason="",
+                extra={"name": path.stem, "sha256": digest},
+            )
         )
-    )
-    return target
+        return target
 
 
 async def reject(root: Path, seq: int, *, reason: str) -> None:
@@ -695,20 +720,22 @@ async def reject(root: Path, seq: int, *, reason: str) -> None:
 
     Raises:
         CampaignError: No, or an ambiguous, pending spec for ``seq``.
+        ConcurrentRun: A live campaign runner holds the campaign lock.
     """
-    path = pending_spec(root, seq)
-    ledger = Ledger.open(root / LEDGER_NAME)
-    await anyio.Path(path).unlink()
-    await ledger.append(
-        LedgerRow(
-            seq=seq,
-            event=CampaignEvent.REJECTED,
-            usd=0.0,
-            wall_s=0.0,
-            reason=f"operator rejected: {reason}",
-            extra={"name": path.stem},
+    async with experiment_lock(root / LOCK_NAME):
+        path = pending_spec(root, seq)
+        ledger = Ledger.open(root / LEDGER_NAME)
+        await anyio.Path(path).unlink()
+        await ledger.append(
+            LedgerRow(
+                seq=seq,
+                event=CampaignEvent.REJECTED,
+                usd=0.0,
+                wall_s=0.0,
+                reason=f"operator rejected: {reason}",
+                extra={"name": path.stem},
+            )
         )
-    )
 
 
 async def campaign_report(root: Path) -> dict[str, object]:
