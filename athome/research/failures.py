@@ -121,9 +121,9 @@ def safe_describe(exc: BaseException) -> str:
     for render in (str, repr):
         try:
             return render(exc)
-        except Exception:
-            # This describer is total: a broken __str__/__repr__ must never replace the
-            # exception a total boundary is recording (A3.12).
+        except BaseException:
+            # Total over hostile renderers, BaseException included; the recording
+            # boundary re-raises the original exception, never the renderer's (A3.12).
             continue
     return f"<unprintable {type(exc).__name__}>"
 
@@ -143,19 +143,39 @@ async def record_infra_event(
         raise AccountingIntegrityError(f"could not record {kind} spend in {path}") from exc
 
 
-async def record_accounting_abort(latch: Path, events: Path, *, unit: int, reason: str) -> None:
+async def record_accounting_abort(latch: Path, events: Path, *, unit: int, reason: str | BaseException) -> None:
+    match reason:
+        case BaseException() as exc:
+            # The durable latch goes down FIRST with a reason that cannot invoke user
+            # code; describing the exception runs its own renderers, so it only ever
+            # enriches an already-written latch (A3.12).
+            await record_accounting_abort(latch, events, unit=unit, reason=type(exc).__name__)
+            await enrich_accounting_abort(latch, unit=unit, exc=exc)
+        case str():
+            with anyio.CancelScope(shield=True):
+                try:
+                    await atomic_write_text(
+                        anyio.Path(latch),
+                        json.dumps({"unit": unit, "reason": reason, "ts": time.time()}),
+                    )
+                except OSError:
+                    logger.exception("could not write accounting-abort latch to {}", latch)
+                try:
+                    append_event(events, {"unit": unit, "reason": reason}, kind="accounting_abort")
+                except OSError:
+                    logger.exception("could not write accounting-abort breadcrumb to {}", events)
+
+
+async def enrich_accounting_abort(latch: Path, *, unit: int, exc: BaseException) -> None:
+    try:
+        payload = json.dumps({"unit": unit, "reason": safe_describe(exc), "ts": time.time()})
+    except BaseException:  # the safe latch is already durable; enrichment is best-effort
+        return
     with anyio.CancelScope(shield=True):
         try:
-            await atomic_write_text(
-                anyio.Path(latch),
-                json.dumps({"unit": unit, "reason": reason, "ts": time.time()}),
-            )
+            await atomic_write_text(anyio.Path(latch), payload)
         except OSError:
-            logger.exception("could not write accounting-abort latch to {}", latch)
-        try:
-            append_event(events, {"unit": unit, "reason": reason}, kind="accounting_abort")
-        except OSError:
-            logger.exception("could not write accounting-abort breadcrumb to {}", events)
+            logger.exception("could not enrich accounting-abort latch in {}", latch)
 
 
 def append_event(path: Path, event: dict[str, object], *, kind: SidecarKind) -> None:

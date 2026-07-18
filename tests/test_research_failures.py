@@ -217,7 +217,46 @@ class BrokenStrAndRepr(BrokenStr):
         raise RuntimeError("broken __repr__")
 
 
+class InterruptingStr(Exception):
+    def __str__(self) -> str:
+        raise KeyboardInterrupt
+
+
+class InterruptingStrAndRepr(InterruptingStr):
+    def __repr__(self) -> str:
+        raise SystemExit(1)
+
+
 def test_safe_describe_is_total_over_broken_renderers() -> None:
     assert safe_describe(ValueError("plain message")) == "plain message"
     assert safe_describe(BrokenStr("boom")) == "BrokenStr('boom')"
     assert safe_describe(BrokenStrAndRepr("boom")) == "<unprintable BrokenStrAndRepr>"
+    assert safe_describe(InterruptingStr("boom")) == "InterruptingStr('boom')"
+    assert safe_describe(InterruptingStrAndRepr("boom")) == "<unprintable InterruptingStrAndRepr>"
+
+
+@pytest.mark.parametrize(
+    "renderer_error",
+    [
+        pytest.param(RuntimeError, id="exception-renderer"),
+        pytest.param(KeyboardInterrupt, id="base-exception-renderer"),
+    ],
+)
+async def test_abort_latch_is_durable_before_any_renderer_runs(
+    tmp_path: Path, renderer_error: type[BaseException]
+) -> None:
+    latch = tmp_path / "toy.abort.json"
+    events = tmp_path / "toy.events.jsonl"
+    observed: list[bool] = []
+
+    class ProbingAbort(AccountingIntegrityError):
+        def __str__(self) -> str:
+            observed.append(latch.exists())
+            raise renderer_error("hostile renderer")
+
+    await record_accounting_abort(latch, events, unit=2, reason=ProbingAbort("boom"))
+
+    assert observed and all(observed)  # every render found the latch already on disk
+    assert json.loads(latch.read_text())["reason"] == "ProbingAbort('boom')"
+    records = [json.loads(line) for line in events.read_text().splitlines()]
+    assert [(record["kind"], record["reason"]) for record in records] == [("accounting_abort", "ProbingAbort")]

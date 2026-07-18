@@ -963,6 +963,37 @@ async def test_abort_epilogue_survives_a_broken_exception_renderer(
     assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
 
 
+@pytest.mark.parametrize(
+    "renderer_error",
+    [
+        pytest.param(RuntimeError, id="exception-renderer"),
+        pytest.param(KeyboardInterrupt, id="base-exception-renderer"),
+    ],
+)
+async def test_abort_latch_exists_before_the_hostile_renderer_runs(
+    tmp_path: Path, renderer_error: type[BaseException]
+) -> None:
+    # A3.12 round 2: the latch is written before any user renderer can run, and a
+    # renderer raising a BaseException neither suppresses it nor replaces the abort.
+    repo = toy_repo(tmp_path)
+    latch = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
+    observed: list[bool] = []
+
+    class ProbingAbort(AccountingIntegrityError):
+        def __str__(self) -> str:
+            observed.append(latch.exists())
+            raise renderer_error("hostile renderer")
+
+    error = ProbingAbort("boom")
+    with pytest.raises(AccountingIntegrityError) as excinfo:
+        await run(make_spec(budget=Budget(max_units=1)), driver=AbortRaisingDriver(error), repo=repo)
+
+    assert excinfo.value is error
+    assert observed and all(observed)  # every render found the latch already durable
+    assert json.loads(latch.read_text()) | {"ts": None} == {"unit": 0, "reason": "ProbingAbort('boom')", "ts": None}
+    assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
+
+
 class BrokenStrRecovery(Exception):
     def __str__(self) -> str:
         raise RuntimeError("broken __str__")
