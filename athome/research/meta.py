@@ -53,7 +53,7 @@ from athome.research.common import Hasher
 from athome.research.contract import sanitize_history
 from athome.research.driver import ClaudeCodeDriver
 from athome.research.errors import AccountingIntegrityError, PreflightFailure, ResearchError
-from athome.research.failures import InfraFailure, infra_cost
+from athome.research.failures import InfraFailure, infra_cost, safe_describe
 from athome.research.journal import Journal
 from athome.research.loop import experiment_lock
 from athome.research.loop import run as run_experiment
@@ -470,7 +470,7 @@ class Campaign:
             round_ = await propose(self.policy, context, backend=self.backend, seq=seq, tier=self.tier)
         except ProposalViolation as violation:
             await self.ledger.append(
-                LedgerRow(seq=seq, event=CampaignEvent.REJECTED, usd=0.0, wall_s=0.0, reason=str(violation))
+                LedgerRow(seq=seq, event=CampaignEvent.REJECTED, usd=0.0, wall_s=0.0, reason=safe_describe(violation))
             )
             return None
         await self.ledger.append(proposed_row(seq, round_))
@@ -596,13 +596,17 @@ class Campaign:
                 spec, driver=self.driver_factory(spec), repo=self.repo, mirror_cc_notes=self.mirror_cc_notes
             )
         except PreflightFailure as exc:
-            await self.release(spec, seq=seq, event=CampaignEvent.PREFLIGHT_FAILED, reason=str(exc), started=started)
+            await self.release(
+                spec, seq=seq, event=CampaignEvent.PREFLIGHT_FAILED, reason=safe_describe(exc), started=started
+            )
             return
         except BudgetExhausted as exc:
-            await self.release(spec, seq=seq, event=CampaignEvent.ABORTED, reason=str(exc), started=started)
+            await self.release(spec, seq=seq, event=CampaignEvent.ABORTED, reason=safe_describe(exc), started=started)
             return
         except InfraFailure as exc:
-            await self.release(spec, seq=seq, event=CampaignEvent.INFRA_ABORTED, reason=str(exc), started=started)
+            await self.release(
+                spec, seq=seq, event=CampaignEvent.INFRA_ABORTED, reason=safe_describe(exc), started=started
+            )
             return
         await self.release(
             spec,

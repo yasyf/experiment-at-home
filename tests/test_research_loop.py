@@ -882,6 +882,98 @@ async def test_driver_cost_is_validated_before_journaling(tmp_path: Path, cost: 
     assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
 
 
+class BrokenStrAbort(AccountingIntegrityError):
+    def __str__(self) -> str:
+        raise RuntimeError("broken __str__")
+
+
+class BrokenReprAbort(AccountingIntegrityError):
+    def __repr__(self) -> str:
+        raise RuntimeError("broken __repr__")
+
+
+class UnprintableAbort(BrokenStrAbort):
+    def __repr__(self) -> str:
+        raise RuntimeError("broken __repr__")
+
+
+@dataclass(frozen=True, slots=True)
+class AbortRaisingDriver:
+    error: AccountingIntegrityError
+    label: str = "abort-raising"
+
+    async def preflight(self) -> None:
+        return None
+
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
+        raise self.error
+
+    async def recover_cost(self) -> float:
+        return 0.0
+
+
+@pytest.mark.parametrize(
+    "error, described",
+    [
+        pytest.param(BrokenStrAbort("boom"), "BrokenStrAbort('boom')", id="broken-str"),
+        pytest.param(BrokenReprAbort("boom"), "boom", id="broken-repr"),
+        pytest.param(UnprintableAbort("boom"), "<unprintable UnprintableAbort>", id="broken-str-and-repr"),
+    ],
+)
+async def test_abort_epilogue_survives_a_broken_exception_renderer(
+    tmp_path: Path, error: AccountingIntegrityError, described: str
+) -> None:
+    # A3.12: the total boundary guards its own error reporting — a broken __str__/__repr__
+    # must neither suppress the latch nor replace the original abort.
+    repo = toy_repo(tmp_path)
+
+    with pytest.raises(AccountingIntegrityError) as excinfo:
+        await run(make_spec(budget=Budget(max_units=1)), driver=AbortRaisingDriver(error), repo=repo)
+
+    assert excinfo.value is error  # the original abort propagates, never a formatting error
+    latch = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
+    assert json.loads(latch.read_text()) | {"ts": None} == {"unit": 0, "reason": described, "ts": None}
+    assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
+
+
+class BrokenStrRecovery(Exception):
+    def __str__(self) -> str:
+        raise RuntimeError("broken __str__")
+
+
+@dataclass(frozen=True, slots=True)
+class BrokenRecoveryDriver:
+    error: Exception
+    label: str = "broken-recovery"
+
+    async def preflight(self) -> None:
+        return None
+
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable")
+
+    async def recover_cost(self) -> float:
+        raise self.error
+
+
+async def test_cleanup_epilogue_survives_a_recovery_error_with_a_broken_str(tmp_path: Path) -> None:
+    # A3.12 finally-path: recover_cost raising an exception whose __str__ raises must still
+    # write the latch, and the recovery error itself propagates by identity.
+    repo = toy_repo(tmp_path)
+    driver = BrokenRecoveryDriver(BrokenStrRecovery("recovery blew up"))
+
+    with anyio.fail_after(3.0):
+        with pytest.raises(BrokenStrRecovery) as excinfo:
+            await run(make_spec(budget=Budget(max_units=1, max_wall_s=0.2)), driver=driver, repo=repo)
+
+    assert excinfo.value is driver.error
+    latch = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
+    record = json.loads(latch.read_text())
+    assert record["unit"] == 0 and record["reason"] == "BrokenStrRecovery('recovery blew up')"
+    assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
+
+
 @pytest.mark.parametrize("error", [ValueError, TypeError, KeyError])
 def test_driver_cost_validation_is_total_over_numeric_input(error: type[Exception]) -> None:
     class ExplodingFloat(float):

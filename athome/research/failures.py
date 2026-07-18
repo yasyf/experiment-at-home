@@ -117,6 +117,17 @@ def classify(exc: BaseException) -> Literal["accounting", "infra", "candidate"]:
             return "candidate"
 
 
+def safe_describe(exc: BaseException) -> str:
+    for render in (str, repr):
+        try:
+            return render(exc)
+        except Exception:
+            # This describer is total: a broken __str__/__repr__ must never replace the
+            # exception a total boundary is recording (A3.12).
+            continue
+    return f"<unprintable {type(exc).__name__}>"
+
+
 async def record_infra_event(
     path: Path,
     *,

@@ -35,6 +35,7 @@ from athome.research.failures import (
     infra_log,
     record_accounting_abort,
     record_infra_event,
+    safe_describe,
 )
 from athome.research.gate import immutable_violations, monotone_gate, parse_diff_tree
 from athome.research.journal import Journal, JournalRow, Verdict
@@ -366,7 +367,7 @@ async def run_unit(
             spent=spent,
         )
     except AccountingIntegrityError as exc:
-        await record_accounting_abort(abort, events, unit=unit, reason=str(exc))
+        await record_accounting_abort(abort, events, unit=unit, reason=safe_describe(exc))
         raise
 
 
@@ -516,7 +517,7 @@ async def execute_unit(
                                 kind="wall_cancel",
                             )
                     except (Exception, anyio.get_cancelled_exc_class()) as exc:
-                        await record_accounting_abort(abort, events, unit=unit, reason=str(exc))
+                        await record_accounting_abort(abort, events, unit=unit, reason=safe_describe(exc))
 
 
 async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_notes: bool = False) -> LoopResult:

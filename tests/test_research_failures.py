@@ -20,6 +20,7 @@ from athome.research.failures import (
     infra_retries,
     record_accounting_abort,
     record_infra_event,
+    safe_describe,
 )
 from athome.research.spec import ImmutableViolation, ProposalTimeout
 
@@ -204,3 +205,19 @@ def test_unreadable_sidecar_cost_uses_accounting_taxonomy(tmp_path: Path, monkey
 
     with pytest.raises(AccountingIntegrityError):
         infra_cost(events)
+
+
+class BrokenStr(Exception):
+    def __str__(self) -> str:
+        raise RuntimeError("broken __str__")
+
+
+class BrokenStrAndRepr(BrokenStr):
+    def __repr__(self) -> str:
+        raise RuntimeError("broken __repr__")
+
+
+def test_safe_describe_is_total_over_broken_renderers() -> None:
+    assert safe_describe(ValueError("plain message")) == "plain message"
+    assert safe_describe(BrokenStr("boom")) == "BrokenStr('boom')"
+    assert safe_describe(BrokenStrAndRepr("boom")) == "<unprintable BrokenStrAndRepr>"
