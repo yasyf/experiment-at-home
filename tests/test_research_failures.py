@@ -106,6 +106,36 @@ async def test_accounting_abort_writes_latch_before_breadcrumb(tmp_path: Path, m
     assert observed == [(events, {"unit": 7, "reason": "unrecoverable spend"}, "accounting_abort")]
 
 
+async def test_failed_initial_latch_write_skips_enrichment_entirely(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R3 fix 5: the renderer must never run without a durable latch on disk.
+    latch = tmp_path / "toy.abort.json"
+    events = tmp_path / "toy.events.jsonl"
+    rendered: list[str] = []
+
+    class ProbingError(Exception):
+        def __str__(self) -> str:
+            rendered.append("str")
+            return "boom"
+
+        def __repr__(self) -> str:
+            rendered.append("repr")
+            return "boom"
+
+    async def fail_write(path: object, text: str) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(failures, "atomic_write_text", fail_write)
+
+    await record_accounting_abort(latch, events, unit=3, reason=ProbingError("boom"))
+
+    assert rendered == []  # enrichment skipped: no renderer ran without a durable latch
+    assert not latch.exists()
+    [event] = infra_events(events)
+    assert event == {"unit": 3, "reason": "ProbingError", "kind": "accounting_abort"}
+
+
 async def test_torn_middle_sidecar_line_never_loses_a_later_record(tmp_path: Path) -> None:
     # Finding #4: a torn (newline-less) prior line must not swallow the next appends. The writer
     # heals the fragment onto its own line; the reader skips only that malformed line.

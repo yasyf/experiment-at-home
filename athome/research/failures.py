@@ -33,7 +33,8 @@ per-run ``<name>.abort.json`` latch with its unit, reason, and timestamp, then b
 appends an ``accounting_abort`` sidecar breadcrumb for M3 reporting. A later run refuses
 to start while the latch remains: check the provider ledger, reconcile the spend, then
 delete the latch file. The sidecar is reporting evidence, not the restart authority. If
-the latch write itself fails I/O, the doubly-degraded F3 residue still aborts loudly, as
+the latch write itself fails I/O, enrichment is skipped — the renderer never runs
+without a durable latch — and the doubly-degraded F3 residue still aborts loudly, as
 do unreadable billing evidence or a detached process that cannot be stopped; check and
 reconcile the ledger before resuming.
 
@@ -148,24 +149,35 @@ async def record_infra_event(
 async def record_accounting_abort(latch: Path, events: Path, *, unit: int, reason: str | BaseException) -> None:
     match reason:
         case BaseException() as exc:
-            # The durable latch goes down FIRST with a reason that cannot invoke user
-            # code; describing the exception runs its own renderers, so it only ever
-            # enriches an already-written latch (A3.12).
-            await record_accounting_abort(latch, events, unit=unit, reason=type(exc).__name__)
-            await enrich_accounting_abort(latch, unit=unit, exc=exc)
+            # Enrichment runs exception renderers, so it only ever follows a durable latch (A3.12).
+            latched = await write_abort_latch(latch, unit=unit, reason=type(exc).__name__)
+            append_abort_breadcrumb(events, unit=unit, reason=type(exc).__name__)
+            if latched:
+                await enrich_accounting_abort(latch, unit=unit, exc=exc)
+            else:
+                logger.error("skipping latch enrichment for unit {}: no durable latch was written to {}", unit, latch)
         case str():
-            with anyio.CancelScope(shield=True):
-                try:
-                    await atomic_write_text(
-                        anyio.Path(latch),
-                        json.dumps({"unit": unit, "reason": reason, "ts": time.time()}),
-                    )
-                except OSError:
-                    logger.exception("could not write accounting-abort latch to {}", latch)
-                try:
-                    append_event(events, {"unit": unit, "reason": reason}, kind="accounting_abort")
-                except OSError:
-                    logger.exception("could not write accounting-abort breadcrumb to {}", events)
+            await write_abort_latch(latch, unit=unit, reason=reason)
+            append_abort_breadcrumb(events, unit=unit, reason=reason)
+
+
+async def write_abort_latch(latch: Path, *, unit: int, reason: str) -> bool:
+    # logger.error, not logger.exception: a diagnose traceback reprs caller locals — the
+    # hostile exception among them — and no renderer may run before the latch is durable.
+    with anyio.CancelScope(shield=True):
+        try:
+            await atomic_write_text(anyio.Path(latch), json.dumps({"unit": unit, "reason": reason, "ts": time.time()}))
+        except OSError as exc:
+            logger.error("could not write accounting-abort latch to {}: {}", latch, safe_describe(exc))
+            return False
+    return True
+
+
+def append_abort_breadcrumb(events: Path, *, unit: int, reason: str) -> None:
+    try:
+        append_event(events, {"unit": unit, "reason": reason}, kind="accounting_abort")
+    except OSError as exc:
+        logger.error("could not write accounting-abort breadcrumb to {}: {}", events, safe_describe(exc))
 
 
 async def enrich_accounting_abort(latch: Path, *, unit: int, exc: BaseException) -> None:
