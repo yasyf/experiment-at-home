@@ -60,9 +60,12 @@ def _metric_summary(rows: Sequence[JournalRow], report: MorningReport) -> _Metri
     kept_metrics = tuple(row.metric for row in rows if row.verdict is Verdict.KEEP and row.metric is not None)
     match kept_metrics, report.best.metric if report.best is not None else None:
         case (), _:
-            raise RetroError("a retrospective requires at least one kept metric")
+            raise RetroError(
+                f"experiment {report.experiment} completed with zero kept units: a retrospective requires "
+                "at least one kept metric"
+            )
         case _, None:
-            raise RetroError("a retrospective requires a best kept metric")
+            raise RetroError(f"experiment {report.experiment} has no best kept metric to compare")
         case (baseline, *_), best_metric:
             return _MetricSummary(baseline, best_metric, abs(best_metric - baseline))
 

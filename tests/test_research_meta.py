@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import sys
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -141,12 +143,14 @@ class PaidDriver:
     contracts: list[str]
     cost: float = 2.0
     label: str = "paid-stub"
+    budgets: list[float | None] = field(default_factory=list)
 
     async def preflight(self) -> None:
         return None
 
-    async def propose(self, contract: str, workdir: Path) -> float:
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         self.contracts.append(contract)
+        self.budgets.append(budget_usd)
         for relative, content in next(self.proposals).files.items():
             target = anyio.Path(workdir) / relative
             await target.parent.mkdir(parents=True, exist_ok=True)
@@ -166,9 +170,9 @@ class StopArmingDriver:
     async def preflight(self) -> None:
         await self.inner.preflight()
 
-    async def propose(self, contract: str, workdir: Path) -> float:
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         await meta.request_stop(self.root, reason="mid-campaign halt")
-        return await self.inner.propose(contract, workdir)
+        return await self.inner.propose(contract, workdir, budget_usd=budget_usd)
 
     async def recover_cost(self) -> float:
         return await self.inner.recover_cost()
@@ -181,7 +185,7 @@ class BrokenPreflightDriver:
     async def preflight(self) -> None:
         raise PreflightFailure("scorer missing on this machine")
 
-    async def propose(self, contract: str, workdir: Path) -> float:
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         raise AssertionError("a failed preflight must never reach a proposal")
 
     async def recover_cost(self) -> float:
@@ -195,7 +199,7 @@ class InfraDriver:
     async def preflight(self) -> None:
         return None
 
-    async def propose(self, contract: str, workdir: Path) -> float:
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         raise OSError("network unreachable")
 
     async def recover_cost(self) -> float:
@@ -328,6 +332,55 @@ async def test_stop_mid_campaign_halts_at_the_experiment_boundary(tmp_path: Path
     assert len(backend.calls) == 2
 
 
+async def test_stop_armed_after_the_boundary_check_halts_before_the_proposer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = toy_repo(tmp_path / "repo")
+    root = tmp_path / "meta"
+    boundary = meta.Campaign.boundary
+
+    async def arming_boundary(self: meta.Campaign) -> str | None:
+        reason = await boundary(self)
+        await meta.request_stop(self.root, reason="armed after boundary")
+        return reason
+
+    monkeypatch.setattr(meta.Campaign, "boundary", arming_boundary)
+    backend = scripted_backend([])
+
+    result = await meta.run_campaign(
+        make_campaign_policy(), repo=repo, root=root, backend=backend, driver_factory=forbidden_factory
+    )
+
+    assert result.halted == "stop requested: armed after boundary"
+    assert backend.calls == []
+    assert [row.event for row in ledger_rows(root)] == [CampaignEvent.STOPPED]
+
+
+async def test_stop_armed_during_the_proposer_halts_before_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = toy_repo(tmp_path / "repo")
+    root = tmp_path / "meta"
+    backend = scripted_backend([make_proposal(1)])
+    propose = meta.propose
+
+    async def arming_propose(*args: object, **kwargs: object) -> object:
+        round_ = await propose(*args, **kwargs)
+        await meta.request_stop(root, reason="armed mid-proposal")
+        return round_
+
+    monkeypatch.setattr(meta, "propose", arming_propose)
+
+    result = await meta.run_campaign(
+        make_campaign_policy(), repo=repo, root=root, backend=backend, driver_factory=forbidden_factory
+    )
+
+    assert result.halted == "stop requested: armed mid-proposal"
+    rows = ledger_rows(root)
+    assert [row.event for row in rows] == [CampaignEvent.PROPOSED, CampaignEvent.STOPPED]
+    assert not any(row.event in CampaignEvent.LAUNCHED for row in rows)
+
+
 async def test_out_of_policy_proposals_ledger_rejected_until_the_failure_cap(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path / "repo")
     root = tmp_path / "meta"
@@ -392,6 +445,84 @@ async def test_infra_abort_does_not_consume_a_candidate_slot_and_counts_toward_t
     assert not ledger.open_reservations()
     assert result.halted is not None and "consecutive failed rounds" in result.halted
     assert retro_names(root) == []
+
+
+async def test_actual_overshoot_latches_refusal_and_ledgers_true_spend(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path / "repo")
+    root = tmp_path / "meta"
+    contracts: list[str] = []
+    backend = scripted_backend([make_proposal(1)])
+
+    result = await meta.run_campaign(
+        make_campaign_policy(max_total_usd=3.0),
+        repo=repo,
+        root=root,
+        backend=backend,
+        driver_factory=lambda spec: PaidDriver(iter([loss_proposal(0.9)]), contracts, cost=3.5),
+    )
+
+    aborted = [row for row in ledger_rows(root) if row.event is CampaignEvent.ABORTED]
+    assert len(aborted) == 1 and aborted[0].usd == 3.5  # true actuals, overshoot included, never clamped to the cap
+    assert result.halted is not None and "campaign budget exhausted" in result.halted
+    assert len(backend.calls) == 1  # the latch refused the next proposer round
+
+    relaunch = scripted_backend([])
+    again = await meta.run_campaign(
+        make_campaign_policy(max_total_usd=3.0),
+        repo=repo,
+        root=root,
+        backend=relaunch,
+        driver_factory=forbidden_factory,
+    )
+    assert again.halted is not None and "campaign budget exhausted" in again.halted
+    assert relaunch.calls == []
+
+
+async def test_each_invocation_receives_the_remaining_experiment_budget(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path / "repo")
+    root = tmp_path / "meta"
+    contracts: list[str] = []
+    driver = PaidDriver(iter([loss_proposal(0.9), loss_proposal(0.8)]), contracts, cost=0.6)
+    backend = scripted_backend([make_proposal(1, max_units=2), make_verdict("two cheap units")])
+
+    result = await meta.run_campaign(
+        make_campaign_policy(max_experiments=1),
+        repo=repo,
+        root=root,
+        backend=backend,
+        driver_factory=lambda spec: driver,
+    )
+
+    assert result.completed == 1
+    assert driver.budgets == [2.0, 1.4]  # the declared max_usd, then max_usd minus the recorded spend
+
+
+async def test_resume_generates_catch_up_retros_before_the_next_round(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path / "repo")
+    root = tmp_path / "meta"
+    contracts: list[str] = []
+    await meta.run_campaign(
+        make_campaign_policy(max_experiments=1),
+        repo=repo,
+        root=root,
+        backend=scripted_backend([make_proposal(1), make_verdict("live retro")]),
+        driver_factory=paid_factory([0.9], contracts),
+    )
+    assert retro_names(root) == ["001-round1"]
+    (root / meta.RETROS_NAME).unlink()  # a crash between the completed ledger row and the durable retro
+
+    backend = scripted_backend([make_verdict("caught up"), make_proposal(2), make_verdict("round two")])
+    result = await meta.run_campaign(
+        make_campaign_policy(max_experiments=2),
+        repo=repo,
+        root=root,
+        backend=backend,
+        driver_factory=paid_factory([0.8], contracts),
+    )
+
+    assert result.completed == 2
+    assert retro_names(root) == ["001-round1", "002-round2"]
+    assert "caught up" in backend.calls[1].prompt  # the catch-up retro feeds the next proposal round
 
 
 async def test_gated_mode_never_runs_an_unapproved_spec(tmp_path: Path) -> None:
@@ -493,6 +624,81 @@ async def test_gated_run_refuses_a_queue_spec_drifted_after_approval(tmp_path: P
             policy, repo=repo, root=root, backend=scripted_backend([]), driver_factory=forbidden_factory
         )
     assert queued.exists()
+
+
+async def test_queue_verification_parses_the_exact_bytes_it_hashed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "meta"
+    (root / meta.QUEUE_DIR).mkdir(parents=True)
+    approved = (
+        textwrap.dedent(
+            """
+        name = "001-round1"
+        metric_command = ["python", "score.py"]
+        metric_key = "loss"
+        direction = "min"
+        mutable_paths = ["train.py"]
+        immutable_paths = ["score.py"]
+
+        [budget]
+        max_units = 1
+        max_wall_s = 300.0
+        max_usd = 2.0
+        """
+        )
+        .strip()
+        .encode()
+    )
+    smuggled = approved.replace(b'"loss"', b'"smuggled"')
+    queued = root / meta.QUEUE_DIR / "001-round1.toml"
+    queued.write_bytes(approved)
+    ledger = Ledger.open(root / meta.LEDGER_NAME)
+    await ledger.append(
+        LedgerRow(
+            seq=1,
+            event=CampaignEvent.APPROVED,
+            usd=0.0,
+            wall_s=0.0,
+            reason="",
+            extra={"name": "001-round1", "sha256": sha256(approved).hexdigest()},
+        )
+    )
+    campaign = meta.Campaign(
+        policy=make_campaign_policy(mode="gated"),
+        repo=tmp_path / "repo",
+        root=root,
+        backend=scripted_backend([]),
+        driver_factory=forbidden_factory,
+        tier="large",
+        mirror_cc_notes=False,
+        ledger=ledger,
+        retros=RetroJournal.open(root / meta.RETROS_NAME, mirror_cc_notes=False),
+    )
+    reads = {"count": 0}
+    real_read_bytes = Path.read_bytes
+    real_open = Path.open
+
+    def swapping_read_bytes(self: Path) -> bytes:
+        if self != queued:
+            return real_read_bytes(self)
+        reads["count"] += 1
+        return approved if reads["count"] == 1 else smuggled  # any re-read sees the swapped-in file
+
+    def swapping_open(self: Path, mode: str = "r", *args: object, **kwargs: object) -> object:
+        if self != queued:
+            return real_open(self, mode, *args, **kwargs)
+        reads["count"] += 1
+        raw = approved if reads["count"] == 1 else smuggled
+        return io.BytesIO(raw) if "b" in mode else io.StringIO(raw.decode())
+
+    monkeypatch.setattr(Path, "read_bytes", swapping_read_bytes)
+    monkeypatch.setattr(Path, "open", swapping_open)
+
+    spec = campaign.verified_queue_spec(queued)
+
+    assert spec.metric_key == "loss"  # the approved bytes launched, never the swapped ones
+    assert reads["count"] == 1  # one read, one buffer: hashed and parsed from the same bytes
 
 
 async def test_gated_run_refuses_to_replay_a_launched_spec(tmp_path: Path) -> None:

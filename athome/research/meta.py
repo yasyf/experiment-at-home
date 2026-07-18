@@ -13,7 +13,19 @@ ledger row — refusing a drifted or unledgered file, and refusing to replay a
 sequence whose launch already began — after which the codepath is identical. The stop file halts the campaign at
 the experiment boundary, like the A3 restart latch: the current experiment
 finishes, nothing new launches, and the file persists until the operator removes
-it. Proposer and retro LLM spend is count-bounded (at most
+it; the runner re-checks it immediately before each proposer call and again
+immediately before each reservation/launch, so a stop armed mid-round blocks the
+next paid step. Reservations are admission control, not a hard ceiling: metering
+is post-hoc, so a single in-flight driver call can overshoot its grant before
+actuals land. Each invocation is therefore granted only the experiment's
+remaining budget (never the full ``max_usd`` cap), terminal ledger rows record
+true journal-measured actuals overshoot included, and the moment recorded
+actuals reach ``max_total_usd`` the boundary latches refusal of all new work —
+the worst-case breach is bounded by one invocation's overshoot, and the cap is
+never stretched. On start and resume the runner reconciles ``completed`` ledger
+rows against ``retros.jsonl`` and generates catch-up retros for any gap before
+the next proposal round; a catch-up failure aborts as loudly as a live one.
+Proposer and retro LLM spend is count-bounded (at most
 ``MAX_PROPOSAL_ATTEMPTS`` extract calls plus one retro per round), not measured;
 experiment spend is the precisely-measured cap.
 """
@@ -381,11 +393,18 @@ class Campaign:
     retros: RetroJournal
 
     async def run(self) -> CampaignResult:
+        await self.reconcile_retros()
         match self.policy.mode:
             case "auto":
                 return await self.run_auto()
             case "gated":
                 return await self.run_gated()
+
+    async def reconcile_retros(self) -> None:
+        durable = {record.experiment for record in self.retros.records()}
+        for row in self.ledger.rows():
+            if row.event is CampaignEvent.COMPLETED and (name := str(row.extra["name"])) not in durable:
+                await self.write_retro(ExperimentSpec.load(self.root / EXPERIMENTS_DIR / name / SPEC_NAME))
 
     async def run_auto(self) -> CampaignResult:
         while True:
@@ -393,11 +412,15 @@ class Campaign:
                 return await self.halt(reason)
             seq = self.ledger.next_seq()
             context = self.context()
+            if (reason := await self.stopped()) is not None:
+                return await self.halt(reason)
             if (round_ := await self.next_round(seq, context)) is None:
                 continue
             await self.materialize(round_, seq=seq, context=context)
             if (refusal := self.reservation_refusal(round_.spec)) is not None:
                 return await self.halt(refusal)
+            if (reason := await self.stopped()) is not None:
+                return await self.halt(reason)
             await self.launch(round_.spec)
 
     async def run_gated(self) -> CampaignResult:
@@ -407,12 +430,16 @@ class Campaign:
             spec = self.verified_queue_spec(path)
             if (refusal := self.reservation_refusal(spec)) is not None:
                 return await self.halt(refusal)
+            if (reason := await self.stopped()) is not None:
+                return await self.halt(reason)
             await self.launch(spec)
             await anyio.Path(path).unlink()
         if (reason := await self.boundary()) is not None:
             return await self.halt(reason)
         seq = self.ledger.next_seq()
         context = self.context()
+        if (reason := await self.stopped()) is not None:
+            return await self.halt(reason)
         if (round_ := await self.next_round(seq, context)) is None:
             return self.result(None)
         text = await self.materialize(round_, seq=seq, context=context)
@@ -442,14 +469,27 @@ class Campaign:
         await self.ledger.append(proposed_row(seq, round_))
         return round_
 
-    async def boundary(self) -> str | None:
-        campaign = self.policy.campaign
+    async def stopped(self) -> str | None:
         if (reason := await read_stop(self.root)) is not None:
             return f"stop requested: {reason}"
+        return None
+
+    async def boundary(self) -> str | None:
+        campaign = self.policy.campaign
+        if (reason := await self.stopped()) is not None:
+            return reason
+        if (total := self.ledger.total_usd()) >= campaign.max_total_usd:
+            return (
+                f"campaign budget exhausted: recorded ${total:.2f} reached max_total_usd "
+                f"${campaign.max_total_usd:.2f}; refusing all new work"
+            )
         if self.ledger.experiments_run() >= campaign.max_experiments:
             return f"campaign complete: {campaign.max_experiments} experiments run"
         if (streak := self.ledger.consecutive_failures()) >= campaign.max_consecutive_failures:
-            return f"{streak} consecutive failed rounds crossed max_consecutive_failures {campaign.max_consecutive_failures}"
+            return (
+                f"{streak} consecutive failed rounds crossed "
+                f"max_consecutive_failures {campaign.max_consecutive_failures}"
+            )
         return None
 
     async def halt(self, reason: str) -> CampaignResult:
@@ -495,12 +535,13 @@ class Campaign:
         )
         if approved is None:
             raise CampaignError(f"queued spec {path.name} has no approved ledger row for seq {seq}")
-        if (digest := sha256(path.read_bytes()).hexdigest()) != approved.extra["sha256"]:
+        raw = path.read_bytes()
+        if (digest := sha256(raw).hexdigest()) != approved.extra["sha256"]:
             raise CampaignError(
                 f"queued spec {path.name} digest {digest} does not match the approved {approved.extra['sha256']}; "
                 "refusing to launch a drifted spec"
             )
-        return ExperimentSpec.load(path)
+        return ExperimentSpec.loads(raw.decode(), source=str(path))
 
     async def materialize(self, round_: ProposalRound, *, seq: int, context: ProposerContext) -> str:
         audit = anyio.Path(self.root / EXPERIMENTS_DIR / round_.spec.name)
@@ -610,10 +651,15 @@ async def run_campaign(
 ) -> CampaignResult:
     """Run campaign rounds under the flock until a boundary halts them.
 
-    Each auto-mode round: kill-switch and cumulative-cap boundary check, one
+    On entry, ``completed`` ledger rows missing a durable retro get catch-up
+    retros before any proposal round. Each auto-mode round: kill-switch and
+    cumulative-cap boundary check (recorded actuals at or over ``max_total_usd``
+    latch refusal of all new work), one
     proposer round (a policy violation ledgers ``rejected`` and continues),
     audit-dir materialization, a worst-case reservation refused rather than
-    stretched, then the inner loop with every A2/A3 protection unchanged. A
+    stretched, then the inner loop with every A2/A3 protection unchanged; the
+    stop file is re-checked immediately before the proposer call and again
+    immediately before reservation/launch. A
     :class:`~athome.research.errors.PreflightFailure` ledgers
     ``preflight_failed``, :class:`~athome.research.spec.BudgetExhausted` ledgers
     ``aborted``, and :class:`~athome.research.failures.InfraFailure` ledgers

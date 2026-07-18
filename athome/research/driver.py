@@ -49,9 +49,11 @@ class MetricShapeError(ResearchError):
 class Driver(Protocol):
     """A proposer that edits the mutable files in a plain candidate directory.
 
-    An implementation receives the generated contract and the candidate directory,
-    mutates the mutable files in place, and returns the dollar cost that proposal
-    incurred. It never writes the metric file — the immutable ``metric_command`` owns
+    An implementation receives the generated contract, the candidate directory, and
+    ``budget_usd`` — the experiment's remaining spend budget at this invocation
+    (``max_usd`` minus spend already recorded, never the full cap; ``None`` when the
+    spec declares no ``max_usd``), mutates the mutable files in place, and returns
+    the dollar cost that proposal incurred. It never writes the metric file — the immutable ``metric_command`` owns
     that channel — and it never inspects git state: the harness owns all git plumbing
     and derives the change description from the trusted tree diff (:func:`describe_change`).
     Before proposals begin, :meth:`preflight` validates any driver-specific external
@@ -67,7 +69,7 @@ class Driver(Protocol):
 
     async def preflight(self) -> None: ...
 
-    async def propose(self, contract: str, workdir: Path) -> float: ...
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float: ...
 
     async def recover_cost(self) -> float: ...
 
@@ -195,7 +197,7 @@ class StubDriver:
     async def preflight(self) -> None:
         return None
 
-    async def propose(self, contract: str, workdir: Path) -> float:
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         for relative, content in next(self.proposals).files.items():
             target = anyio.Path(workdir) / relative
             await target.parent.mkdir(parents=True, exist_ok=True)
@@ -237,7 +239,9 @@ class ClaudeCodeDriver:
     The generated contract is handed to a detached ``claude`` process
     (:func:`athome.detach.launch`) whose working directory is the plain candidate
     directory. :meth:`preflight` rejects CLI versions predating the
-    ``total_cost_usd`` result envelope. :meth:`propose` bounds that run — ``timeout_s`` when set, else the
+    ``total_cost_usd`` result envelope. :meth:`propose` passes the invocation's
+    remaining experiment budget (never the full ``max_usd`` cap) as
+    ``--max-budget-usd``, and bounds that run — ``timeout_s`` when set, else the
     spec's ``hard_kill_s``, else :data:`DEFAULT_PROPOSAL_TIMEOUT_S`, so a proposal is
     always bounded even when no wall-clock budget is configured — and waits on the
     process's actual exit (``detach.running`` reporting the pid gone, never a grepped
@@ -282,8 +286,8 @@ class ClaudeCodeDriver:
                 f"{'.'.join(map(str, CLAUDE_CLI_ENVELOPE_FLOOR))}; upgrade Claude Code"
             )
 
-    async def propose(self, contract: str, workdir: Path) -> float:
-        budget = () if self.spec.budget.max_usd is None else ("--max-budget-usd", str(self.spec.budget.max_usd))
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
+        budget = () if budget_usd is None else ("--max-budget-usd", str(budget_usd))
         inner = f"cd {shlex.quote(str(workdir))} && exec {shlex.join([*self.command, *budget, contract])}"
         self._recovery.run = None
         try:

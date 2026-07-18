@@ -57,7 +57,7 @@ class PaidDriver:
     async def preflight(self) -> None:
         return None
 
-    async def propose(self, contract: str, workdir: Path) -> float:
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         for relative, content in self.proposal.files.items():
             (workdir / relative).write_text(content)
         return self.cost

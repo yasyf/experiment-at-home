@@ -242,10 +242,32 @@ async def test_propose_edits_the_candidate_dir_and_reports_cost(tmp_path: Path) 
         make_spec(budget=Budget(max_units=1)), command=fake_claude(tmp_path, FAKE_CLAUDE_COST), poll=0.02, timeout_s=10
     )
 
-    cost = await driver.propose("the generated contract", workdir)
+    cost = await driver.propose("the generated contract", workdir, budget_usd=None)
 
     assert (workdir / "train.py").read_text() == "LOSS = 0.2\n"
     assert cost == 0.4207  # from total_cost_usd, never the "cost is 999" prose
+
+
+async def test_propose_passes_the_granted_budget_to_the_cli(tmp_path: Path) -> None:
+    workdir = plain_checkout(toy_repo(tmp_path))
+    argv_body = textwrap.dedent(
+        """
+        import json, pathlib, sys
+        pathlib.Path("argv.json").write_text(json.dumps(sys.argv[1:]))
+        print(json.dumps({"type": "result", "total_cost_usd": 0.01}))
+        """
+    ).strip()
+    driver = ClaudeCodeDriver(
+        make_spec(budget=Budget(max_units=1, max_usd=5.0)),
+        command=fake_claude(tmp_path, argv_body),
+        poll=0.02,
+        timeout_s=10,
+    )
+
+    await driver.propose("the generated contract", workdir, budget_usd=1.25)
+
+    # The invocation's remaining grant reaches the CLI — never the spec's full max_usd cap.
+    assert json.loads((workdir / "argv.json").read_text()) == ["--max-budget-usd", "1.25", "the generated contract"]
 
 
 @pytest.mark.parametrize(
@@ -402,7 +424,7 @@ async def test_nonzero_exit_still_returns_the_reported_cost(tmp_path: Path) -> N
     )
 
     # A failed claude run does not raise; the CLI reported a (zero) cost even on failure.
-    assert await driver.propose("contract", workdir) == 0.0
+    assert await driver.propose("contract", workdir, budget_usd=None) == 0.0
 
 
 async def test_loop_drives_the_claude_driver_end_to_end(tmp_path: Path) -> None:
@@ -431,7 +453,7 @@ async def test_hanging_proposal_is_killed_on_timeout(tmp_path: Path) -> None:
     )
 
     with pytest.raises(AccountingIntegrityError):
-        await driver.propose("contract", workdir)
+        await driver.propose("contract", workdir, budget_usd=None)
 
     agent_pid = int((workdir / "agent.pid").read_text())  # the agent started before the kill
     with anyio.fail_after(3.0):
@@ -452,7 +474,7 @@ async def test_proposal_is_bounded_by_hard_kill_when_no_timeout_s(tmp_path: Path
 
     with anyio.fail_after(6.0):  # must actually cut the 120s hang short
         with pytest.raises(AccountingIntegrityError):
-            await driver.propose("contract", workdir)
+            await driver.propose("contract", workdir, budget_usd=None)
 
 
 async def test_captured_cost_reads_the_cli_envelope(tmp_path: Path) -> None:
@@ -590,7 +612,7 @@ async def test_killed_unit_spend_is_recovered_from_the_log(tmp_path: Path) -> No
 
     with anyio.fail_after(6.0):
         with pytest.raises(ProposalTimeout) as exc_info:
-            await driver.propose("contract", workdir)
+            await driver.propose("contract", workdir, budget_usd=None)
 
     assert exc_info.value.cost == 0.99  # recovered from the log even though the agent was killed
 

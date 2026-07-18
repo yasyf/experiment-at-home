@@ -137,7 +137,7 @@ class HostileDriver:
     async def preflight(self) -> None:
         return None
 
-    async def propose(self, contract: str, workdir: Path) -> float:
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         self.action(Path(workdir))
         return self.cost
 
@@ -156,7 +156,7 @@ class CostDriver:
     async def preflight(self) -> None:
         return None
 
-    async def propose(self, contract: str, workdir: Path) -> float:
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         for relative, content in next(self.proposals).files.items():
             (Path(workdir) / relative).write_text(content)
         return self.cost
@@ -175,7 +175,7 @@ class SlowDriver:
     async def preflight(self) -> None:
         return None
 
-    async def propose(self, contract: str, workdir: Path) -> float:
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         await anyio.sleep(self.delay)
         (Path(workdir) / "train.py").write_text("LOSS = 0.1\n")
         return 0.0
@@ -194,7 +194,7 @@ class TimeoutDriver:
     async def preflight(self) -> None:
         return None
 
-    async def propose(self, contract: str, workdir: Path) -> float:
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         (Path(workdir) / "train.py").write_text("LOSS = 0.1\n")
         raise ProposalTimeout("simulated hang killed on timeout", cost=self.cost)
 
@@ -212,7 +212,7 @@ class RecoveryCostDriver:
     async def preflight(self) -> None:
         return None
 
-    async def propose(self, contract: str, workdir: Path) -> float:
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         await anyio.sleep_forever()
         raise AssertionError("unreachable")
 
@@ -233,7 +233,7 @@ class OuterCancellingDriver:
     async def preflight(self) -> None:
         return None
 
-    async def propose(self, contract: str, workdir: Path) -> float:
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         self.scope.cancel()
         match self.completed_cost:
             case float() as cost:
@@ -266,7 +266,7 @@ class RecoveryCancellingDriver:
     async def preflight(self) -> None:
         return None
 
-    async def propose(self, contract: str, workdir: Path) -> float:
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         raise OSError("pid-file write failed")
 
     async def recover_cost(self) -> float:
@@ -286,7 +286,7 @@ class RecordingDriver:
     async def preflight(self) -> None:
         return None
 
-    async def propose(self, contract: str, workdir: Path) -> float:
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         self.contracts.append(contract)
         for relative, content in next(self.proposals).files.items():
             target = anyio.Path(workdir) / relative
@@ -1973,7 +1973,7 @@ class SequenceDriver:
     async def preflight(self) -> None:
         return None
 
-    async def propose(self, contract: str, workdir: Path) -> float:
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         next(self.actions)(Path(workdir))
         return self.cost
 

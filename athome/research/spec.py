@@ -156,21 +156,36 @@ class ExperimentSpec:
             raise ImmutableViolation("known_good_dir must be a repo-relative directory")
 
     @classmethod
+    def loads(cls, text: str, *, source: str) -> ExperimentSpec:
+        """Loads the experiment from TOML text already in hand; the ``[budget]`` table becomes a :class:`Budget`.
+
+        The seam for verified loads: a caller that hash-checks a file parses the
+        exact bytes it hashed instead of re-reading the path.
+
+        Args:
+            text: The TOML document.
+            source: Where the text came from, named in refusals.
+
+        Raises:
+            UnknownSpecField: the TOML carries a field the spec or its budget does not declare.
+        """
+        data = tomllib.loads(text)
+        budget = data.pop("budget")
+        reject_unknown_fields(Budget, budget, source=source)
+        reject_unknown_fields(cls, data, source=source)
+        return cls(
+            budget=Budget(**budget),
+            **{key: tuple(value) if isinstance(value, list) else value for key, value in data.items()},
+        )
+
+    @classmethod
     def load(cls, path: Path) -> ExperimentSpec:
         """Loads the experiment from a TOML file; the ``[budget]`` table becomes a :class:`Budget`.
 
         Raises:
             UnknownSpecField: the TOML carries a field the spec or its budget does not declare.
         """
-        with path.open("rb") as file:
-            data = tomllib.load(file)
-        budget = data.pop("budget")
-        reject_unknown_fields(Budget, budget, source=str(path))
-        reject_unknown_fields(cls, data, source=str(path))
-        return cls(
-            budget=Budget(**budget),
-            **{key: tuple(value) if isinstance(value, list) else value for key, value in data.items()},
-        )
+        return cls.loads(path.read_text(), source=str(path))
 
 
 @dataclass(frozen=True, slots=True)

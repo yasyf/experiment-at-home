@@ -408,7 +408,8 @@ async def execute_unit(
                             workdir = worktrees / f"unit-{unit}-{attempt}"
                             await extract_tree(repo, incumbent, workdir)
                             proposal_started = True
-                            cost = validate_driver_cost(unit, await driver.propose(contract, workdir))
+                            grant = None if spec.budget.max_usd is None else max(spec.budget.max_usd - spent, 0.0)
+                            cost = validate_driver_cost(unit, await driver.propose(contract, workdir, budget_usd=grant))
                             proposal_completed = True
                             reported = await read_reported_metric(spec, workdir)
                             await (anyio.Path(workdir) / spec.metric_file).unlink(missing_ok=True)
