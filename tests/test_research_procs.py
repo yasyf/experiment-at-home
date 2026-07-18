@@ -176,6 +176,23 @@ async def test_scan_recognizes_a_sidecar_event_and_terminalizes_quietly(tmp_path
     assert not (await procs.abort_latch(repo, "001-round1")).exists()
 
 
+async def test_scan_survives_a_torn_sidecar_when_the_journal_proves_recording(tmp_path: Path) -> None:
+    # A torn events sidecar must not discard the journal's evidence and raise a false latch.
+    repo = campaign_repo(tmp_path / "repo")
+    registry = make_registry(tmp_path / "meta")
+    run = registered(registry)
+    journal = await nightly.journal_path(repo, "001-round1")
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    journal.write_text(json.dumps(journal_row_record(run)) + "\n")
+    journal.with_name("001-round1.events.jsonl").write_text('{"torn')
+
+    assert await procs.scan(registry, repo=repo, alive=lambda pid: False, table=table_with()) == []
+
+    [record] = registry.records()
+    assert record.outcome == "accounted"
+    assert not (await procs.abort_latch(repo, "001-round1")).exists()
+
+
 async def test_scan_still_latches_when_the_artifacts_name_a_different_run(tmp_path: Path) -> None:
     repo = campaign_repo(tmp_path / "repo")
     registry = make_registry(tmp_path / "meta")

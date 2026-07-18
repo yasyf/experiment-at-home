@@ -475,10 +475,12 @@ async def execute_unit(
                                 recorded = True
                                 raise
                             case "candidate":
-                                # Candidate crash: journaled with its proposal cost; the loop continues.
+                                # Type name only: the description feeds contract history, never candidate text.
                                 logger.warning("unit {} crashed: {!r}", unit, exc)
                                 crash_cost = 0.0 if billed else committed.cost if committed is not None else cost
-                                outcome = UnitOutcome(Verdict.CRASH, None, incumbent, f"crash: {exc!r}", crash_cost)
+                                outcome = UnitOutcome(
+                                    Verdict.CRASH, None, incumbent, f"crash: {type(exc).__name__}", crash_cost
+                                )
                                 recorded = True
                                 return outcome
                             case "infra":

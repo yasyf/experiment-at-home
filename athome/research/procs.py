@@ -199,9 +199,12 @@ async def spend_recorded(repo: Path, record: ProposalProcess) -> bool:
     events = journal.with_name(f"{record.experiment}.events.jsonl")
     try:
         rows = load_journal(journal)
+    except (OSError, ValueError, AccountingIntegrityError):
+        rows = []  # an unreadable journal contributes no evidence; the sidecar may still prove recording
+    try:
         recorded = infra_events(events)
     except (OSError, ValueError, AccountingIntegrityError):
-        return False  # unreadable artifacts keep the conservative answer: latch
+        recorded = []  # a torn sidecar must not discard the journal's evidence; no evidence at all still latches
     return any(
         isinstance(resources := row.get("resources"), dict) and resources.get("run") == record.run for row in rows
     ) or any(event.get("run") == record.run for event in recorded)
