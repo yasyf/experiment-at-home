@@ -65,6 +65,9 @@ class PaidDriver:
     async def recover_cost(self) -> float:
         return 0.0
 
+    def settle(self) -> None:
+        return None
+
 
 def git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()

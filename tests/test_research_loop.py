@@ -144,6 +144,9 @@ class HostileDriver:
     async def recover_cost(self) -> float:
         return 0.0
 
+    def settle(self) -> None:
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class CostDriver:
@@ -164,6 +167,9 @@ class CostDriver:
     async def recover_cost(self) -> float:
         return 0.0
 
+    def settle(self) -> None:
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class SlowDriver:
@@ -183,6 +189,9 @@ class SlowDriver:
     async def recover_cost(self) -> float:
         return 0.0
 
+    def settle(self) -> None:
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class TimeoutDriver:
@@ -201,6 +210,9 @@ class TimeoutDriver:
     async def recover_cost(self) -> float:
         return 0.0
 
+    def settle(self) -> None:
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class RecoveryCostDriver:
@@ -218,6 +230,9 @@ class RecoveryCostDriver:
 
     async def recover_cost(self) -> float:
         return self.cost
+
+    def settle(self) -> None:
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +269,9 @@ class OuterCancellingDriver:
             case float() as cost:
                 return cost
 
+    def settle(self) -> None:
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class RecoveryCancellingDriver:
@@ -273,6 +291,9 @@ class RecoveryCancellingDriver:
         self.scope.cancel()
         await anyio.lowlevel.checkpoint()
         return self.cost
+
+    def settle(self) -> None:
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,6 +317,9 @@ class RecordingDriver:
 
     async def recover_cost(self) -> float:
         return 0.0
+
+    def settle(self) -> None:
+        return None
 
 
 async def test_end_to_end_all_gates_in_one_run(tmp_path: Path) -> None:
@@ -911,6 +935,9 @@ class AbortRaisingDriver:
     async def recover_cost(self) -> float:
         return 0.0
 
+    def settle(self) -> None:
+        return None
+
 
 @pytest.mark.parametrize(
     "error, described",
@@ -955,6 +982,9 @@ class BrokenRecoveryDriver:
 
     async def recover_cost(self) -> float:
         raise self.error
+
+    def settle(self) -> None:
+        return None
 
 
 async def test_cleanup_epilogue_survives_a_recovery_error_with_a_broken_str(tmp_path: Path) -> None:
@@ -2071,6 +2101,9 @@ class SequenceDriver:
 
     async def recover_cost(self) -> float:
         return 0.0
+
+    def settle(self) -> None:
+        return None
 
 
 async def test_fifo_in_a_mutable_path_is_a_candidate_crash(tmp_path: Path) -> None:

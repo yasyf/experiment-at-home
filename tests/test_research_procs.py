@@ -4,13 +4,16 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import anyio
 import pytest
 
 from athome.detach import run_exitfile, run_log, run_pidfile
 from athome.research import meta, procs, watchdog
 from athome.research.driver import ClaudeCodeDriver
 from athome.research.errors import AccountingIntegrityError, PreflightFailure
+from athome.research.journal import Journal
 from athome.research.loop import experiment_lock
+from athome.research.loop import run as run_loop
 from athome.research.procs import PROCS_NAME, ExperimentProcs, ProcessRegistry
 from athome.research.spec import Budget, ProposalTimeout
 from tests.test_research_driver import (
@@ -210,6 +213,9 @@ async def test_run_campaign_default_factory_binds_the_registry(tmp_path: Path, m
         async def recover_cost(self) -> float:
             return 0.0
 
+        def settle(self) -> None:
+            return None
+
     monkeypatch.setattr(meta, "ClaudeCodeDriver", CapturingDriver)
     repo = campaign_repo(tmp_path / "repo")
     root = tmp_path / "meta"
@@ -228,7 +234,7 @@ async def test_run_campaign_default_factory_binds_the_registry(tmp_path: Path, m
     assert len(handle.spec_digest) == 64
 
 
-async def test_claude_driver_registers_binds_and_accounts_a_proposal(tmp_path: Path) -> None:
+async def test_claude_driver_registers_binds_and_marks_terminal_only_on_settle(tmp_path: Path) -> None:
     workdir = plain_checkout(toy_repo(tmp_path))
     registry = make_registry(tmp_path / "meta")
     driver = ClaudeCodeDriver(
@@ -243,7 +249,8 @@ async def test_claude_driver_registers_binds_and_accounts_a_proposal(tmp_path: P
 
     assert cost == 0.4207
     [record] = registry.records()
-    assert record.experiment == "toy" and record.outcome == "accounted"
+    assert record.experiment == "toy"
+    assert record.outcome is None  # a kill in this window must leave the record for the orphan scan
     assert record.pid is not None and record.pgid == record.pid  # the detached run leads its own session
     assert (record.log, record.pid_file, record.exit_file) == (
         run_log(record.run),
@@ -251,8 +258,15 @@ async def test_claude_driver_registers_binds_and_accounts_a_proposal(tmp_path: P
         run_exitfile(record.run),
     )
 
+    driver.settle()
 
-async def test_claude_driver_accounts_a_timed_out_proposal_with_a_recovered_envelope(tmp_path: Path) -> None:
+    [record] = registry.records()
+    assert record.outcome == "accounted"
+    driver.settle()  # idempotent: nothing pending appends nothing
+    assert len(registry.events()) == 3
+
+
+async def test_claude_driver_timeout_carried_spend_stays_pending_until_settle(tmp_path: Path) -> None:
     workdir = plain_checkout(toy_repo(tmp_path))
     registry = make_registry(tmp_path / "meta")
     driver = ClaudeCodeDriver(
@@ -268,7 +282,82 @@ async def test_claude_driver_accounts_a_timed_out_proposal_with_a_recovered_enve
 
     assert excinfo.value.cost == 0.99
     [record] = registry.records()
+    assert record.outcome is None  # the carried spend is not durable yet
+
+    driver.settle()
+
+    [record] = registry.records()
     assert record.outcome == "accounted"
+
+
+async def test_claude_driver_recovered_spend_stays_pending_until_settle(tmp_path: Path) -> None:
+    workdir = plain_checkout(toy_repo(tmp_path))
+    registry = make_registry(tmp_path / "meta")
+    driver = ClaudeCodeDriver(
+        make_spec(budget=Budget(max_units=1)),
+        command=fake_claude(tmp_path, FAKE_CLAUDE_COST_THEN_HANGS),
+        poll=0.02,
+        timeout_s=30,
+        procs=registry.experiment("toy", seq=1, spec_digest=DIGEST),
+    )
+
+    with anyio.move_on_after(1.5):
+        await driver.propose("the generated contract", workdir, budget_usd=None)
+
+    assert await driver.recover_cost() == 0.99
+    [record] = registry.records()
+    assert record.outcome is None  # recovery hands spend to the caller; the durable write hasn't happened
+
+    driver.settle()
+
+    [record] = registry.records()
+    assert record.outcome == "accounted"
+
+
+async def test_loop_settles_the_registry_after_the_journal_row(tmp_path: Path) -> None:
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = toy_repo(repo_dir)
+    registry = make_registry(tmp_path / "meta")
+    spec = make_spec(budget=Budget(max_units=1))
+    driver = ClaudeCodeDriver(
+        spec,
+        command=fake_claude(tmp_path, FAKE_CLAUDE_COST),
+        poll=0.02,
+        timeout_s=10,
+        procs=registry.experiment("toy", seq=1, spec_digest=DIGEST),
+    )
+
+    with anyio.fail_after(30.0):
+        await run_loop(spec, driver=driver, repo=repo)
+
+    [record] = registry.records()
+    assert record.outcome == "accounted"
+
+
+async def test_loop_journal_failure_leaves_the_registry_non_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = toy_repo(repo_dir)
+    registry = make_registry(tmp_path / "meta")
+    spec = make_spec(budget=Budget(max_units=1))
+    driver = ClaudeCodeDriver(
+        spec,
+        command=fake_claude(tmp_path, FAKE_CLAUDE_COST),
+        poll=0.02,
+        timeout_s=10,
+        procs=registry.experiment("toy", seq=1, spec_digest=DIGEST),
+    )
+
+    async def fail_append(self: Journal, row: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Journal, "append", fail_append)
+    with anyio.fail_after(30.0), pytest.raises(AccountingIntegrityError, match="could not append journal row"):
+        await run_loop(spec, driver=driver, repo=repo)
+
+    [record] = registry.records()
+    assert record.outcome is None  # never terminal without the durable journal row; the orphan scan latches it
 
 
 async def test_claude_driver_leaves_an_unaccounted_proposal_non_terminal(tmp_path: Path) -> None:

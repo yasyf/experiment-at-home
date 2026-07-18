@@ -64,6 +64,11 @@ class Driver(Protocol):
     Implementations should raise an :class:`AccountingIntegrityError` subtype for unknown
     or unrecoverable spend. The loop converts any ordinary recovery exception or backend
     cancellation into a durable abort latch instead of depending on that convention.
+    Once the loop has durably recorded a proposal's spend — a journal row or a sidecar
+    event — it calls :meth:`settle`; an implementation holding a durable process
+    registration marks it terminal there and never earlier, so a kill between the two
+    writes leaves a non-terminal record the startup orphan scan latches instead of
+    invisible spend.
     """
 
     label: str
@@ -73,6 +78,8 @@ class Driver(Protocol):
     async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float: ...
 
     async def recover_cost(self) -> float: ...
+
+    def settle(self) -> None: ...
 
 
 async def read_reported_metric(spec: ExperimentSpec, workdir: Path) -> float | None:
@@ -208,6 +215,9 @@ class StubDriver:
     async def recover_cost(self) -> float:
         return 0.0
 
+    def settle(self) -> None:
+        return None
+
 
 def stop(run: DetachedRun) -> None:
     try:
@@ -221,6 +231,7 @@ def stop(run: DetachedRun) -> None:
 @dataclass(slots=True)
 class ProposalRecovery:
     run: DetachedRun | None = None
+    pending: DetachedRun | None = None
 
     def retain(self, run: DetachedRun) -> None:
         self.run = run
@@ -257,9 +268,11 @@ class ClaudeCodeDriver:
     never the agent's stdout. The ``claude`` CLI is shelled out to, never imported, so
     this driver loads without the ``llm``/``research`` extras. With ``procs`` bound
     (campaign mode), every proposal is durably registered before it launches, bound to
-    its pid on spawn, and marked terminal once its spend enters the accounting stream,
-    so a harness-level kill leaves an orphan record the campaign's startup scan and the
-    A7 watchdog turn into an alarm or an abort latch (:mod:`athome.research.procs`).
+    its pid on spawn, and marked terminal only on :meth:`settle` — after the loop has
+    durably recorded the spend that :meth:`propose`, :class:`ProposalTimeout`, or
+    :meth:`recover_cost` handed it — so a harness-level kill at any earlier point
+    leaves a non-terminal record the campaign's startup scan and the A7 watchdog turn
+    into an alarm or an abort latch (:mod:`athome.research.procs`).
 
     Example:
         >>> driver = ClaudeCodeDriver(spec)
@@ -327,8 +340,16 @@ class ClaudeCodeDriver:
             self.procs.bind(run.name, pid=run.pid, pgid=os.getpgid(run.pid))
 
     def account(self, run: DetachedRun) -> None:
-        if self.procs is not None:
-            self.procs.finalize(run.name, outcome="accounted")
+        self._recovery.pending = run
+
+    def settle(self) -> None:
+        match self._recovery.pending:
+            case None:
+                return
+            case run:
+                if self.procs is not None:
+                    self.procs.finalize(run.name, outcome="accounted")
+                self._recovery.pending = None
 
     async def recover_cost(self) -> float:
         match self._recovery.run:

@@ -481,6 +481,7 @@ async def execute_unit(
                                 cost=cost,
                                 kind="wall_cancel",
                             )
+                        driver.settle()
                     recorded = True
                     return None
                 # A committed candidate re-scores (bill its cost once); a pre-commit failure re-proposes.
@@ -489,6 +490,7 @@ async def execute_unit(
                 await record_infra_event(
                     events, unit=unit, attempt=attempt, reason=repr(infra), cost=attempt_cost, kind="retry"
                 )
+                driver.settle()
                 recorded = True
                 spent += attempt_cost
                 logger.warning("unit {} infra failure, attempt {}/{}: {!r}", unit, attempt, MAX_INFRA_RETRIES, infra)
@@ -516,6 +518,7 @@ async def execute_unit(
                                 cost=cost,
                                 kind="wall_cancel",
                             )
+                        driver.settle()
                     except (Exception, anyio.get_cancelled_exc_class()) as exc:
                         await record_accounting_abort(abort, events, unit=unit, reason=safe_describe(exc))
 
@@ -656,6 +659,7 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
                     reason = f"could not append journal row for unit {unit} to {journal.sink.path}"
                     await record_accounting_abort(abort, events, unit=unit, reason=reason)
                     raise AccountingIntegrityError(reason) from exc
+                driver.settle()
                 if outcome.verdict is Verdict.KEEP:
                     await run_git(repo, "branch", "-f", branch, outcome.commit)
                     incumbent, incumbent_metric = outcome.commit, outcome.metric

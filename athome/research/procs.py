@@ -7,8 +7,9 @@ the in-memory recovery state is gone, the per-attempt UUID run name is unrecorde
 and a restart scans only accounting artifacts. The registry closes that gap with an
 append-only JSONL file under the campaign root: every proposal appends a ``register``
 line *before* the detached process launches, a ``bind`` line the moment the pid
-exists, and a ``terminal`` line once its spend enters the accounting stream
-(captured, recovered, or carried by a :class:`~athome.research.spec.ProposalTimeout`).
+exists, and a ``terminal`` line only after its spend — captured, recovered, or
+carried by a :class:`~athome.research.spec.ProposalTimeout` — has been durably
+written to the accounting stream (a journal row or a sidecar event), never before.
 A non-terminal record whose runner is gone is an orphan: a live pid raises the alarm
 (spend still accruing with no harness), and a dead pid writes the experiment's
 accounting-abort latch — the A3.x exactly-once-or-latch invariant — and marks the

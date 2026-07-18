@@ -160,6 +160,9 @@ class PaidDriver:
     async def recover_cost(self) -> float:
         return self.cost
 
+    def settle(self) -> None:
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class StopArmingDriver:
@@ -177,6 +180,9 @@ class StopArmingDriver:
     async def recover_cost(self) -> float:
         return await self.inner.recover_cost()
 
+    def settle(self) -> None:
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class BrokenPreflightDriver:
@@ -191,6 +197,9 @@ class BrokenPreflightDriver:
     async def recover_cost(self) -> float:
         return 0.0
 
+    def settle(self) -> None:
+        return None
+
 
 @dataclass(frozen=True, slots=True)
 class InfraDriver:
@@ -204,6 +213,9 @@ class InfraDriver:
 
     async def recover_cost(self) -> float:
         return 0.0
+
+    def settle(self) -> None:
+        return None
 
 
 def paid_factory(losses: Sequence[float], contracts: list[str]) -> Callable[[ExperimentSpec], PaidDriver]:
