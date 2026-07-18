@@ -103,8 +103,6 @@ def env_pair(entry: str) -> tuple[str, str]:
 def tinker_model(base: BaseModelSpec) -> TinkerModelId:
     if base.tinker is None:
         raise UnservableBase(f"{base.mlx} has no Tinker base model")
-    if not base.serves_locally:
-        raise UnservableBase(f"{base.mlx} has no mlx-lm LoRA counterpart, so a Tinker adapter cannot be fused into it")
     return base.tinker
 
 
@@ -483,7 +481,7 @@ class TinkerBackend:
             count, the wall-clock, and the total metered spend.
 
         Raises:
-            UnservableBase: The base has no Tinker id, or no mlx-lm counterpart to fuse into.
+            UnservableBase: The base has no Tinker id.
             UnsupportedLoraShape: The LoRA shape asks for something Tinker cannot train.
             TorchRequired: The method is ``dpo`` and torch is not installed locally.
             InsufficientData: The surviving pool is smaller than one batch.

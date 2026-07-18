@@ -43,6 +43,7 @@ from athome.train.tinker import (
     dpo_loss,
     score_sequence,
     tinker_lora,
+    tinker_model,
 )
 from tests import tinker_fakes
 from tests.tinker_fakes import (
@@ -866,15 +867,36 @@ async def test_score_rejects_an_over_cap_projection_before_creating_a_service_cl
     assert service_calls == []
 
 
-async def test_a_base_with_no_mlx_lm_counterpart_aborts_before_the_service_client(
-    service: FakeService, tmp_path: Path
-) -> None:
+def test_tinker_model_returns_the_id_for_a_hosted_only_base() -> None:
+    base = BASE_MODELS["qwen3.5-4b"]
+    assert not base.serves_locally
+
+    assert tinker_model(base) == TinkerModelId("Qwen/Qwen3.5-4B")
+
+
+def test_tinker_model_refuses_a_base_with_no_tinker_id() -> None:
+    base = dataclasses.replace(BASE_MODELS["qwen3-8b"], tinker=None)
+
+    with pytest.raises(UnservableBase, match="no Tinker base model"):
+        tinker_model(base)
+
+
+async def test_fit_runs_for_a_hosted_only_base_with_a_tinker_id(service: FakeService, tmp_path: Path) -> None:
     request = spec(corpus(tmp_path, method="sft"), base=BASE_MODELS["qwen3.5-4b"])
 
-    with pytest.raises(UnservableBase, match="mlx-lm LoRA counterpart"):
-        await TinkerBackend.from_settings().train(request, sink=sink(tmp_path), work_dir=tmp_path / "run")
+    report = await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path))
 
-    assert service.clients == []
+    assert service.clients[0].base_model == "Qwen/Qwen3.5-4B"
+    assert (report.final.step, len(report.steps)) == (3, 3)
+
+
+async def test_score_runs_for_a_hosted_only_base_with_a_tinker_id(sampling_service: FakeSamplingService) -> None:
+    rows = (EvalRow(tokens=(1, 2, 3), weights=(0.0, 1.0, 2.0)),)
+
+    scores = await TinkerBackend.from_settings().score("tinker://run/step2", rows, base=BASE_MODELS["qwen3.5-4b"])
+
+    assert sampling_service.sampling_paths == ["tinker://run/step2"]
+    assert len(scores) == 1
 
 
 async def test_download_adapter_unpacks_the_signed_archive(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

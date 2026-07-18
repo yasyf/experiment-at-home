@@ -57,7 +57,15 @@ async def convert_peft_to_mlx(peft_dir: Path, out_dir: Path, *, base: BaseModelS
 
     Returns:
         ``out_dir``, an mlx-lm adapter directory.
+
+    Raises:
+        UnservableBase: The base has no mlx-lm LoRA counterpart, so the PEFT adapter has no mlx-lm
+            shape to convert into; nothing is converted.
     """
+    from athome.train.spec import UnservableBase
+
+    if not base.serves_locally:
+        raise UnservableBase(f"{base.mlx} has no mlx-lm LoRA counterpart, so a Tinker adapter cannot be fused into it")
     await run_process(
         sidecar_command("convert", "--peft", str(peft_dir), "--out", str(out_dir), "--num-layers", str(base.num_layers))
     )
@@ -78,7 +86,15 @@ async def fuse(adapter_dir: Path, out_dir: Path, *, base: BaseModelSpec) -> Path
 
     Returns:
         ``out_dir``, a standalone 4-bit MLX model directory.
+
+    Raises:
+        UnservableBase: The base has no mlx-lm LoRA counterpart to fuse the adapter into; nothing
+            is fused.
     """
+    from athome.train.spec import UnservableBase
+
+    if not base.serves_locally:
+        raise UnservableBase(f"{base.mlx} has no mlx-lm LoRA counterpart, so a Tinker adapter cannot be fused into it")
     await run_process(
         mlx_lm_command("fuse", "--model", base.mlx, "--adapter-path", str(adapter_dir), "--save-path", str(out_dir))
     )

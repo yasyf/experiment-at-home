@@ -19,7 +19,7 @@ from athome.train.sidecar import (
     run_convert,
     sidecar_command,
 )
-from athome.train.spec import BASE_MODELS, STD_MODULES
+from athome.train.spec import BASE_MODELS, STD_MODULES, UnservableBase
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -152,6 +152,24 @@ async def test_fuse_saves_a_standalone_model_from_the_base_and_the_adapter(
         )
     ]
     assert "--dequantize" not in commands[0]
+
+
+async def test_convert_refuses_a_base_with_no_mlx_lm_counterpart_before_any_work(
+    commands: list[Sequence[str]], tmp_path: Path
+) -> None:
+    with pytest.raises(UnservableBase, match="mlx-lm LoRA counterpart"):
+        await convert_peft_to_mlx(tmp_path / "peft", tmp_path / "adapter", base=BASE_MODELS["qwen3.5-4b"])
+
+    assert commands == []
+
+
+async def test_fuse_refuses_a_base_with_no_mlx_lm_counterpart_before_any_work(
+    commands: list[Sequence[str]], tmp_path: Path
+) -> None:
+    with pytest.raises(UnservableBase, match="mlx-lm LoRA counterpart"):
+        await fuse(tmp_path / "adapter", tmp_path / "fused", base=BASE_MODELS["qwen3.5-4b"])
+
+    assert commands == []
 
 
 def test_convert_transposes_every_trained_lora_matrix(archive: Archive) -> None:
