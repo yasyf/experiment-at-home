@@ -347,8 +347,8 @@ async def test_run_passes_mirror_cc_notes_to_journal(tmp_path: Path, monkeypatch
     monkeypatch.setattr(Journal, "open", staticmethod(open_journal))
 
     await run(
-        make_spec(budget=Budget(max_units=0)),
-        driver=StubDriver(iter([])),
+        make_spec(budget=Budget(max_units=1)),
+        driver=StubDriver(iter([loss_proposal(0.5)])),
         repo=repo,
         mirror_cc_notes=True,
     )
@@ -483,8 +483,9 @@ def test_contract_maximize_wording_and_budget_low_warning() -> None:
 
 def test_contract_renders_hypothesis_only_when_set() -> None:
     spec = make_spec(budget=Budget(max_units=3))
-    assert "## Hypothesis" not in build_contract(spec, budget_low=False)
-    contract = build_contract(replace(spec, hypothesis="a lower LR converges further"), budget_low=False)
+    memory = Memory(baseline=None, incumbent=None, best=None, recent=())
+    assert "## Hypothesis" not in build_contract(spec, budget_low=False, memory=memory)
+    contract = build_contract(replace(spec, hypothesis="a lower LR converges further"), budget_low=False, memory=memory)
     assert "## Hypothesis\na lower LR converges further" in contract
     assert contract.index("## Hypothesis") < contract.index("## Files you MAY edit")
 

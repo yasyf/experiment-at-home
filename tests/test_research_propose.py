@@ -183,7 +183,18 @@ def make_context() -> ProposerContext:
     )
     return ProposerContext(
         retros=("Retro: the 4B arm plateaued early.",),
-        reports=(MorningReport(experiment="001-lr", units=3, kept=1, crashes=1, best=row, rows=(row,)),),
+        reports=(
+            MorningReport(
+                experiment="001-lr",
+                units=3,
+                kept=1,
+                crashes=1,
+                infra_retries=0,
+                accounting_aborts=0,
+                best=row,
+                rows=(row,),
+            ),
+        ),
         leaderboard=(Cell(experiment="001-lr", unit=0, arm="candidate", metric=0.91, verdict="keep"),),
         current=VersionInfo(name="watcher", version="v001-20260710-abcdef123456", path=Path("/tmp/v001"), metadata={}),
         failures=("round 2 rejected: unknown template 'ghost'",),
