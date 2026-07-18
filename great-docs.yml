@@ -142,6 +142,10 @@ reference:
       - serve.probe_all
       - serve.ServeError
       - serve.HealthTimeout
+  - title: Idle
+    desc: A generic idle-unload lifecycle — single-flight load, reference-counted use, and a TTL reaper that unloads a value once it sits idle.
+    contents:
+      - idle.IdleResource
   - title: Embed
     desc: Batch text-embedding backends and a digest-keyed incremental index with MMR rerank.
     contents:

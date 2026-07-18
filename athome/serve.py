@@ -16,6 +16,7 @@ from athome import detach, launchd, llmcache
 from athome.cli import coro, emit, json_option
 from athome.config import SectionSettings, load
 from athome.errors import AthomeError
+from athome.idle import IdleResource
 from athome.launchd import AgentSpec, KeepAlive, LaunchdError
 
 if TYPE_CHECKING:
@@ -340,6 +341,20 @@ class ManagedServer:
                 kill_group(pid)
             except ProcessLookupError:
                 pass
+
+    def idle(self, *, ttl_s: float) -> IdleResource[ServerHandle]:
+        """An :class:`~athome.idle.IdleResource` that spawns this server on first use and stops it once idle.
+
+        Each :meth:`~athome.idle.IdleResource.use` ensures the server is healthy and yields its handle;
+        the resource's reaper stops the server once it has sat unused past ``ttl_s``.
+
+        Args:
+            ttl_s: Idle seconds before the reaper stops the server.
+
+        Returns:
+            A resource wired to :meth:`ensure` and :meth:`stop`.
+        """
+        return IdleResource(self.ensure, self.stop, ttl_s=ttl_s)
 
     def client(self, *, cached: bool = False) -> AsyncOpenAI:
         """Return an ``AsyncOpenAI`` client bound to this recipe's endpoint.
