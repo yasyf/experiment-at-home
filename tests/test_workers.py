@@ -234,6 +234,16 @@ async def test_wire_error_on_non_wire_reply() -> None:
             await worker.call("echo", "x")
 
 
+async def test_cleanup_killpg_failure_never_masks_the_wire_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def deny_killpg(pgid: int, sig: int) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "killpg", deny_killpg)
+    async with running(NON_WIRE_SOURCE) as worker:
+        with pytest.raises(WireError):  # the poisoning path's own killpg failure stays suppressed
+            await worker.call("echo", "x")
+
+
 async def test_worker_crash_raises_worker_crashed_with_returncode_and_stderr() -> None:
     async with running(CRASH_SOURCE) as worker:
         with pytest.raises(WorkerCrashed) as excinfo:

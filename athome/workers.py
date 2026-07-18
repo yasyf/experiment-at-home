@@ -6,7 +6,7 @@ import sys
 import threading
 import traceback
 from collections import deque
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
@@ -143,10 +143,10 @@ class PipeWorker:
         return process
 
     async def reap(self, process: Process) -> None:
-        try:
+        # Cleanup guards its own killpg: the group may already be reaped or unkillable
+        # (EPERM), and a raise here would mask the original wire error being propagated.
+        with suppress(OSError):
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
         await process.wait()
         if (thread := self.stderr_thread) is not None:
             self.stderr_thread = None
