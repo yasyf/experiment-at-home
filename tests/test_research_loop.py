@@ -144,6 +144,9 @@ class HostileDriver:
     async def recover_cost(self) -> float:
         return 0.0
 
+    def pending_run(self) -> str | None:
+        return None
+
     def settle(self) -> None:
         return None
 
@@ -167,6 +170,9 @@ class CostDriver:
     async def recover_cost(self) -> float:
         return 0.0
 
+    def pending_run(self) -> str | None:
+        return None
+
     def settle(self) -> None:
         return None
 
@@ -189,6 +195,9 @@ class SlowDriver:
     async def recover_cost(self) -> float:
         return 0.0
 
+    def pending_run(self) -> str | None:
+        return None
+
     def settle(self) -> None:
         return None
 
@@ -210,6 +219,9 @@ class TimeoutDriver:
     async def recover_cost(self) -> float:
         return 0.0
 
+    def pending_run(self) -> str | None:
+        return None
+
     def settle(self) -> None:
         return None
 
@@ -230,6 +242,9 @@ class RecoveryCostDriver:
 
     async def recover_cost(self) -> float:
         return self.cost
+
+    def pending_run(self) -> str | None:
+        return None
 
     def settle(self) -> None:
         return None
@@ -269,6 +284,9 @@ class OuterCancellingDriver:
             case float() as cost:
                 return cost
 
+    def pending_run(self) -> str | None:
+        return None
+
     def settle(self) -> None:
         return None
 
@@ -291,6 +309,9 @@ class RecoveryCancellingDriver:
         self.scope.cancel()
         await anyio.lowlevel.checkpoint()
         return self.cost
+
+    def pending_run(self) -> str | None:
+        return None
 
     def settle(self) -> None:
         return None
@@ -317,6 +338,9 @@ class RecordingDriver:
 
     async def recover_cost(self) -> float:
         return 0.0
+
+    def pending_run(self) -> str | None:
+        return None
 
     def settle(self) -> None:
         return None
@@ -935,6 +959,9 @@ class AbortRaisingDriver:
     async def recover_cost(self) -> float:
         return 0.0
 
+    def pending_run(self) -> str | None:
+        return None
+
     def settle(self) -> None:
         return None
 
@@ -1013,6 +1040,9 @@ class BrokenRecoveryDriver:
 
     async def recover_cost(self) -> float:
         raise self.error
+
+    def pending_run(self) -> str | None:
+        return None
 
     def settle(self) -> None:
         return None
@@ -2132,6 +2162,9 @@ class SequenceDriver:
 
     async def recover_cost(self) -> float:
         return 0.0
+
+    def pending_run(self) -> str | None:
+        return None
 
     def settle(self) -> None:
         return None

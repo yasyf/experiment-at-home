@@ -160,6 +160,9 @@ class PaidDriver:
     async def recover_cost(self) -> float:
         return self.cost
 
+    def pending_run(self) -> str | None:
+        return None
+
     def settle(self) -> None:
         return None
 
@@ -180,6 +183,9 @@ class StopArmingDriver:
     async def recover_cost(self) -> float:
         return await self.inner.recover_cost()
 
+    def pending_run(self) -> str | None:
+        return None
+
     def settle(self) -> None:
         return None
 
@@ -197,6 +203,9 @@ class BrokenPreflightDriver:
     async def recover_cost(self) -> float:
         return 0.0
 
+    def pending_run(self) -> str | None:
+        return None
+
     def settle(self) -> None:
         return None
 
@@ -213,6 +222,9 @@ class InfraDriver:
 
     async def recover_cost(self) -> float:
         return 0.0
+
+    def pending_run(self) -> str | None:
+        return None
 
     def settle(self) -> None:
         return None

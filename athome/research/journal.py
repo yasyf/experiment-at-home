@@ -33,7 +33,9 @@ class JournalRow:
         commit: The candidate commit the row describes.
         metric: The structured-channel metric, or ``None`` on a crash.
         verdict: Whether the candidate was kept, discarded, or crashed.
-        resources: What the iteration consumed (``wall_s``, ``peak_rss_mb``, ``usd``).
+        resources: What the iteration consumed (``wall_s``, ``peak_rss_mb``, ``usd``),
+            plus ``run`` — the detached proposal's UUID run name — when one billed the
+            unit, so the orphan scan can recognize the spend as accounted.
         description: The driver's one-line description of the proposal.
     """
 
@@ -41,7 +43,7 @@ class JournalRow:
     commit: str
     metric: float | None
     verdict: Verdict
-    resources: dict[str, float]
+    resources: dict[str, float | str]
     description: str
 
     @classmethod

@@ -65,6 +65,9 @@ class PaidDriver:
     async def recover_cost(self) -> float:
         return 0.0
 
+    def pending_run(self) -> str | None:
+        return None
+
     def settle(self) -> None:
         return None
 

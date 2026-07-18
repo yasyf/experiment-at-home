@@ -13,7 +13,11 @@ written to the accounting stream (a journal row or a sidecar event), never befor
 A non-terminal record whose runner is gone is an orphan: a live pid raises the alarm
 (spend still accruing with no harness), and a dead pid writes the experiment's
 accounting-abort latch — the A3.x exactly-once-or-latch invariant — and marks the
-record terminal. A record with no bound pid and no pid file may still name a live,
+record terminal. Before latching, a dead record is cross-checked against the
+experiment's accounting artifacts: journal rows and sidecar events carry the run's
+UUID name, so a kill that landed between the durable accounting write and the
+registry's terminal mark is recognized as already-accounted spend and quietly
+terminalized instead of raising a false alarm. A record with no bound pid and no pid file may still name a live,
 billing child (killed between spawn and bind), so it is resolved through the process
 table by its UUID run name: found live it alarms, provably absent it latches, and
 unresolvable it stays UNKNOWN — alarmed and refused on every startup, never silently
@@ -41,6 +45,9 @@ import anyio
 from loguru import logger
 
 from athome.cache import atomic_write_text
+from athome.progress import load_journal
+from athome.research.errors import AccountingIntegrityError
+from athome.research.failures import infra_events
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -183,6 +190,21 @@ async def abort_latch(repo: Path, experiment: str) -> Path:
 
     journal = await nightly.journal_path(repo, experiment)
     return journal.with_name(f"{experiment}.abort.json")
+
+
+async def spend_recorded(repo: Path, record: ProposalProcess) -> bool:
+    from athome.research import nightly
+
+    journal = await nightly.journal_path(repo, record.experiment)
+    events = journal.with_name(f"{record.experiment}.events.jsonl")
+    try:
+        rows = load_journal(journal)
+        recorded = infra_events(events)
+    except (OSError, ValueError, AccountingIntegrityError):
+        return False  # unreadable artifacts keep the conservative answer: latch
+    return any(
+        isinstance(resources := row.get("resources"), dict) and resources.get("run") == record.run for row in rows
+    ) or any(event.get("run") == record.run for event in recorded)
 
 
 def orphan_status(orphan: Orphan) -> str:
@@ -334,7 +356,10 @@ async def scan(
     a kill between spawn and bind leaves exactly that shape with a live, billing
     child. Live and unknown orphans stay non-terminal so every later scan keeps
     refusing and alarming until reconciled; only a provably dead record gets the
-    experiment's accounting-abort latch written and its record marked terminal.
+    experiment's accounting-abort latch written and its record marked terminal — and
+    a dead record whose run UUID already appears on a journal row or sidecar event
+    is quietly marked ``accounted`` instead: its spend reached the accounting stream
+    and only the terminal registry line was lost to the kill.
 
     Args:
         registry: The campaign's proposal-process registry.
@@ -357,6 +382,13 @@ async def scan(
     for record in pending:
         latch = await abort_latch(repo, record.experiment)
         match liveness(record, alive=alive, snapshot=snapshot):
+            case ("dead", _) if await spend_recorded(repo, record):
+                registry.finalize(record.run, outcome="accounted")
+                logger.info(
+                    "proposal {} died before its terminal registry line but its spend is durably recorded; "
+                    "marked accounted without latching",
+                    record.run,
+                )
             case ("dead", pid):
                 await atomic_write_text(
                     anyio.Path(latch),

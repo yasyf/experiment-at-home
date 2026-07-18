@@ -69,8 +69,8 @@ async def test_record_and_count_infra_events(tmp_path: Path) -> None:
     events = tmp_path / "toy.events.jsonl"
     assert infra_retries(events) == 0 and infra_cost(events) == 0.0  # absent sidecar reads as zero
 
-    await record_infra_event(events, unit=3, attempt=0, reason="OSError('reset')", cost=0.6, kind="retry")
-    await record_infra_event(events, unit=3, attempt=1, reason="OSError('reset')", cost=0.0, kind="retry")
+    await record_infra_event(events, unit=3, attempt=0, reason="OSError('reset')", cost=0.6, kind="retry", run=None)
+    await record_infra_event(events, unit=3, attempt=1, reason="OSError('reset')", cost=0.0, kind="retry", run=None)
     await record_accounting_abort(latch, events, unit=4, reason="unknown spend")
 
     assert infra_retries(events) == 2
@@ -110,12 +110,12 @@ async def test_torn_middle_sidecar_line_never_loses_a_later_record(tmp_path: Pat
     # Finding #4: a torn (newline-less) prior line must not swallow the next appends. The writer
     # heals the fragment onto its own line; the reader skips only that malformed line.
     events = tmp_path / "toy.events.jsonl"
-    await record_infra_event(events, unit=0, attempt=0, reason="ok", cost=0.6, kind="retry")
+    await record_infra_event(events, unit=0, attempt=0, reason="ok", cost=0.6, kind="retry", run=None)
     with events.open("a") as handle:
         handle.write('{"unit": 1, "attempt": 0, "reason": "tor')  # a crash mid-write leaves this fragment
 
-    await record_infra_event(events, unit=2, attempt=0, reason="ok", cost=0.6, kind="retry")
-    await record_infra_event(events, unit=3, attempt=0, reason="ok", cost=0.6, kind="retry")
+    await record_infra_event(events, unit=2, attempt=0, reason="ok", cost=0.6, kind="retry", run=None)
+    await record_infra_event(events, unit=3, attempt=0, reason="ok", cost=0.6, kind="retry", run=None)
 
     assert sorted(event["unit"] for event in infra_events(events)) == [0, 2, 3]  # fragment skipped, nothing else lost
     assert infra_retries(events) == 3

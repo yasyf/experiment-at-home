@@ -8,7 +8,7 @@ import anyio
 import pytest
 
 from athome.detach import run_exitfile, run_log, run_pidfile
-from athome.research import meta, procs, watchdog
+from athome.research import meta, nightly, procs, watchdog
 from athome.research.driver import ClaudeCodeDriver
 from athome.research.errors import AccountingIntegrityError, PreflightFailure
 from athome.research.journal import Journal
@@ -129,6 +129,66 @@ async def test_scan_latches_a_dead_orphan_and_marks_it_terminal(tmp_path: Path) 
     assert stale.latch == orphan.latch
     orphan.latch.unlink()
     assert await procs.unreconciled(registry, repo=repo) == []
+
+
+def journal_row_record(run: str) -> dict[str, object]:
+    return {
+        "unit": 0,
+        "commit": "c" * 40,
+        "metric": None,
+        "verdict": "crash",
+        "resources": {"wall_s": 1.0, "usd": 0.42, "run": run},
+        "description": "proposal timeout",
+    }
+
+
+async def test_scan_recognizes_a_journaled_run_and_terminalizes_quietly(tmp_path: Path) -> None:
+    # R3 fix 1: a kill between journal.append and settle() leaves a non-terminal record whose
+    # spend is already durable; the scan must mark it accounted, never raise a false latch.
+    repo = campaign_repo(tmp_path / "repo")
+    registry = make_registry(tmp_path / "meta")
+    run = registered(registry)
+    journal = await nightly.journal_path(repo, "001-round1")
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    journal.write_text(json.dumps(journal_row_record(run)) + "\n")
+
+    assert await procs.scan(registry, repo=repo, alive=lambda pid: False, table=table_with()) == []
+
+    [record] = registry.records()
+    assert record.outcome == "accounted"
+    assert not (await procs.abort_latch(repo, "001-round1")).exists()
+
+
+async def test_scan_recognizes_a_sidecar_event_and_terminalizes_quietly(tmp_path: Path) -> None:
+    # R3 fix 1: the same kill window between record_infra_event and settle(), via the sidecar.
+    repo = campaign_repo(tmp_path / "repo")
+    registry = make_registry(tmp_path / "meta")
+    run = registered(registry)
+    journal = await nightly.journal_path(repo, "001-round1")
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    event = {"unit": 0, "attempt": 0, "reason": "wall cancel", "cost": 0.0, "kind": "wall_cancel", "run": run}
+    journal.with_name("001-round1.events.jsonl").write_text(json.dumps(event) + "\n")
+
+    assert await procs.scan(registry, repo=repo, alive=lambda pid: False, table=table_with()) == []
+
+    [record] = registry.records()
+    assert record.outcome == "accounted"
+    assert not (await procs.abort_latch(repo, "001-round1")).exists()
+
+
+async def test_scan_still_latches_when_the_artifacts_name_a_different_run(tmp_path: Path) -> None:
+    repo = campaign_repo(tmp_path / "repo")
+    registry = make_registry(tmp_path / "meta")
+    registered(registry)
+    journal = await nightly.journal_path(repo, "001-round1")
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    journal.write_text(json.dumps(journal_row_record("run-other")) + "\n")
+
+    [orphan] = await procs.scan(registry, repo=repo, alive=lambda pid: False, table=table_with())
+
+    assert orphan.resolution == "dead" and orphan.latch.exists()
+    [record] = registry.records()
+    assert record.outcome == "orphaned"
 
 
 async def test_scan_resolves_the_pid_from_the_pid_file_when_the_bind_never_landed(tmp_path: Path) -> None:
@@ -304,6 +364,9 @@ async def test_run_campaign_default_factory_binds_the_registry(tmp_path: Path, m
         async def recover_cost(self) -> float:
             return 0.0
 
+        def pending_run(self) -> str | None:
+            return None
+
         def settle(self) -> None:
             return None
 
@@ -423,6 +486,38 @@ async def test_loop_settles_the_registry_after_the_journal_row(tmp_path: Path) -
 
     [record] = registry.records()
     assert record.outcome == "accounted"
+    [row] = Journal.open(await nightly.journal_path(repo, "toy")).rows()
+    assert row.resources["run"] == record.run  # the durable artifact names the run it accounts
+
+
+async def test_kill_between_journal_row_and_settle_is_recognized_not_latched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R3 fix 1 end-to-end: settle never lands (the kill window), yet the journal row carries the
+    # run identity, so the startup scan quietly terminalizes instead of latching accounted spend.
+    (repo_dir := tmp_path / "repo").mkdir()
+    repo = toy_repo(repo_dir)
+    registry = make_registry(tmp_path / "meta")
+    spec = make_spec(budget=Budget(max_units=1))
+    driver = ClaudeCodeDriver(
+        spec,
+        command=fake_claude(tmp_path, FAKE_CLAUDE_COST),
+        poll=0.02,
+        timeout_s=10,
+        procs=registry.experiment("toy", seq=1, spec_digest=DIGEST),
+    )
+    monkeypatch.setattr(ClaudeCodeDriver, "settle", lambda self: None)
+
+    with anyio.fail_after(30.0):
+        await run_loop(spec, driver=driver, repo=repo)
+
+    [record] = registry.records()
+    assert record.outcome is None  # the kill window: spend durable, terminal registry line lost
+
+    assert await procs.scan(registry, repo=repo, alive=lambda pid: False, table=table_with()) == []
+    [record] = registry.records()
+    assert record.outcome == "accounted"
+    assert not (await procs.abort_latch(repo, "toy")).exists()
 
 
 async def test_loop_journal_failure_leaves_the_registry_non_terminal(

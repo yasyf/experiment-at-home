@@ -136,9 +136,11 @@ async def record_infra_event(
     reason: str,
     cost: float,
     kind: Literal["retry", "wall_cancel"],
+    run: str | None,
 ) -> None:
+    event: dict[str, object] = {"unit": unit, "attempt": attempt, "reason": reason, "cost": cost}
     try:
-        append_event(path, {"unit": unit, "attempt": attempt, "reason": reason, "cost": cost}, kind=kind)
+        append_event(path, event if run is None else event | {"run": run}, kind=kind)
     except OSError as exc:
         raise AccountingIntegrityError(f"could not record {kind} spend in {path}") from exc
 

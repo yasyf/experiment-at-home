@@ -68,7 +68,10 @@ class Driver(Protocol):
     event — it calls :meth:`settle`; an implementation holding a durable process
     registration marks it terminal there and never earlier, so a kill between the two
     writes leaves a non-terminal record the startup orphan scan latches instead of
-    invisible spend.
+    invisible spend. :meth:`pending_run` names the registered detached run whose spend
+    is captured or recovered but not yet settled (``None`` for drivers without one);
+    the loop stamps that identity onto the durable accounting artifact so the orphan
+    scan can recognize already-accounted spend instead of raising a false latch.
     """
 
     label: str
@@ -78,6 +81,8 @@ class Driver(Protocol):
     async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float: ...
 
     async def recover_cost(self) -> float: ...
+
+    def pending_run(self) -> str | None: ...
 
     def settle(self) -> None: ...
 
@@ -215,6 +220,9 @@ class StubDriver:
     async def recover_cost(self) -> float:
         return 0.0
 
+    def pending_run(self) -> str | None:
+        return None
+
     def settle(self) -> None:
         return None
 
@@ -341,6 +349,13 @@ class ClaudeCodeDriver:
 
     def account(self, run: DetachedRun) -> None:
         self._recovery.pending = run
+
+    def pending_run(self) -> str | None:
+        match self._recovery.pending:
+            case None:
+                return None
+            case run:
+                return run.name
 
     def settle(self) -> None:
         match self._recovery.pending:

@@ -479,6 +479,7 @@ async def execute_unit(
                                 reason="wall deadline cancelled after proposal",
                                 cost=cost,
                                 kind="wall_cancel",
+                                run=driver.pending_run(),
                             )
                         driver.settle()
                     recorded = True
@@ -487,7 +488,13 @@ async def execute_unit(
                 attempt_cost = (committed.cost if not billed else 0.0) if committed is not None else cost
                 billed = billed or committed is not None
                 await record_infra_event(
-                    events, unit=unit, attempt=attempt, reason=repr(infra), cost=attempt_cost, kind="retry"
+                    events,
+                    unit=unit,
+                    attempt=attempt,
+                    reason=repr(infra),
+                    cost=attempt_cost,
+                    kind="retry",
+                    run=driver.pending_run(),
                 )
                 driver.settle()
                 recorded = True
@@ -516,6 +523,7 @@ async def execute_unit(
                                 reason="attempt interrupted after proposal",
                                 cost=cost,
                                 kind="wall_cancel",
+                                run=driver.pending_run(),
                             )
                         driver.settle()
                     except (Exception, anyio.get_cancelled_exc_class()) as exc:
@@ -649,7 +657,8 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
                     commit=outcome.commit,
                     metric=outcome.metric,
                     verdict=outcome.verdict,
-                    resources={"wall_s": time.monotonic() - unit_started, "usd": outcome.cost},
+                    resources={"wall_s": time.monotonic() - unit_started, "usd": outcome.cost}
+                    | ({} if (pending := driver.pending_run()) is None else {"run": pending}),
                     description=outcome.description,
                 )
                 try:
