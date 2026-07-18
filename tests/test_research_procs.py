@@ -105,10 +105,10 @@ async def test_scan_alarms_a_live_orphan_and_leaves_it_non_terminal(tmp_path: Pa
 
     [orphan] = await procs.scan(registry, repo=repo, alive=lambda pid: pid == 4242, table=table_with((4242, "run-a")))
 
-    assert orphan.live and orphan.pid == 4242
+    assert orphan.resolution == "live" and orphan.pid == 4242
     assert not orphan.latch.exists()
     [again] = await procs.scan(registry, repo=repo, alive=lambda pid: pid == 4242, table=table_with((4242, "run-a")))
-    assert again.live  # still non-terminal: every later scan keeps refusing until reconciled
+    assert again.resolution == "live"  # still non-terminal: every later scan keeps refusing until reconciled
 
 
 async def test_scan_latches_a_dead_orphan_and_marks_it_terminal(tmp_path: Path) -> None:
@@ -118,7 +118,7 @@ async def test_scan_latches_a_dead_orphan_and_marks_it_terminal(tmp_path: Path) 
 
     [orphan] = await procs.scan(registry, repo=repo, alive=lambda pid: False, table=table_with())
 
-    assert not orphan.live and orphan.pid == 4242
+    assert orphan.resolution == "dead" and orphan.pid == 4242
     latch = json.loads(orphan.latch.read_text())
     assert latch["run"] == run and "reconcile the spend" in latch["reason"]
     [record] = registry.records()
@@ -139,17 +139,54 @@ async def test_scan_resolves_the_pid_from_the_pid_file_when_the_bind_never_lande
 
     [orphan] = await procs.scan(registry, repo=repo, alive=lambda pid: pid == 4242, table=table_with((4242, run)))
 
-    assert orphan.live and orphan.pid == 4242
+    assert orphan.resolution == "live" and orphan.pid == 4242
 
 
-async def test_scan_latches_a_never_bound_record_with_no_pid_file(tmp_path: Path) -> None:
+async def test_scan_latches_a_never_bound_record_provably_absent_from_the_table(tmp_path: Path) -> None:
     repo = campaign_repo(tmp_path / "repo")
     registry = make_registry(tmp_path / "meta")
     registered(registry, pid=None)
 
-    [orphan] = await procs.scan(registry, repo=repo, alive=lambda pid: pytest.fail("no pid to probe"), table=table_with())
+    [orphan] = await procs.scan(
+        registry, repo=repo, alive=lambda pid: pytest.fail("no pid to probe"), table=table_with()
+    )
 
-    assert not orphan.live and orphan.pid is None and orphan.latch.exists()
+    assert orphan.resolution == "dead" and orphan.pid is None and orphan.latch.exists()
+
+
+async def test_scan_resolves_a_never_bound_record_to_its_live_child_by_run_name(tmp_path: Path) -> None:
+    # Killed between spawn and bind: no pid anywhere, but the child is alive and billing.
+    repo = campaign_repo(tmp_path / "repo")
+    registry = make_registry(tmp_path / "meta")
+    run = registered(registry, pid=None)
+
+    [orphan] = await procs.scan(
+        registry, repo=repo, alive=lambda pid: pytest.fail("no pid to probe"), table=table_with((5555, run))
+    )
+
+    assert orphan.resolution == "live" and orphan.pid == 5555
+    assert not orphan.latch.exists()
+    [record] = registry.records()
+    assert record.outcome is None  # left for every later scan to keep refusing
+
+
+async def test_scan_never_silently_latches_an_unresolvable_record(tmp_path: Path) -> None:
+    repo = campaign_repo(tmp_path / "repo")
+    registry = make_registry(tmp_path / "meta")
+    registered(registry, pid=None)
+
+    [orphan] = await procs.scan(
+        registry, repo=repo, alive=lambda pid: pytest.fail("no pid to probe"), table=lambda: None
+    )
+
+    assert orphan.resolution == "unknown" and orphan.pid is None
+    assert not orphan.latch.exists()
+    [record] = registry.records()
+    assert record.outcome is None
+    assert "UNRESOLVED" in procs.refusal([orphan]) and "unreconciled spend" in procs.refusal([orphan])
+
+    [again] = await procs.scan(registry, repo=repo, alive=lambda pid: pytest.fail("no pid"), table=lambda: None)
+    assert again.resolution == "unknown"  # persistent refusal until the operator reconciles
 
 
 async def test_scan_latches_an_alive_pid_reused_by_an_unrelated_process(tmp_path: Path) -> None:
@@ -161,7 +198,9 @@ async def test_scan_latches_an_alive_pid_reused_by_an_unrelated_process(tmp_path
         registry, repo=repo, alive=lambda pid: True, table=table_with((4242, "some-unrelated-daemon"))
     )
 
-    assert not orphan.live and orphan.pid == 4242  # alive but not our process: PID reuse, never a LIVE block
+    assert (
+        orphan.resolution == "dead" and orphan.pid == 4242
+    )  # alive but not our process: PID reuse, never a LIVE block
     assert json.loads(orphan.latch.read_text())["run"] == run
     [record] = registry.records()
     assert record.outcome == "orphaned"
@@ -176,7 +215,7 @@ async def test_scan_latches_a_pgid_mismatch_as_pid_reuse(tmp_path: Path) -> None
         registry, repo=repo, alive=lambda pid: True, table=table_with((4242, "run-a"), pgid=999)
     )
 
-    assert not orphan.live and orphan.latch.exists()
+    assert orphan.resolution == "dead" and orphan.latch.exists()
     [record] = registry.records()
     assert record.outcome == "orphaned"
 
@@ -188,7 +227,9 @@ async def test_scan_treats_an_alive_pid_as_live_when_the_table_is_unavailable(tm
 
     [orphan] = await procs.scan(registry, repo=repo, alive=lambda pid: True, table=lambda: None)
 
-    assert orphan.live  # identity unverifiable: refuse conservatively, never latch a possibly-live biller
+    assert (
+        orphan.resolution == "live"
+    )  # identity unverifiable: refuse conservatively, never latch a possibly-live biller
     assert not orphan.latch.exists()
 
 
@@ -450,8 +491,9 @@ async def test_check_campaign_alerts_and_latches_orphans(tmp_path: Path, monkeyp
     registry = make_registry(root)
     registered(registry, run="run-live", pid=4242)
     registered(registry, run="run-dead", pid=9999)
+    registered(registry, run="run-unknown", pid=None)
     monkeypatch.setattr(procs, "pid_alive", lambda pid: pid == 4242)
-    monkeypatch.setattr(procs, "process_table", table_with((4242, "run-live")))
+    monkeypatch.setattr(procs, "process_table", lambda: None)
     alerts: list[tuple[str, str, str]] = []
 
     async def fake_alert(_journal: Path, *, unit: str, detail: str, kind: str = "quiet_alarm") -> None:
@@ -461,10 +503,12 @@ async def test_check_campaign_alerts_and_latches_orphans(tmp_path: Path, monkeyp
 
     result = await watchdog.check_campaign(root, repo=repo)
 
-    assert not result.live and {orphan.record.run for orphan in result.orphans} == {"run-live", "run-dead"}
+    assert not result.live
+    assert {orphan.record.run for orphan in result.orphans} == {"run-live", "run-dead", "run-unknown"}
     assert {kind for kind, _, _ in alerts} == {"orphan_alarm"}
     assert any("billing with no harness" in detail for _, _, detail in alerts)
     assert any("abort latch written" in detail for _, _, detail in alerts)
+    assert any("reconcile manually" in detail for _, _, detail in alerts)
     assert (await procs.abort_latch(repo, "001-round1")).exists()
     outcomes = {record.run: record.outcome for record in registry.records()}
-    assert outcomes == {"run-live": None, "run-dead": "orphaned"}
+    assert outcomes == {"run-live": None, "run-dead": "orphaned", "run-unknown": None}

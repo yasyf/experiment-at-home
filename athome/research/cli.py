@@ -254,7 +254,7 @@ async def meta_watch_command(repo: Path | None, root: Path | None, *, as_json: b
                     "run": orphan.record.run,
                     "experiment": orphan.record.experiment,
                     "pid": orphan.pid,
-                    "alive": orphan.live,
+                    "resolution": orphan.resolution,
                     "latch": str(orphan.latch),
                 }
                 for orphan in result.orphans

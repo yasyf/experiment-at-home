@@ -13,9 +13,13 @@ written to the accounting stream (a journal row or a sidecar event), never befor
 A non-terminal record whose runner is gone is an orphan: a live pid raises the alarm
 (spend still accruing with no harness), and a dead pid writes the experiment's
 accounting-abort latch — the A3.x exactly-once-or-latch invariant — and marks the
-record terminal. :func:`athome.research.meta.run_campaign` refuses to start while an
-orphan is live or its latch remains unreconciled, and the A7 watchdog runs the same
-scan whenever no live runner holds the campaign lock.
+record terminal. A record with no bound pid and no pid file may still name a live,
+billing child (killed between spawn and bind), so it is resolved through the process
+table by its UUID run name: found live it alarms, provably absent it latches, and
+unresolvable it stays UNKNOWN — alarmed and refused on every startup, never silently
+latched and terminalized. :func:`athome.research.meta.run_campaign` refuses to start
+while an orphan is live or unknown or its latch remains unreconciled, and the A7
+watchdog runs the same scan whenever no live runner holds the campaign lock.
 
 A torn final line (the harness killed mid-append) is skipped on read and healed by
 the next append; losing a torn ``terminal`` line only makes the scan conservative —
@@ -86,14 +90,16 @@ class Orphan:
 
     Attributes:
         record: The orphaned registry record.
-        pid: The resolved pid, or ``None`` when no pid was ever durably bound.
-        live: Whether the process is still alive (and still billing).
+        pid: The resolved pid, or ``None`` when none could be resolved.
+        resolution: ``live`` (still billing, alarmed and refused), ``dead``
+            (latched and marked terminal), or ``unknown`` (no pid resolvable and
+            the process table unavailable: alarmed and refused, never latched).
         latch: The experiment's accounting-abort latch path.
     """
 
     record: ProposalProcess
     pid: int | None
-    live: bool
+    resolution: Resolution
     latch: Path
 
 
@@ -144,6 +150,21 @@ def identity_matches(record: ProposalProcess, entry: ProcessEntry | None) -> boo
             return False
 
 
+def liveness(
+    record: ProposalProcess, *, alive: Callable[[int], bool], snapshot: ProcessTable | None
+) -> tuple[Resolution, int | None]:
+    if (pid := resolve_pid(record)) is not None:
+        if not alive(pid):
+            return "dead", pid
+        if snapshot is None:
+            return "live", pid
+        return ("live", pid) if identity_matches(record, snapshot.get(pid)) else ("dead", pid)
+    if snapshot is None:
+        return "unknown", None
+    found = next((pid for pid, entry in snapshot.items() if record.run in entry.command), None)
+    return ("dead", None) if found is None else ("live", found)
+
+
 def resolve_pid(record: ProposalProcess) -> int | None:
     if record.pid is not None:
         return record.pid
@@ -164,11 +185,18 @@ async def abort_latch(repo: Path, experiment: str) -> Path:
     return journal.with_name(f"{experiment}.abort.json")
 
 
+def orphan_status(orphan: Orphan) -> str:
+    match orphan.resolution:
+        case "live":
+            return f"LIVE pid {orphan.pid}, still billing"
+        case "dead":
+            return f"latched {orphan.latch}"
+        case "unknown":
+            return "UNRESOLVED: no pid recorded and the process table is unavailable; possibly still billing"
+
+
 def refusal(orphans: Sequence[Orphan]) -> str:
-    described = "; ".join(
-        f"{orphan.record.run} ({f'LIVE pid {orphan.pid}, still billing' if orphan.live else f'latched {orphan.latch}'})"
-        for orphan in orphans
-    )
+    described = "; ".join(f"{orphan.record.run} ({orphan_status(orphan)})" for orphan in orphans)
     return (
         f"detached proposal processes with unreconciled spend: {described}; "
         "check the provider ledger, reconcile the spend, then delete each latch file"
@@ -301,18 +329,20 @@ async def scan(
     start/resume, or from the watchdog after its momentary exclusive probe. Liveness
     requires identity, not just an alive pid: the process table must show the run's
     UUID name on the pid's command line and the recorded pgid where one was bound,
-    else the pid was reused by an unrelated process and the record is dead. A live
-    orphan is left non-terminal so every later scan keeps refusing and alarming until
-    it is reconciled; a dead (or never-bound) pid gets the experiment's
-    accounting-abort latch written and its record marked terminal.
+    else the pid was reused by an unrelated process and the record is dead. A record
+    with no bound pid and no pid file is resolved through the table by its run name —
+    a kill between spawn and bind leaves exactly that shape with a live, billing
+    child. Live and unknown orphans stay non-terminal so every later scan keeps
+    refusing and alarming until reconciled; only a provably dead record gets the
+    experiment's accounting-abort latch written and its record marked terminal.
 
     Args:
         registry: The campaign's proposal-process registry.
         repo: The git repository experiments ran against (locates each latch).
         alive: Injectable pid-liveness probe; defaults to ``kill -0``.
         table: Injectable process-table snapshot; defaults to ``ps -axo``. ``None``
-            from the snapshot means the table is unavailable and identity cannot be
-            checked, so an alive pid is conservatively treated as live.
+            from the snapshot means the table is unavailable: an alive pid is
+            conservatively live, and a record with no pid at all is unknown.
 
     Returns:
         Every orphan found, live ones first as recorded.
@@ -325,24 +355,24 @@ async def scan(
     snapshot = table()
     orphans = []
     for record in pending:
-        pid = resolve_pid(record)
         latch = await abort_latch(repo, record.experiment)
-        if pid is not None and alive(pid) and (snapshot is None or identity_matches(record, snapshot.get(pid))):
-            orphans.append(Orphan(record, pid=pid, live=True, latch=latch))
-            continue
-        await atomic_write_text(
-            anyio.Path(latch),
-            json.dumps(
-                {
-                    "reason": f"orphaned detached proposal {record.run} has no accounting trace; "
-                    "check the provider ledger, reconcile the spend, then delete the latch file",
-                    "run": record.run,
-                    "ts": time.time(),
-                }
-            ),
-        )
-        registry.finalize(record.run, outcome="orphaned")
-        orphans.append(Orphan(record, pid=pid, live=False, latch=latch))
+        match liveness(record, alive=alive, snapshot=snapshot):
+            case ("dead", pid):
+                await atomic_write_text(
+                    anyio.Path(latch),
+                    json.dumps(
+                        {
+                            "reason": f"orphaned detached proposal {record.run} has no accounting trace; "
+                            "check the provider ledger, reconcile the spend, then delete the latch file",
+                            "run": record.run,
+                            "ts": time.time(),
+                        }
+                    ),
+                )
+                registry.finalize(record.run, outcome="orphaned")
+                orphans.append(Orphan(record, pid=pid, resolution="dead", latch=latch))
+            case (resolution, pid):
+                orphans.append(Orphan(record, pid=pid, resolution=resolution, latch=latch))
     return orphans
 
 
@@ -354,5 +384,5 @@ async def unreconciled(registry: ProcessRegistry, *, repo: Path) -> list[Orphan]
             continue
         latch = await abort_latch(repo, record.experiment)
         if await anyio.Path(latch).exists():
-            stale.append(Orphan(record, pid=record.pid, live=False, latch=latch))
+            stale.append(Orphan(record, pid=record.pid, resolution="dead", latch=latch))
     return stale

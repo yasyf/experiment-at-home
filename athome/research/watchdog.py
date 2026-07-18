@@ -71,8 +71,9 @@ class CampaignWatchResult:
 
     Attributes:
         live: Whether a live runner holds the campaign lock (the registry is left to it).
-        orphans: The orphans handled when no runner was live: live pids alarmed and left
-            non-terminal, dead pids latched and marked terminal.
+        orphans: The orphans handled when no runner was live: live and unknown
+            records alarmed and left non-terminal, dead ones latched and marked
+            terminal.
     """
 
     live: bool
@@ -353,16 +354,26 @@ async def check_campaign(root: Path, *, repo: Path) -> CampaignWatchResult:
     finally:
         os.close(fd)
     for orphan in orphans:
+        match orphan.resolution:
+            case "live":
+                detail = (
+                    f"live orphaned proposal process {orphan.record.run} (pid {orphan.pid}) is billing with no harness"
+                )
+            case "dead":
+                detail = (
+                    f"orphaned proposal process {orphan.record.run} died with no accounting trace; "
+                    f"abort latch written to {orphan.latch}"
+                )
+            case "unknown":
+                detail = (
+                    f"orphaned proposal process {orphan.record.run} has no resolvable pid and the process "
+                    "table is unavailable; possibly still billing — reconcile manually"
+                )
         await _alert(
             await nightly.journal_path(repo, orphan.record.experiment),
             unit=orphan.record.experiment,
             kind="orphan_alarm",
-            detail=(
-                f"live orphaned proposal process {orphan.record.run} (pid {orphan.pid}) is billing with no harness"
-                if orphan.live
-                else f"orphaned proposal process {orphan.record.run} died with no accounting trace; "
-                f"abort latch written to {orphan.latch}"
-            ),
+            detail=detail,
         )
     return CampaignWatchResult(live=False, orphans=orphans)
 
