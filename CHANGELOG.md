@@ -4,7 +4,14 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] - 2026-07-18
+
+### Added
+- **`TinkerBackend.sample(path, prompts, *, base, max_tokens, temperature, seed, max_usd)`** — free-form sampling from what Tinker actually serves: any saved checkpoint path, or the bare base model with `path=None`. Modeled on `score()`'s spend idioms — one conservative up-front `SpendGuard` projection (full prompt prefill plus `max_tokens` per prompt) checked before any client exists, prompts fanned under bounded concurrency, order-preserving results, and per-sequence actual cost recorded against the projection. Per-prompt seeds derive as `seed + i`, so a batch reproduces exactly while its members stay distinct. Returns the new frozen **`SampledSequence(text, prompt_tokens, sampled_tokens, usd)`**, exported from `athome.train`.
+- **`Adapter.sampler_path` / `Checkpoint.sampler_path`** — the `tinker://` address a checkpoint was saved under now survives `materialize` and `fuse` instead of being dropped, and persists through the registry, so consumers can sample from the exact weights a saved checkpoint serves. `Adapter.sampler_path` is required; `Checkpoint.sampler_path` is `None` for local- and modal-trained checkpoints, which have no hosted sampler.
+
+### Fixed
+- `TinkerBackend.score` and `sample` create their sampling clients through the SDK's async variant, so a slow remote session creation no longer blocks the event loop.
 
 ## [0.7.1] - 2026-07-18
 

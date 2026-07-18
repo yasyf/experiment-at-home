@@ -154,9 +154,11 @@ def test_checkpoint_carries_the_fused_artifact_and_its_provenance() -> None:
         mlx_path=Path("/runs/watcher/fused"),
         adapter_dir=Path("/runs/watcher/adapter"),
         train_cost_usd=1.25,
+        sampler_path="tinker://run/watcher-sampler",
     )
     assert checkpoint.mlx_path == Path("/runs/watcher/fused")
     assert checkpoint.adapter_dir == Path("/runs/watcher/adapter")
+    assert checkpoint.sampler_path == "tinker://run/watcher-sampler"
 
 
 def test_train_settings_defaults_expand_user_paths() -> None:

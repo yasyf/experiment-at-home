@@ -98,6 +98,7 @@ def checkpoint(*, mlx_path: Path = FUSED, adapter_dir: Path = Path("/runs/watche
         mlx_path=mlx_path,
         adapter_dir=adapter_dir,
         train_cost_usd=1.25,
+        sampler_path="tinker://run/watcher-sampler",
     )
 
 
@@ -236,6 +237,7 @@ async def test_run_trains_evaluates_registers_and_promotes_the_winner(
     assert promoted is not None and promoted.version == result.version.version
     assert promoted.metadata["source_mlx_path"] == str(backend.checkpoints[0].mlx_path)
     assert promoted.metadata["backend"] == "tinker"
+    assert promoted.metadata["sampler_path"] == "tinker://run/watcher-sampler"
     assert promoted.metadata["metric"] == 0.9
     assert json.loads((result.version.path / train.CHECKPOINT_FILE).read_text())["source_mlx_path"] == str(
         backend.checkpoints[0].mlx_path

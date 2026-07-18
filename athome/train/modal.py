@@ -400,4 +400,5 @@ class ModalTrainBackend:
             mlx_path=mlx_path,
             adapter_dir=adapter_dir,
             train_cost_usd=actual,
+            sampler_path=None,
         )

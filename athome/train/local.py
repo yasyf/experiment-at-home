@@ -165,4 +165,5 @@ class LocalBackend:
             mlx_path=fused,
             adapter_dir=adapter_dir,
             train_cost_usd=0.0,
+            sampler_path=None,
         )

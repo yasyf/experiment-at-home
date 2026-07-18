@@ -37,6 +37,7 @@ from athome.train.spec import (
     InsufficientData,
     LoraSpec,
     OverlongEvalRows,
+    SampledSequence,
     SavedCheckpoint,
     ScoredSequence,
     StepRecord,
@@ -57,7 +58,7 @@ if TYPE_CHECKING:
     import torch
 
     from athome.progress import RunSink
-    from athome.train.data import TinkerPreference
+    from athome.train.data import Message, TinkerPreference
     from athome.train.engine import Loss, Op
     from athome.train.spec import (
         BackendName,
@@ -628,7 +629,7 @@ class TinkerBackend:
         """
         peft = await download_adapter(self.service(), saved.path, work_dir / "peft")
         adapter_dir = await sidecar.convert_peft_to_mlx(peft, work_dir / "adapter", base=spec.base)
-        return Adapter(step=saved.step, adapter_dir=adapter_dir, train_cost_usd=cost)
+        return Adapter(step=saved.step, adapter_dir=adapter_dir, train_cost_usd=cost, sampler_path=saved.path)
 
     async def fuse(self, adapter: Adapter, spec: TrainSpec, *, work_dir: Path) -> Checkpoint:
         """Fuse a materialized adapter into a standalone servable MLX checkpoint.
@@ -649,6 +650,7 @@ class TinkerBackend:
             mlx_path=await sidecar.fuse(adapter.adapter_dir, work_dir / "mlx", base=spec.base),
             adapter_dir=adapter.adapter_dir,
             train_cost_usd=adapter.train_cost_usd,
+            sampler_path=adapter.sampler_path,
         )
 
     async def score(
@@ -684,7 +686,7 @@ class TinkerBackend:
         )
         guard = SpendGuard(max_usd=self.settings.spend_cap_usd if max_usd is None else max_usd)
         await guard.check(projected)
-        client = self.service().create_sampling_client(model_path=path)
+        client = await self.service().create_sampling_client_async(model_path=path)
         prompts = [tinker.ModelInput.from_ints(list(row.tokens)) for row in rows]
         outputs = await gather_bounded(
             [partial(client.compute_logprobs_async, prompt) for prompt in prompts],
@@ -698,3 +700,88 @@ class TinkerBackend:
             )
             for output, row in zip(outputs, rows, strict=True)
         )
+
+    async def sample(
+        self,
+        path: str | None,
+        prompts: Sequence[Sequence[Message]],
+        *,
+        base: BaseModelSpec,
+        max_tokens: int,
+        temperature: float,
+        seed: int | None = None,
+        max_usd: float | None = None,
+    ) -> tuple[SampledSequence, ...]:
+        """Sample free-form completions from a Tinker checkpoint, or the base model when ``path`` is None.
+
+        Every prompt is rendered with the base's training chat template and a generation prompt, so a
+        sample matches what the policy was trained to continue. The whole batch is projected against
+        the spend cap in one conservative reservation — full prefill plus ``max_tokens`` per prompt —
+        before any sampling client exists, then reconciled to the real generated token counts, so a
+        batch that cannot fit the cap aborts having spent nothing and a short generation bills less.
+
+        Args:
+            path: The opaque ``tinker://`` sampler checkpoint to sample from, or None to sample the
+                base model directly (iteration-zero negatives, before any checkpoint exists).
+            prompts: The chat prompts to complete, one completion returned per prompt, in input order.
+            base: The base model identity: its chat template tokenizes the prompts and its price sheet
+                bills the run, and, when ``path`` is None, its Tinker id is the model sampled.
+            max_tokens: The generation cap per prompt; also the per-prompt sample count the projection reserves.
+            temperature: The sampling temperature applied to every prompt.
+            seed: The base seed; prompt ``i`` samples with ``seed + i`` for reproducibility, or None to
+                leave every prompt unseeded.
+            max_usd: The sampling spend cap, or None for the configured Tinker cap.
+
+        Returns:
+            One sampled sequence per prompt, preserving input order, each with its decoded text, token
+            counts, and billed cost.
+
+        Raises:
+            UnservableBase: The base has no Tinker identity.
+            SpendExceeded: The projected prefill and ``max_tokens`` per prompt cross the cap.
+        """
+        import tinker
+
+        model = tinker_model(base)
+        tok = data.tokenizer(base.mlx)
+        prompt_ids = [data.chat_ids(prompt, base.mlx, add_generation_prompt=True) for prompt in prompts]
+        projected = self.cost(
+            model=model,
+            prefill=sum(len(ids) for ids in prompt_ids),
+            sample=max_tokens * len(prompts),
+        )
+        guard = SpendGuard(max_usd=self.settings.spend_cap_usd if max_usd is None else max_usd)
+        await guard.check(projected)
+        client = await (
+            self.service().create_sampling_client_async(base_model=model)
+            if path is None
+            else self.service().create_sampling_client_async(model_path=path)
+        )
+        responses = await gather_bounded(
+            [
+                partial(
+                    client.sample_async,
+                    tinker.ModelInput.from_ints(ids),
+                    1,
+                    tinker.SamplingParams(
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        seed=None if seed is None else seed + index,
+                    ),
+                )
+                for index, ids in enumerate(prompt_ids)
+            ],
+            concurrency=64,
+        )
+        sampled = tuple(
+            SampledSequence(
+                text=tok.decode(sequence.tokens),
+                prompt_tokens=len(ids),
+                sampled_tokens=len(sequence.tokens),
+                usd=self.cost(model=model, prefill=len(ids), sample=len(sequence.tokens)),
+            )
+            for ids, response in zip(prompt_ids, responses, strict=True)
+            for sequence in (response.sequences[0],)
+        )
+        await guard.record(projected, sum(sequence.usd for sequence in sampled))
+        return sampled

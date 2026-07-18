@@ -333,11 +333,13 @@ class Adapter:
         step: The training step whose weights this adapter carries.
         adapter_dir: The mlx-lm adapter directory.
         train_cost_usd: What the training run spent to produce the saved weights.
+        sampler_path: The opaque ``tinker://`` sampler checkpoint the adapter was materialized from.
     """
 
     step: int
     adapter_dir: Path
     train_cost_usd: float
+    sampler_path: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,6 +360,8 @@ class Checkpoint:
         mlx_path: The fused standalone 4-bit MLX model directory.
         adapter_dir: The mlx-lm adapter directory, when one was materialized.
         train_cost_usd: What the run spent; 0.0 on the unmetered local backend.
+        sampler_path: The opaque ``tinker://`` sampler checkpoint the fused adapter came from, or
+            None for a backend that produces no hosted sampler checkpoint (local, modal).
     """
 
     base: BaseModelSpec
@@ -367,6 +371,7 @@ class Checkpoint:
     mlx_path: Path
     adapter_dir: Path | None
     train_cost_usd: float
+    sampler_path: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,6 +385,23 @@ class ScoredSequence:
 
     logprob: float
     weight: float
+
+
+@dataclass(frozen=True, slots=True)
+class SampledSequence:
+    """One free-form completion sampled from a checkpoint, with its token counts and billed cost.
+
+    Attributes:
+        text: The decoded completion text.
+        prompt_tokens: The prompt's prefilled token count.
+        sampled_tokens: The number of tokens generated.
+        usd: What this sequence's prefill and generated tokens billed.
+    """
+
+    text: str
+    prompt_tokens: int
+    sampled_tokens: int
+    usd: float
 
 
 @dataclass(frozen=True, slots=True)

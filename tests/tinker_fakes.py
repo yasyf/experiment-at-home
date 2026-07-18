@@ -53,6 +53,13 @@ class FakeAdamParams:
 
 
 @dataclass(frozen=True, slots=True)
+class FakeSamplingParams:
+    max_tokens: int
+    temperature: float
+    seed: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class FakeOutput:
     loss_fn_outputs: list[dict[str, FakeTensor]]
     metrics: dict[str, float] = field(default_factory=dict)
@@ -245,6 +252,9 @@ class FakeTokenizer:
     def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
         return [ord(char) for char in text]
 
+    def decode(self, tokens: list[int]) -> str:
+        return "".join(chr(token) for token in tokens)
+
 
 def fake_sdk() -> ModuleType:
     """A stand-in ``tinker`` module carrying the value types the training code constructs."""
@@ -254,6 +264,7 @@ def fake_sdk() -> ModuleType:
     module.ModelInput = FakeModelInput
     module.TensorData = FakeTensor
     module.AdamParams = FakeAdamParams
+    module.SamplingParams = FakeSamplingParams
     return module
 
 

@@ -52,6 +52,7 @@ from tests.tinker_fakes import (
     Boom,
     FakeAdamParams,
     FakeModelInput,
+    FakeSamplingParams,
     FakeService,
     FakeTokenizer,
     FakeUrl,
@@ -68,11 +69,25 @@ if TYPE_CHECKING:
     from athome.train.spec import Method
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class FakeSampledSequence:
+    tokens: list[int]
+    stop_reason: str = "length"
+    logprobs: list[float] | None = None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class FakeSampleResponse:
+    sequences: list[FakeSampledSequence]
+
+
 @dataclasses.dataclass(slots=True)
 class FakeSampling:
     outputs: dict[tuple[int, ...], list[float | None]] = dataclasses.field(default_factory=dict)
+    generated: dict[tuple[int, ...], list[int]] = dataclasses.field(default_factory=dict)
     calls: list[tuple[int, ...]] = dataclasses.field(default_factory=list)
     finished: list[tuple[int, ...]] = dataclasses.field(default_factory=list)
+    sample_calls: list[tuple[tuple[int, ...], int, FakeSamplingParams]] = dataclasses.field(default_factory=list)
     slow: tuple[int, ...] | None = None
     release: anyio.Event | None = None
 
@@ -87,14 +102,33 @@ class FakeSampling:
         self.finished.append(key)
         return self.outputs.get(key, [None, *([LOGPROB] * (len(key) - 1))])
 
+    async def sample_async(
+        self, prompt: FakeModelInput, num_samples: int, sampling_params: FakeSamplingParams
+    ) -> FakeSampleResponse:
+        key = tuple(prompt.ids)
+        self.sample_calls.append((key, num_samples, sampling_params))
+        if self.release is not None:
+            if key == self.slow:
+                await self.release.wait()
+            else:
+                self.release.set()
+        self.finished.append(key)
+        return FakeSampleResponse(
+            [FakeSampledSequence(tokens=self.generated.get(key, [ord("x")])) for _ in range(num_samples)]
+        )
+
 
 @dataclasses.dataclass(slots=True)
 class FakeSamplingService(FakeService):
     sampling: FakeSampling = dataclasses.field(default_factory=FakeSampling)
-    sampling_paths: list[str] = dataclasses.field(default_factory=list)
+    sampling_paths: list[str | None] = dataclasses.field(default_factory=list)
+    sampling_base_models: list[str | None] = dataclasses.field(default_factory=list)
 
-    def create_sampling_client(self, model_path: str) -> FakeSampling:
+    async def create_sampling_client_async(
+        self, model_path: str | None = None, base_model: str | None = None
+    ) -> FakeSampling:
         self.sampling_paths.append(model_path)
+        self.sampling_base_models.append(base_model)
         return self.sampling
 
 
@@ -723,7 +757,12 @@ async def test_materialize_converts_any_saved_checkpoint_without_fusing(
 
     adapter = await TinkerBackend.from_settings().materialize(saved, request, work_dir=tmp_path / "run", cost=1.25)
 
-    assert adapter == Adapter(step=2, adapter_dir=tmp_path / "run" / "adapter", train_cost_usd=1.25)
+    assert adapter == Adapter(
+        step=2,
+        adapter_dir=tmp_path / "run" / "adapter",
+        train_cost_usd=1.25,
+        sampler_path="tinker://run/watcher-step00002",
+    )
     assert converged["tinker_path"] == saved.path
     assert converged["peft"] == tmp_path / "run" / "peft"
     assert converged["convert_from"] == tmp_path / "run" / "peft"
@@ -732,7 +771,9 @@ async def test_materialize_converts_any_saved_checkpoint_without_fusing(
 
 async def test_fuse_preserves_the_materialized_adapter_step(converged: dict[str, object], tmp_path: Path) -> None:
     request = spec(corpus(tmp_path, method="sft"))
-    adapter = Adapter(step=2, adapter_dir=tmp_path / "adapter", train_cost_usd=1.25)
+    adapter = Adapter(
+        step=2, adapter_dir=tmp_path / "adapter", train_cost_usd=1.25, sampler_path="tinker://run/watcher-step2"
+    )
 
     checkpoint = await TinkerBackend.from_settings().fuse(adapter, request, work_dir=tmp_path / "run")
 
@@ -740,6 +781,7 @@ async def test_fuse_preserves_the_materialized_adapter_step(converged: dict[str,
     assert checkpoint.adapter_dir == adapter.adapter_dir
     assert checkpoint.mlx_path == tmp_path / "run" / "mlx"
     assert checkpoint.train_cost_usd == adapter.train_cost_usd
+    assert checkpoint.sampler_path == adapter.sampler_path
     assert converged["fuse_from"] == adapter.adapter_dir
 
 
@@ -757,6 +799,7 @@ async def test_the_checkpoint_fuses_the_downloaded_adapter_into_mlx(
     assert converged["fuse_from"] == run / "adapter"
     assert checkpoint.mlx_path == run / "mlx"
     assert checkpoint.adapter_dir == run / "adapter"
+    assert checkpoint.sampler_path == "tinker://run/watcher-sft-3"
     assert checkpoint.base == BASE_MODELS["qwen3-8b"]
 
 
@@ -865,6 +908,135 @@ async def test_score_rejects_an_over_cap_projection_before_creating_a_service_cl
         await TinkerBackend.from_settings().score("tinker://run/final", rows, base=BASE_MODELS["qwen3-8b"], max_usd=0.0)
 
     assert service_calls == []
+
+
+def prompt_ids(prompt: list[dict[str, str]]) -> tuple[int, ...]:
+    return tuple(data.chat_ids(prompt, BASE_MODELS["qwen3-8b"].mlx, add_generation_prompt=True))
+
+
+async def test_sample_preserves_prompt_order_and_seeds_each_prompt_by_index(
+    sampling_service: FakeSamplingService,
+) -> None:
+    prompts = [[{"role": "user", "content": "one"}], [{"role": "user", "content": "two"}]]
+    sampling_service.sampling.generated = {
+        prompt_ids(prompts[0]): [ord("A"), ord("B")],
+        prompt_ids(prompts[1]): [ord("C")],
+    }
+    sampling_service.sampling.slow = prompt_ids(prompts[0])
+    sampling_service.sampling.release = anyio.Event()
+
+    sampled = await TinkerBackend.from_settings().sample(
+        "tinker://run/step2", prompts, base=BASE_MODELS["qwen3-8b"], max_tokens=8, temperature=0.7, seed=100
+    )
+
+    assert sampling_service.sampling.finished == [prompt_ids(prompts[1]), prompt_ids(prompts[0])]
+    assert [sequence.text for sequence in sampled] == ["AB", "C"]
+    assert [sequence.sampled_tokens for sequence in sampled] == [2, 1]
+    assert {key: params.seed for key, _, params in sampling_service.sampling.sample_calls} == {
+        prompt_ids(prompts[0]): 100,
+        prompt_ids(prompts[1]): 101,
+    }
+    assert {params.temperature for _, _, params in sampling_service.sampling.sample_calls} == {0.7}
+    assert {params.max_tokens for _, _, params in sampling_service.sampling.sample_calls} == {8}
+    assert {num_samples for _, num_samples, _ in sampling_service.sampling.sample_calls} == {1}
+
+
+async def test_sample_leaves_the_seed_unset_when_none_is_given(sampling_service: FakeSamplingService) -> None:
+    prompts = [[{"role": "user", "content": "hi"}]]
+
+    await TinkerBackend.from_settings().sample(
+        "tinker://run/step2", prompts, base=BASE_MODELS["qwen3-8b"], max_tokens=4, temperature=0.5
+    )
+
+    assert [params.seed for _, _, params in sampling_service.sampling.sample_calls] == [None]
+
+
+async def test_sample_with_no_path_routes_to_a_base_model_client(sampling_service: FakeSamplingService) -> None:
+    prompts = [[{"role": "user", "content": "hi"}]]
+
+    await TinkerBackend.from_settings().sample(
+        None, prompts, base=BASE_MODELS["qwen3-8b"], max_tokens=4, temperature=0.5
+    )
+
+    assert sampling_service.sampling_paths == [None]
+    assert sampling_service.sampling_base_models == ["Qwen/Qwen3-8B"]
+
+
+async def test_sample_with_a_path_routes_to_a_model_path_client(sampling_service: FakeSamplingService) -> None:
+    prompts = [[{"role": "user", "content": "hi"}]]
+
+    await TinkerBackend.from_settings().sample(
+        "tinker://run/step2", prompts, base=BASE_MODELS["qwen3-8b"], max_tokens=4, temperature=0.5
+    )
+
+    assert sampling_service.sampling_paths == ["tinker://run/step2"]
+    assert sampling_service.sampling_base_models == [None]
+
+
+async def test_sample_rejects_an_over_cap_projection_before_creating_a_service_client(sdk: ModuleType) -> None:
+    service_calls: list[str] = []
+
+    def create_service(api_key: str) -> FakeSamplingService:
+        service_calls.append(api_key)
+        return FakeSamplingService(api_key)
+
+    sdk.ServiceClient = create_service
+    prompts = [[{"role": "user", "content": "hi"}]]
+
+    with pytest.raises(SpendExceeded):
+        await TinkerBackend.from_settings().sample(
+            None, prompts, base=BASE_MODELS["qwen3-8b"], max_tokens=4, temperature=0.5, max_usd=0.0
+        )
+
+    assert service_calls == []
+
+
+async def test_sample_records_the_actual_short_output_cost_below_the_projection(
+    sampling_service: FakeSamplingService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, object] = {}
+
+    class RecordingGuard:
+        def __init__(self, *, max_usd: float) -> None:
+            seen["max_usd"] = max_usd
+
+        async def check(self, projected: float) -> None:
+            seen["checked"] = projected
+
+        async def record(self, reserved: float, actual: float) -> None:
+            seen["recorded"] = (reserved, actual)
+
+    monkeypatch.setattr(tinker, "SpendGuard", RecordingGuard)
+    prompts = [[{"role": "user", "content": "one"}], [{"role": "user", "content": "two"}]]
+    sampling_service.sampling.generated = {
+        prompt_ids(prompts[0]): [ord("A"), ord("B")],
+        prompt_ids(prompts[1]): [ord("C")],
+    }
+    backend = TinkerBackend.from_settings()
+
+    sampled = await backend.sample(None, prompts, base=BASE_MODELS["qwen3-8b"], max_tokens=10, temperature=0.7)
+
+    model = TinkerModelId("Qwen/Qwen3-8B")
+    projected = backend.cost(model=model, prefill=sum(len(prompt_ids(prompt)) for prompt in prompts), sample=20)
+    actual = sum(sequence.usd for sequence in sampled)
+    assert seen["max_usd"] == backend.settings.spend_cap_usd
+    assert seen["checked"] == pytest.approx(projected)
+    assert seen["recorded"] == pytest.approx((projected, actual))
+    assert actual < projected
+    assert sampled[0].usd == pytest.approx(backend.cost(model=model, prefill=len(prompt_ids(prompts[0])), sample=2))
+    assert sampled[1].usd == pytest.approx(backend.cost(model=model, prefill=len(prompt_ids(prompts[1])), sample=1))
+    assert [sequence.prompt_tokens for sequence in sampled] == [len(prompt_ids(prompt)) for prompt in prompts]
+
+
+async def test_sample_runs_for_a_hosted_only_base_with_a_tinker_id(sampling_service: FakeSamplingService) -> None:
+    prompts = [[{"role": "user", "content": "hi"}]]
+
+    sampled = await TinkerBackend.from_settings().sample(
+        None, prompts, base=BASE_MODELS["qwen3.5-4b"], max_tokens=4, temperature=0.5
+    )
+
+    assert sampling_service.sampling_base_models == ["Qwen/Qwen3.5-4B"]
+    assert len(sampled) == 1
 
 
 def test_tinker_model_returns_the_id_for_a_hosted_only_base() -> None:
