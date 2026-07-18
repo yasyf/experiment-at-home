@@ -43,6 +43,8 @@ def make_report(rows: tuple[JournalRow, ...], *, experiment: str = "toy") -> Mor
         units=len(rows),
         kept=len(kept),
         crashes=sum(row.verdict is Verdict.CRASH for row in rows),
+        infra_retries=0,
+        accounting_aborts=0,
         best=kept[-1],
         rows=rows,
     )
