@@ -6,6 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-18
+
+### Changed
+- Hosted Tinker operations no longer require a locally-servable base: `tinker_model` refuses only a base with no Tinker id, so `TinkerBackend.fit` and `TinkerBackend.score` run for every Tinker base (`qwen3.5-4b` and `qwen3.5-9b` included). `serves_locally` now gates exactly the code that consumes the mlx-lm counterpart — `sidecar.convert_peft_to_mlx` and `sidecar.fuse` refuse such a base before any conversion work, and `train`/`retrain`, whose contract ends in a local adapter, refuse it up front, before any billable fit spend, mirroring modal's pre-launch guard.
+
 ## [0.7.0] - 2026-07-17
 
 ### Added
@@ -29,8 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - Queue verification parses the exact bytes it hashed (one read, `ExperimentSpec.loads`), closing the approve-to-launch file-swap window; per-invocation driver budgets carry the remaining experiment budget rather than the full cap, and recorded actuals reaching the campaign cap latch refusal of all new work.
 - Exception-controlled text is confined to operator-only fields: durable latch records split into a harness-authored `reason` (type name) and an operator-only `detail`, and every prompt-feeding path (proposer context, retros, contract history) reads only harness-authored text.
-
-### Security
 - `metric_file` must now be a relative path confined to the work directory — no absolute paths, no `..` traversal — refused with `PolicyViolation` at policy load and `UnconfinedPath` at `ExperimentSpec` construction. An absolute `metric_file` previously produced an admitted spec whose pre-measure cleanup unlinked that external file: an arbitrary-file-deletion primitive.
 - Every budget number and operator ceiling must be finite and positive, enforced in `Budget` and `CampaignBudget` themselves (`InvalidBudget` / `PolicyViolation`). A `max_usd = inf` ceiling previously admitted `inf` proposal budgets (`inf <= inf`), disabling all spend limits.
 - The harness-supplied ledger `seq` must be a positive non-boolean int before it forms the experiment identity; `seq=True` previously collided with `seq=1` as `001-…` (shared journal/lock/branch identity), and zero/negative values were admitted.
@@ -158,7 +161,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI gate asserting the core imports on Python 3.14 free-threaded with the GIL still disabled.
 - The in-repo `athome` Claude Code plugin (marketplace + `cache`/`overnight` skills).
 
-[Unreleased]: https://github.com/yasyf/experiment-at-home/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/yasyf/experiment-at-home/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/yasyf/experiment-at-home/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/yasyf/experiment-at-home/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/yasyf/experiment-at-home/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/yasyf/experiment-at-home/compare/v0.5.0...v0.5.1
