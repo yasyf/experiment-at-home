@@ -471,7 +471,8 @@ async def execute_unit(
                     with anyio.CancelScope(shield=True):
                         if proposal_started and not proposal_completed:
                             cost = validate_driver_cost(unit, await driver.recover_cost())
-                        if proposal_completed or cost > 0:
+                        if proposal_completed or cost > 0 or driver.pending_run() is not None:
+                            # A recovered zero-cost envelope is still an event: terminal implies an artifact.
                             await record_infra_event(
                                 events,
                                 unit=unit,
@@ -515,7 +516,7 @@ async def execute_unit(
                     try:
                         if proposal_started and not proposal_completed:
                             cost = validate_driver_cost(unit, await driver.recover_cost())
-                        if proposal_completed or cost > 0:
+                        if proposal_completed or cost > 0 or driver.pending_run() is not None:
                             await record_infra_event(
                                 events,
                                 unit=unit,

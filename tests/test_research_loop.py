@@ -251,6 +251,30 @@ class RecoveryCostDriver:
 
 
 @dataclass(frozen=True, slots=True)
+class ZeroEnvelopeRecoveryDriver:
+    """Runs until wall cancellation, then recovers a zero-cost envelope that awaits settlement."""
+
+    settles: list[str] = field(default_factory=list)
+    label: str = "zero-envelope"
+
+    async def preflight(self) -> None:
+        return None
+
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable")
+
+    async def recover_cost(self) -> float:
+        return 0.0
+
+    def pending_run(self) -> str | None:
+        return None if self.settles else "run-zero"
+
+    def settle(self) -> None:
+        self.settles.append("run-zero")
+
+
+@dataclass(frozen=True, slots=True)
 class OuterCancellingDriver:
     """Cancels its caller during or immediately after a proposal and exposes recovery evidence."""
 
@@ -1435,6 +1459,22 @@ async def test_bp3_wall_budget_bounds_work_within_a_unit(tmp_path: Path) -> None
 
     assert journal_rows(repo) == []  # the cancelled unit was never journaled
     assert result.kept == 0
+
+
+async def test_recovered_zero_cost_envelope_still_records_an_event(tmp_path: Path) -> None:
+    # R3 fix 2: a recovered zero-cost envelope must terminalize with an accounting artifact —
+    # a 0.0-cost wall-cancel event — so "terminal implies an artifact" holds for the orphan scan.
+    repo = toy_repo(tmp_path)
+    driver = ZeroEnvelopeRecoveryDriver()
+
+    with anyio.fail_after(3.0):
+        result = await run(make_spec(budget=Budget(max_units=1, max_wall_s=0.2)), driver=driver, repo=repo)
+
+    assert result.kept == 0 and journal_rows(repo) == []
+    [event] = infra_events(repo)
+    assert (event["kind"], event["cost"], event["run"]) == ("wall_cancel", 0.0, "run-zero")
+    assert driver.settles == ["run-zero"]
+    assert not (repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json").exists()
 
 
 async def test_wr1_resume_reconciles_a_lost_branch_update_with_the_journal(tmp_path: Path) -> None:
