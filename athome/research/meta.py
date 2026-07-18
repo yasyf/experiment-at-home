@@ -48,7 +48,7 @@ from athome import launchd
 from athome.cache import atomic_write_text
 from athome.config import SectionSettings
 from athome.progress import RunSink, load_journal
-from athome.research import nightly, retro
+from athome.research import nightly, procs, retro
 from athome.research.common import Hasher
 from athome.research.contract import sanitize_history
 from athome.research.driver import ClaudeCodeDriver
@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from spawnllm import LlmBackend, TModel
 
     from athome.research.driver import Driver
+    from athome.research.procs import ExperimentProcs, ProcessRegistry
     from athome.research.propose import ProposalRound
 
 LEDGER_NAME = "ledger.jsonl"
@@ -348,6 +349,12 @@ def render_retro(record: RetroRecord) -> str:
             *(f"- evidence: {line}" for line in verdict.evidence),
             *(f"- next: {line}" for line in verdict.next_steps),
         ]
+    )
+
+
+def proposal_procs(registry: ProcessRegistry, spec: ExperimentSpec) -> ExperimentProcs:
+    return registry.experiment(
+        spec.name, seq=spec_seq(spec.name), spec_digest=sha256(spec_toml(spec).encode()).hexdigest()
     )
 
 
@@ -645,13 +652,18 @@ async def run_campaign(
     repo: Path,
     root: Path,
     backend: LlmBackend | str,
-    driver_factory: Callable[[ExperimentSpec], Driver] = ClaudeCodeDriver,
+    driver_factory: Callable[[ExperimentSpec], Driver] | None = None,
     tier: TModel = "large",
     mirror_cc_notes: bool = False,
 ) -> CampaignResult:
     """Run campaign rounds under the flock until a boundary halts them.
 
-    On entry, ``completed`` ledger rows missing a durable retro get catch-up
+    On entry, the proposal-process registry is scanned for orphans of a
+    harness-level kill: a startup with a live orphan still billing, a
+    freshly-dead one (its accounting-abort latch is written and the record
+    marked terminal), or a previously-latched orphan whose latch has not been
+    reconciled away refuses to run (:mod:`athome.research.procs`). Then
+    ``completed`` ledger rows missing a durable retro get catch-up
     retros before any proposal round. Each auto-mode round: kill-switch and
     cumulative-cap boundary check (recorded actuals at or over ``max_total_usd``
     latch refusal of all new work), one
@@ -676,7 +688,9 @@ async def run_campaign(
         repo: The git repository experiments run against.
         root: The campaign state root (ledger, retros, pending, queue, stop file).
         backend: A bound spawnllm backend, or a backend registry name.
-        driver_factory: Builds the per-experiment driver; defaults to ``ClaudeCodeDriver``.
+        driver_factory: Builds the per-experiment driver; ``None`` builds a
+            :class:`~athome.research.driver.ClaudeCodeDriver` bound to the
+            campaign's proposal-process registry.
         tier: The abstract spawnllm model tier for proposer and retro calls.
         mirror_cc_notes: Whether journals and retros mirror to the installed ``cc-notes``.
 
@@ -686,19 +700,25 @@ async def run_campaign(
     Raises:
         ConcurrentRun: Another live runner holds the campaign lock.
         PoisonedLedger: The ledger on disk is unreadable, malformed, or torn.
-        AccountingIntegrityError: The inner loop latched an accounting abort.
+        AccountingIntegrityError: The inner loop latched an accounting abort, or
+            the startup scan found an orphaned proposal process with
+            unreconciled spend.
         RetroError: A completed experiment's retrospective could not be generated.
     """
     from spawnllm.backends.registry import BACKENDS_BY_NAME
 
     await anyio.Path(root).mkdir(parents=True, exist_ok=True)
     async with experiment_lock(root / LOCK_NAME):
+        registry = procs.ProcessRegistry(root / procs.PROCS_NAME)
+        if orphans := [*await procs.scan(registry, repo=repo), *await procs.unreconciled(registry, repo=repo)]:
+            raise AccountingIntegrityError(procs.refusal(orphans))
         campaign = Campaign(
             policy=policy,
             repo=repo,
             root=root,
             backend=BACKENDS_BY_NAME[backend] if isinstance(backend, str) else backend,
-            driver_factory=driver_factory,
+            driver_factory=driver_factory
+            or (lambda spec: ClaudeCodeDriver(spec, procs=proposal_procs(registry, spec))),
             tier=tier,
             mirror_cc_notes=mirror_cc_notes,
             ledger=Ledger.open(root / LEDGER_NAME),

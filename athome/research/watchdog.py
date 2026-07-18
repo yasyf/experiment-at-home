@@ -15,9 +15,10 @@ from athome import launchd
 from athome.cache import atomic_write_text
 from athome.config import AthomeSettings, load
 from athome.progress import append_line
-from athome.research import nightly
+from athome.research import nightly, procs
 from athome.research.errors import ResearchError
 from athome.research.journal import CC_NOTES_BIN
+from athome.research.meta import LOCK_NAME
 from athome.research.spec import ExperimentSpec
 
 if TYPE_CHECKING:
@@ -62,6 +63,20 @@ class WatchResult:
 
     live: bool
     alarm: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CampaignWatchResult:
+    """The orphan-scan result for one campaign watchdog check.
+
+    Attributes:
+        live: Whether a live runner holds the campaign lock (the registry is left to it).
+        orphans: The orphans handled when no runner was live: live pids alarmed and left
+            non-terminal, dead pids latched and marked terminal.
+    """
+
+    live: bool
+    orphans: tuple[procs.Orphan, ...]
 
 
 def _probe_lock(lock_path: Path) -> tuple[bool, str | None]:
@@ -242,14 +257,14 @@ def _events_path(journal: Path) -> Path:
     return journal.with_name(f"{journal.stem}.events.jsonl")
 
 
-async def _alert(journal: Path, *, unit: str, detail: str) -> None:
-    await append_line(_events_path(journal), {"type": "quiet_alarm", "unit": unit, "detail": detail})
+async def _alert(journal: Path, *, unit: str, detail: str, kind: str = "quiet_alarm") -> None:
+    await append_line(_events_path(journal), {"type": kind, "unit": unit, "detail": detail})
     await anyio.run_process(
         [
             str(CC_NOTES_BIN),
             "note",
             "add",
-            f"athome quiet alarm [{unit}]",
+            f"athome {kind.replace('_', ' ')} [{unit}]",
             "--body",
             detail,
             "--label",
@@ -302,6 +317,54 @@ async def check(
                 ),
             )
         return WatchResult(live=holder_id is not None, alarm=alarm)
+
+
+async def check_campaign(root: Path, *, repo: Path) -> CampaignWatchResult:
+    """Scans the campaign's proposal-process registry for orphans of a harness kill.
+
+    A held campaign lock means a live runner owns the registry, so the check reports
+    live and touches nothing (the ``LOCK_SH`` probe discipline of :func:`probe_live`).
+    Otherwise the scan runs under a momentary ``LOCK_EX | LOCK_NB`` hold — the same
+    momentary shadow :func:`athome.research.loop.experiment_lock` already retries
+    past — so no runner can start registering mid-scan: every live orphan raises the
+    alert, and every dead one has its accounting-abort latch written and its record
+    marked terminal by :func:`athome.research.procs.scan`.
+
+    Args:
+        root: The campaign state root holding the registry and lock.
+        repo: The git repository the campaign's experiments ran against.
+
+    Returns:
+        Whether a runner is live, and the orphans handled when none was.
+    """
+    lock_path = root / LOCK_NAME
+    if probe_live(lock_path):
+        return CampaignWatchResult(live=True, orphans=())
+    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return CampaignWatchResult(live=True, orphans=())
+        try:
+            orphans = tuple(await procs.scan(procs.ProcessRegistry(root / procs.PROCS_NAME), repo=repo))
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+    for orphan in orphans:
+        await _alert(
+            await nightly.journal_path(repo, orphan.record.experiment),
+            unit=orphan.record.experiment,
+            kind="orphan_alarm",
+            detail=(
+                f"live orphaned proposal process {orphan.record.run} (pid {orphan.pid}) is billing with no harness"
+                if orphan.live
+                else f"orphaned proposal process {orphan.record.run} died with no accounting trace; "
+                f"abort latch written to {orphan.latch}"
+            ),
+        )
+    return CampaignWatchResult(live=False, orphans=orphans)
 
 
 async def install(spec_path: Path, *, interval: launchd.Interval = WATCH_INTERVAL) -> Path:

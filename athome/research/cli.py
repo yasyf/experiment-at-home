@@ -233,6 +233,37 @@ async def meta_report_command(root: Path | None, *, as_json: bool) -> None:
     emit(await meta.campaign_report(meta_root(root)), as_json=as_json)
 
 
+@meta_group.command("watch")
+@click.option(
+    "--repo",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="The git repository the campaign's experiments ran against (default: the working directory).",
+)
+@root_option
+@json_option
+@coro
+async def meta_watch_command(repo: Path | None, root: Path | None, *, as_json: bool) -> None:
+    """Scan the campaign registry for proposal processes orphaned by a harness kill."""
+    result = await watchdog.check_campaign(meta_root(root), repo=(repo or Path.cwd()).resolve())
+    emit(
+        {
+            "live": result.live,
+            "orphans": [
+                {
+                    "run": orphan.record.run,
+                    "experiment": orphan.record.experiment,
+                    "pid": orphan.pid,
+                    "alive": orphan.live,
+                    "latch": str(orphan.latch),
+                }
+                for orphan in result.orphans
+            ],
+        },
+        as_json=as_json,
+    )
+
+
 @meta_group.command("approve")
 @click.argument("seq", type=int)
 @root_option

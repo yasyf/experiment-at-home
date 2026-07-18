@@ -13,7 +13,7 @@ from uuid import uuid4
 
 import anyio
 
-from athome.detach import launch, running
+from athome.detach import launch, run_exitfile, run_log, run_pidfile, running
 from athome.research.errors import AccountingIntegrityError, PreflightFailure, ResearchError
 from athome.research.spec import ProposalTimeout
 
@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
     from athome.detach import DetachedRun
     from athome.research.gate import TreeChange
+    from athome.research.procs import ExperimentProcs
     from athome.research.spec import ExperimentSpec
 
 RUN_PREFIX = "athome-research"
@@ -254,7 +255,11 @@ class ClaudeCodeDriver:
     an incomplete log instead raises :class:`CostError` because spawned-run spend is
     unknown. The change description is derived harness-side from the trusted tree diff,
     never the agent's stdout. The ``claude`` CLI is shelled out to, never imported, so
-    this driver loads without the ``llm``/``research`` extras.
+    this driver loads without the ``llm``/``research`` extras. With ``procs`` bound
+    (campaign mode), every proposal is durably registered before it launches, bound to
+    its pid on spawn, and marked terminal once its spend enters the accounting stream,
+    so a harness-level kill leaves an orphan record the campaign's startup scan and the
+    A7 watchdog turn into an alarm or an abort latch (:mod:`athome.research.procs`).
 
     Example:
         >>> driver = ClaudeCodeDriver(spec)
@@ -266,6 +271,7 @@ class ClaudeCodeDriver:
     command: tuple[str, ...] = DEFAULT_CLAUDE_COMMAND
     poll: float = 5.0
     timeout_s: float | None = None
+    procs: ExperimentProcs | None = None
     _recovery: ProposalRecovery = field(default_factory=ProposalRecovery, init=False, repr=False, compare=False)
 
     async def preflight(self) -> None:
@@ -289,34 +295,49 @@ class ClaudeCodeDriver:
     async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         budget = () if budget_usd is None else ("--max-budget-usd", str(budget_usd))
         inner = f"cd {shlex.quote(str(workdir))} && exec {shlex.join([*self.command, *budget, contract])}"
+        name = f"{RUN_PREFIX}-{self.spec.name}-{uuid4().hex[:12]}"
         self._recovery.run = None
+        if self.procs is not None:
+            self.procs.register(name, log=run_log(name), pid_file=run_pidfile(name), exit_file=run_exitfile(name))
         try:
-            run = await launch(
-                ["/bin/sh", "-c", inner],
-                name=f"{RUN_PREFIX}-{self.spec.name}-{uuid4().hex[:12]}",
-                on_spawn=self._recovery.retain,
-            )
+            run = await launch(["/bin/sh", "-c", inner], name=name, on_spawn=self.track)
         except BaseException:
+            if self.procs is not None and self._recovery.run is None:
+                self.procs.finalize(name, outcome="unspawned")
             self._recovery.stop()
             raise
         try:
             await self.await_exit(run)
         except TimeoutError as exc:
             stop(run)
-            raise ProposalTimeout(str(exc), cost=await self.recovered_cost(run)) from exc
+            cost = await self.recovered_cost(run)
+            self.account(run)
+            raise ProposalTimeout(str(exc), cost=cost) from exc
         except BaseException:
             stop(run)
             raise
         cost = await self.captured_cost(run)
+        self.account(run)
         self._recovery.run = None
         return cost
+
+    def track(self, run: DetachedRun) -> None:
+        self._recovery.retain(run)
+        if self.procs is not None:
+            self.procs.bind(run.name, pid=run.pid, pgid=os.getpgid(run.pid))
+
+    def account(self, run: DetachedRun) -> None:
+        if self.procs is not None:
+            self.procs.finalize(run.name, outcome="accounted")
 
     async def recover_cost(self) -> float:
         match self._recovery.run:
             case None:
                 return 0.0
             case run:
-                return await self.recovered_cost(run)
+                cost = await self.recovered_cost(run)
+                self.account(run)
+                return cost
 
     async def await_exit(self, run: DetachedRun) -> None:
         fallback = self.spec.budget.hard_kill_s or DEFAULT_PROPOSAL_TIMEOUT_S
