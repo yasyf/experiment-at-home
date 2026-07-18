@@ -210,8 +210,9 @@ def assert_accounting_abort_recorded(repo: Path) -> None:
     athome = repo / ".git" / "athome"
     latch = athome / f"{EXPERIMENT_NAME}.abort.json"
     record = json.loads(latch.read_text())
-    assert set(record) == {"unit", "reason", "ts"}
+    assert set(record) == {"unit", "reason", "detail", "ts"}  # enriched: harness reason + operator detail
     assert record["unit"] == 0 and isinstance(record["reason"], str) and record["reason"]
+    assert isinstance(record["detail"], str) and record["detail"]
     assert list(athome.glob(f"{EXPERIMENT_NAME}.abort.json.tmp-*")) == []
     events = athome / f"{EXPERIMENT_NAME}.events.jsonl"
     assert [(event["kind"], "cost" in event) for event in infra_events(events)] == [("accounting_abort", False)]

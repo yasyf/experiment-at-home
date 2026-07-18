@@ -287,6 +287,7 @@ async def test_abort_latch_is_durable_before_any_renderer_runs(
     await record_accounting_abort(latch, events, unit=2, reason=ProbingAbort("boom"))
 
     assert observed and all(observed)  # every render found the latch already on disk
-    assert json.loads(latch.read_text())["reason"] == "ProbingAbort('boom')"
+    enriched = json.loads(latch.read_text())
+    assert enriched["reason"] == "ProbingAbort" and enriched["detail"] == "ProbingAbort('boom')"
     records = [json.loads(line) for line in events.read_text().splitlines()]
     assert [(record["kind"], record["reason"]) for record in records] == [("accounting_abort", "ProbingAbort")]

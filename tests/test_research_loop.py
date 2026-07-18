@@ -1039,7 +1039,12 @@ async def test_abort_epilogue_survives_a_broken_exception_renderer(
 
     assert excinfo.value is error  # the original abort propagates, never a formatting error
     latch = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
-    assert json.loads(latch.read_text()) | {"ts": None} == {"unit": 0, "reason": described, "ts": None}
+    assert json.loads(latch.read_text()) | {"ts": None} == {
+        "unit": 0,
+        "reason": type(error).__name__,  # harness-authored, never exception-controlled
+        "detail": described,  # enriched, operator-only
+        "ts": None,
+    }
     assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
 
 
@@ -1070,7 +1075,12 @@ async def test_abort_latch_exists_before_the_hostile_renderer_runs(
 
     assert excinfo.value is error
     assert observed and all(observed)  # every render found the latch already durable
-    assert json.loads(latch.read_text()) | {"ts": None} == {"unit": 0, "reason": "ProbingAbort('boom')", "ts": None}
+    assert json.loads(latch.read_text()) | {"ts": None} == {
+        "unit": 0,
+        "reason": "ProbingAbort",
+        "detail": "ProbingAbort('boom')",
+        "ts": None,
+    }
     assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
 
 
@@ -1114,7 +1124,8 @@ async def test_cleanup_epilogue_survives_a_recovery_error_with_a_broken_str(tmp_
     assert excinfo.value is driver.error
     latch = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
     record = json.loads(latch.read_text())
-    assert record["unit"] == 0 and record["reason"] == "BrokenStrRecovery('recovery blew up')"
+    assert record["unit"] == 0 and record["reason"] == "BrokenStrRecovery"
+    assert record["detail"] == "BrokenStrRecovery('recovery blew up')"
     assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
 
 
@@ -1291,7 +1302,8 @@ async def test_outer_cancellation_mid_proposal_latches_unknown_spend(tmp_path: P
             )
 
     latch = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
-    assert json.loads(latch.read_text())["reason"] == "partial billing envelope"
+    record = json.loads(latch.read_text())
+    assert record["reason"] == "AccountingIntegrityError" and record["detail"] == "partial billing envelope"
     assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
 
 
@@ -1313,7 +1325,8 @@ async def test_outer_cancellation_mid_proposal_latches_unexpected_recovery_failu
 
     assert propagated.value is driver.proposal_errors[0]
     latch = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
-    assert json.loads(latch.read_text())["reason"] == str(recovery_error)
+    record = json.loads(latch.read_text())
+    assert record["reason"] == type(recovery_error).__name__ and record["detail"] == str(recovery_error)
     assert journal_rows(repo) == []
     assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
 
@@ -1331,7 +1344,8 @@ async def test_outer_cancellation_mid_proposal_latches_recovery_cancellation(tmp
     assert propagated.value is driver.proposal_errors[0]
     assert propagated.value is not recovery_error
     latch = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
-    assert json.loads(latch.read_text())["reason"] == str(recovery_error)
+    record = json.loads(latch.read_text())
+    assert record["reason"] == type(recovery_error).__name__ and record["detail"] == str(recovery_error)
     assert journal_rows(repo) == []
     assert [(event["kind"], "cost" in event) for event in infra_events(repo)] == [("accounting_abort", False)]
 

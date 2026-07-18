@@ -129,8 +129,11 @@ class LedgerRow:
             terminal rows, ``0`` otherwise.
         wall_s: Reserved worst case on ``reserved`` rows, measured wall clock on
             terminal rows, ``0`` otherwise.
-        reason: The harness-authored reason on refusals, failures, and stops.
-        extra: Audit payload (experiment name, template, digests, result stats).
+        reason: The harness-authored reason on refusals, failures, and stops — the
+            exception type name for a caught failure. This field feeds the next
+            round's proposer context and never carries exception-controlled text.
+        extra: Audit payload (experiment name, template, digests, result stats, and
+            the operator-only ``detail`` describing a caught failure).
     """
 
     seq: int
@@ -597,15 +600,32 @@ class Campaign:
             )
         except PreflightFailure as exc:
             await self.release(
-                spec, seq=seq, event=CampaignEvent.PREFLIGHT_FAILED, reason=safe_describe(exc), started=started
+                spec,
+                seq=seq,
+                event=CampaignEvent.PREFLIGHT_FAILED,
+                reason=type(exc).__name__,
+                started=started,
+                extra={"detail": safe_describe(exc)},
             )
             return
         except BudgetExhausted as exc:
-            await self.release(spec, seq=seq, event=CampaignEvent.ABORTED, reason=safe_describe(exc), started=started)
+            await self.release(
+                spec,
+                seq=seq,
+                event=CampaignEvent.ABORTED,
+                reason=type(exc).__name__,
+                started=started,
+                extra={"detail": safe_describe(exc)},
+            )
             return
         except InfraFailure as exc:
             await self.release(
-                spec, seq=seq, event=CampaignEvent.INFRA_ABORTED, reason=safe_describe(exc), started=started
+                spec,
+                seq=seq,
+                event=CampaignEvent.INFRA_ABORTED,
+                reason=type(exc).__name__,
+                started=started,
+                extra={"detail": safe_describe(exc)},
             )
             return
         await self.release(

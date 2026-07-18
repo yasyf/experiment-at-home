@@ -29,8 +29,11 @@ discard, or contract-memory feedback — so the worst it achieves is burning its
 budget before the run aborts. Worthless.
 
 Before an accounting-integrity abort escapes a unit, the harness atomically writes a
-per-run ``<name>.abort.json`` latch with its unit, reason, and timestamp, then best-effort
-appends an ``accounting_abort`` sidecar breadcrumb for M3 reporting. A later run refuses
+per-run ``<name>.abort.json`` latch with its unit, a harness-authored ``reason`` (the
+exception type name), and a timestamp, then best-effort appends an ``accounting_abort``
+sidecar breadcrumb for M3 reporting. Enrichment then rewrites the latch with an added
+operator-only ``detail`` (the described exception); ``reason`` stays harness-authored
+because prompt-feeding consumers must never read exception-controlled text. A later run refuses
 to start while the latch remains: check the provider ledger, reconcile the spend, then
 delete the latch file. The sidecar is reporting evidence, not the restart authority. If
 the latch write itself fails I/O, enrichment is skipped — the renderer never runs
@@ -181,8 +184,11 @@ def append_abort_breadcrumb(events: Path, *, unit: int, reason: str) -> None:
 
 
 async def enrich_accounting_abort(latch: Path, *, unit: int, exc: BaseException) -> None:
+    # reason stays harness-authored (the type name); detail is enriched, operator-only text.
     try:
-        payload = json.dumps({"unit": unit, "reason": safe_describe(exc), "ts": time.time()})
+        payload = json.dumps(
+            {"unit": unit, "reason": type(exc).__name__, "detail": safe_describe(exc), "ts": time.time()}
+        )
     except BaseException:  # the safe latch is already durable; enrichment is best-effort
         return
     with anyio.CancelScope(shield=True):
