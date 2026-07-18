@@ -26,10 +26,12 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from subprocess import CalledProcessError
+from typing import TYPE_CHECKING, Literal
 
 import anyio
 from loguru import logger
@@ -40,6 +42,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
 PROCS_NAME = "procs.jsonl"
+
+type Resolution = Literal["live", "dead", "unknown"]
+type ProcessTable = dict[int, ProcessEntry]
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +97,20 @@ class Orphan:
     latch: Path
 
 
+@dataclass(frozen=True, slots=True)
+class ProcessEntry:
+    """One row of the live process table: a pid's process group and full command line.
+
+    Attributes:
+        pgid: The process-group id ``ps`` reported for the pid.
+        command: The full command line, which carries the run's UUID name for every
+            detached proposal (its exit-file path embeds the name).
+    """
+
+    pgid: int
+    command: str
+
+
 def pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -100,6 +119,29 @@ def pid_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def process_table() -> ProcessTable | None:
+    try:
+        listing = subprocess.run(
+            ["ps", "-axo", "pid=,pgid=,command="], check=True, capture_output=True, text=True
+        ).stdout
+    except (OSError, CalledProcessError):
+        return None
+    table: ProcessTable = {}
+    for line in listing.splitlines():
+        match line.split(None, 2):
+            case [pid, pgid, command] if pid.isdigit() and pgid.isdigit():
+                table[int(pid)] = ProcessEntry(pgid=int(pgid), command=command)
+    return table
+
+
+def identity_matches(record: ProposalProcess, entry: ProcessEntry | None) -> bool:
+    match entry:
+        case ProcessEntry(pgid=pgid, command=command):
+            return record.run in command and (record.pgid is None or record.pgid == pgid)
+        case None:
+            return False
 
 
 def resolve_pid(record: ProposalProcess) -> int | None:
@@ -246,31 +288,46 @@ class ExperimentProcs:
         self.registry.finalize(run, outcome=outcome)
 
 
-async def scan(registry: ProcessRegistry, *, repo: Path, alive: Callable[[int], bool] | None = None) -> list[Orphan]:
+async def scan(
+    registry: ProcessRegistry,
+    *,
+    repo: Path,
+    alive: Callable[[int], bool] | None = None,
+    table: Callable[[], ProcessTable | None] | None = None,
+) -> list[Orphan]:
     """Sweeps non-terminal registry records into live-orphan alarms or abort latches.
 
     Only call while no campaign runner can be registering: under the campaign lock on
-    start/resume, or from the watchdog after its momentary exclusive probe. A live
-    pid is returned as a live orphan and left non-terminal so every later scan keeps
-    refusing and alarming until it is reconciled; a dead (or never-bound) pid gets
-    the experiment's accounting-abort latch written and its record marked terminal.
+    start/resume, or from the watchdog after its momentary exclusive probe. Liveness
+    requires identity, not just an alive pid: the process table must show the run's
+    UUID name on the pid's command line and the recorded pgid where one was bound,
+    else the pid was reused by an unrelated process and the record is dead. A live
+    orphan is left non-terminal so every later scan keeps refusing and alarming until
+    it is reconciled; a dead (or never-bound) pid gets the experiment's
+    accounting-abort latch written and its record marked terminal.
 
     Args:
         registry: The campaign's proposal-process registry.
         repo: The git repository experiments ran against (locates each latch).
         alive: Injectable pid-liveness probe; defaults to ``kill -0``.
+        table: Injectable process-table snapshot; defaults to ``ps -axo``. ``None``
+            from the snapshot means the table is unavailable and identity cannot be
+            checked, so an alive pid is conservatively treated as live.
 
     Returns:
         Every orphan found, live ones first as recorded.
     """
     alive = alive or pid_alive
+    table = table or process_table
+    pending = [record for record in registry.records() if record.outcome is None]
+    if not pending:
+        return []
+    snapshot = table()
     orphans = []
-    for record in registry.records():
-        if record.outcome is not None:
-            continue
+    for record in pending:
         pid = resolve_pid(record)
         latch = await abort_latch(repo, record.experiment)
-        if pid is not None and alive(pid):
+        if pid is not None and alive(pid) and (snapshot is None or identity_matches(record, snapshot.get(pid))):
             orphans.append(Orphan(record, pid=pid, live=True, latch=latch))
             continue
         await atomic_write_text(

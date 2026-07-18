@@ -14,7 +14,7 @@ from athome.research.errors import AccountingIntegrityError, PreflightFailure
 from athome.research.journal import Journal
 from athome.research.loop import experiment_lock
 from athome.research.loop import run as run_loop
-from athome.research.procs import PROCS_NAME, ExperimentProcs, ProcessRegistry
+from athome.research.procs import PROCS_NAME, ExperimentProcs, ProcessEntry, ProcessRegistry
 from athome.research.spec import Budget, ProposalTimeout
 from tests.test_research_driver import (
     FAKE_CLAUDE_COST,
@@ -30,6 +30,7 @@ from tests.test_research_meta import toy_repo as campaign_repo
 from tests.test_research_propose import scripted_backend
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from athome.research.spec import ExperimentSpec
@@ -43,6 +44,13 @@ def make_registry(root: Path) -> ProcessRegistry:
 
 def run_pid_file(registry: ProcessRegistry, run: str) -> Path:
     return registry.path.parent / f"{run}.pid"
+
+
+def table_with(*entries: tuple[int, str], pgid: int | None = None) -> Callable[[], dict[int, ProcessEntry]]:
+    return lambda: {
+        pid: ProcessEntry(pgid=pgid if pgid is not None else pid, command=f"/bin/sh -c claude; echo $? > {run}.exit")
+        for pid, run in entries
+    }
 
 
 def registered(registry: ProcessRegistry, *, run: str = "run-a", pid: int | None = 4242) -> str:
@@ -95,11 +103,11 @@ async def test_scan_alarms_a_live_orphan_and_leaves_it_non_terminal(tmp_path: Pa
     registry = make_registry(tmp_path / "meta")
     registered(registry)
 
-    [orphan] = await procs.scan(registry, repo=repo, alive=lambda pid: pid == 4242)
+    [orphan] = await procs.scan(registry, repo=repo, alive=lambda pid: pid == 4242, table=table_with((4242, "run-a")))
 
     assert orphan.live and orphan.pid == 4242
     assert not orphan.latch.exists()
-    [again] = await procs.scan(registry, repo=repo, alive=lambda pid: pid == 4242)
+    [again] = await procs.scan(registry, repo=repo, alive=lambda pid: pid == 4242, table=table_with((4242, "run-a")))
     assert again.live  # still non-terminal: every later scan keeps refusing until reconciled
 
 
@@ -108,7 +116,7 @@ async def test_scan_latches_a_dead_orphan_and_marks_it_terminal(tmp_path: Path) 
     registry = make_registry(tmp_path / "meta")
     run = registered(registry)
 
-    [orphan] = await procs.scan(registry, repo=repo, alive=lambda pid: False)
+    [orphan] = await procs.scan(registry, repo=repo, alive=lambda pid: False, table=table_with())
 
     assert not orphan.live and orphan.pid == 4242
     latch = json.loads(orphan.latch.read_text())
@@ -116,7 +124,7 @@ async def test_scan_latches_a_dead_orphan_and_marks_it_terminal(tmp_path: Path) 
     [record] = registry.records()
     assert record.outcome == "orphaned"
 
-    assert await procs.scan(registry, repo=repo, alive=lambda pid: False) == []
+    assert await procs.scan(registry, repo=repo, alive=lambda pid: False, table=table_with()) == []
     [stale] = await procs.unreconciled(registry, repo=repo)
     assert stale.latch == orphan.latch
     orphan.latch.unlink()
@@ -129,7 +137,7 @@ async def test_scan_resolves_the_pid_from_the_pid_file_when_the_bind_never_lande
     run = registered(registry, pid=None)
     run_pid_file(registry, run).write_text("4242")
 
-    [orphan] = await procs.scan(registry, repo=repo, alive=lambda pid: pid == 4242)
+    [orphan] = await procs.scan(registry, repo=repo, alive=lambda pid: pid == 4242, table=table_with((4242, run)))
 
     assert orphan.live and orphan.pid == 4242
 
@@ -139,9 +147,49 @@ async def test_scan_latches_a_never_bound_record_with_no_pid_file(tmp_path: Path
     registry = make_registry(tmp_path / "meta")
     registered(registry, pid=None)
 
-    [orphan] = await procs.scan(registry, repo=repo, alive=lambda pid: pytest.fail("no pid to probe"))
+    [orphan] = await procs.scan(registry, repo=repo, alive=lambda pid: pytest.fail("no pid to probe"), table=table_with())
 
     assert not orphan.live and orphan.pid is None and orphan.latch.exists()
+
+
+async def test_scan_latches_an_alive_pid_reused_by_an_unrelated_process(tmp_path: Path) -> None:
+    repo = campaign_repo(tmp_path / "repo")
+    registry = make_registry(tmp_path / "meta")
+    run = registered(registry)
+
+    [orphan] = await procs.scan(
+        registry, repo=repo, alive=lambda pid: True, table=table_with((4242, "some-unrelated-daemon"))
+    )
+
+    assert not orphan.live and orphan.pid == 4242  # alive but not our process: PID reuse, never a LIVE block
+    assert json.loads(orphan.latch.read_text())["run"] == run
+    [record] = registry.records()
+    assert record.outcome == "orphaned"
+
+
+async def test_scan_latches_a_pgid_mismatch_as_pid_reuse(tmp_path: Path) -> None:
+    repo = campaign_repo(tmp_path / "repo")
+    registry = make_registry(tmp_path / "meta")
+    registered(registry)
+
+    [orphan] = await procs.scan(
+        registry, repo=repo, alive=lambda pid: True, table=table_with((4242, "run-a"), pgid=999)
+    )
+
+    assert not orphan.live and orphan.latch.exists()
+    [record] = registry.records()
+    assert record.outcome == "orphaned"
+
+
+async def test_scan_treats_an_alive_pid_as_live_when_the_table_is_unavailable(tmp_path: Path) -> None:
+    repo = campaign_repo(tmp_path / "repo")
+    registry = make_registry(tmp_path / "meta")
+    registered(registry)
+
+    [orphan] = await procs.scan(registry, repo=repo, alive=lambda pid: True, table=lambda: None)
+
+    assert orphan.live  # identity unverifiable: refuse conservatively, never latch a possibly-live biller
+    assert not orphan.latch.exists()
 
 
 async def test_run_campaign_refuses_startup_until_the_orphan_latch_is_reconciled(
@@ -151,6 +199,7 @@ async def test_run_campaign_refuses_startup_until_the_orphan_latch_is_reconciled
     root = tmp_path / "meta"
     registered(make_registry(root))
     monkeypatch.setattr(procs, "pid_alive", lambda pid: False)
+    monkeypatch.setattr(procs, "process_table", table_with())
     backend = scripted_backend([])
 
     with pytest.raises(AccountingIntegrityError, match="unreconciled spend"):
@@ -181,6 +230,7 @@ async def test_run_campaign_refuses_startup_while_a_live_orphan_bills(
     root = tmp_path / "meta"
     registered(make_registry(root))
     monkeypatch.setattr(procs, "pid_alive", lambda pid: True)
+    monkeypatch.setattr(procs, "process_table", table_with((4242, "run-a")))
 
     for _ in range(2):  # non-terminal while live: every startup keeps refusing
         with pytest.raises(AccountingIntegrityError, match="LIVE pid 4242"):
@@ -401,6 +451,7 @@ async def test_check_campaign_alerts_and_latches_orphans(tmp_path: Path, monkeyp
     registered(registry, run="run-live", pid=4242)
     registered(registry, run="run-dead", pid=9999)
     monkeypatch.setattr(procs, "pid_alive", lambda pid: pid == 4242)
+    monkeypatch.setattr(procs, "process_table", table_with((4242, "run-live")))
     alerts: list[tuple[str, str, str]] = []
 
     async def fake_alert(_journal: Path, *, unit: str, detail: str, kind: str = "quiet_alarm") -> None:
