@@ -6,13 +6,14 @@ import sys
 import threading
 import traceback
 from collections import deque
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
 import anyio
 from anyio import Lock
 from anyio.streams.buffered import BufferedByteReceiveStream
+from loguru import logger
 
 from athome.config import base_environ
 from athome.errors import AthomeError
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
 STDERR_CHUNK = 4096
 STDERR_TAIL_CHUNKS = 16
 ACLOSE_TIMEOUT = 5.0
+REAP_WAIT_TIMEOUT = 5.0
 STDERR_JOIN_TIMEOUT = 2.0
 
 
@@ -143,11 +145,21 @@ class PipeWorker:
         return process
 
     async def reap(self, process: Process) -> None:
-        # Cleanup guards its own killpg: the group may already be reaped or unkillable
-        # (EPERM), and a raise here would mask the original wire error being propagated.
-        with suppress(OSError):
+        # Cleanup guards its own killpg (already-reaped group, EPERM) and bounds the wait
+        # when the kill failed, so neither can mask the original wire error.
+        try:
             os.killpg(process.pid, signal.SIGKILL)
-        await process.wait()
+        except OSError:
+            with anyio.move_on_after(REAP_WAIT_TIMEOUT) as scope:
+                await process.wait()
+            if scope.cancelled_caught:
+                logger.warning(
+                    "leaking worker process {}: kill failed and it did not exit within {}s",
+                    process.pid,
+                    REAP_WAIT_TIMEOUT,
+                )
+        else:
+            await process.wait()
         if (thread := self.stderr_thread) is not None:
             self.stderr_thread = None
             await anyio.to_thread.run_sync(thread.join, STDERR_JOIN_TIMEOUT)

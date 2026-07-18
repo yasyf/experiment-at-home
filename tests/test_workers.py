@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import anyio
 import pytest
 
+from athome import workers
 from athome.wire import LENGTH_PREFIX, WIRE_VERSION, WireError, decode, encode, read_frame, validate
 from athome.workers import (
     MAX_FRAME_BYTES,
@@ -57,6 +58,17 @@ def write(obj):
 write({"wire": 1, "fingerprint": {}})
 sys.stdin.buffer.read(int.from_bytes(sys.stdin.buffer.read(4), "big"))
 write({1, 2, 3})
+"""
+
+STUBBORN_NON_WIRE_SOURCE = """
+import sys, pickle, time
+def write(obj):
+    body = pickle.dumps(obj, protocol=5)
+    sys.stdout.buffer.write(len(body).to_bytes(4, "big") + body); sys.stdout.buffer.flush()
+write({"wire": 1, "fingerprint": {}})
+sys.stdin.buffer.read(int.from_bytes(sys.stdin.buffer.read(4), "big"))
+write({1, 2, 3})
+time.sleep(120)
 """
 
 CRASH_SOURCE = """
@@ -242,6 +254,30 @@ async def test_cleanup_killpg_failure_never_masks_the_wire_error(monkeypatch: py
     async with running(NON_WIRE_SOURCE) as worker:
         with pytest.raises(WireError):  # the poisoning path's own killpg failure stays suppressed
             await worker.call("echo", "x")
+
+
+async def test_unkillable_worker_bounds_the_reap_wait_and_the_wire_error_still_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_killpg = os.killpg
+    denied: list[int] = []
+
+    def deny_killpg(pgid: int, sig: int) -> None:
+        denied.append(pgid)
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "killpg", deny_killpg)
+    monkeypatch.setattr(workers, "REAP_WAIT_TIMEOUT", 0.2)
+    monkeypatch.setattr(workers, "STDERR_JOIN_TIMEOUT", 0.1)
+    worker = PipeWorker(WorkerSpec((sys.executable, "-c", STUBBORN_NON_WIRE_SOURCE)))
+    try:
+        with anyio.fail_after(5.0):  # the bounded wait, not a hang, must deliver the error
+            with pytest.raises(WireError):
+                await worker.call("echo", "x")
+    finally:
+        for pgid in denied:  # the deliberately-leaked worker must not outlive the test
+            with suppress(OSError):
+                real_killpg(pgid, signal.SIGKILL)
 
 
 async def test_worker_crash_raises_worker_crashed_with_returncode_and_stderr() -> None:
