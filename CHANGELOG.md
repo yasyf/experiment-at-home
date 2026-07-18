@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-17
+
 ### Added
 - **`athome.research.meta`** — the campaign outer loop (A6b): `run_campaign` proposes, admits, and runs one experiment per round under a campaign-wide flock, with reservation-based cumulative caps — each launch reserves the admitted spec's declared worst case (`max_usd`/`max_wall_s`) against the `CampaignBudget` and is refused, never stretched, when the reservation would breach it; the reservation is released to journal-summed actuals when the experiment ends. An append-only `Ledger` (the Journal idiom: torn-final-line refusal, crash-resume recomputes totals, the consecutive-failure streak, and the next seq from disk; an unreleased reservation stays counted at its worst case, so a crash can only over-reserve) records one JSONL row per campaign event (`proposed`/`rejected`/`pending`/`approved`/`reserved`/`started`/`preflight_failed`/`aborted`/`infra_aborted`/`completed`/`stopped`). The per-experiment loop wires A2 preflight before any paid work and the A3 taxonomy unchanged: an `InfraFailure` ledgers `infra_aborted` without consuming a candidate-experiment slot, and rejected/preflight-failed/infra-aborted rounds count toward the `max_consecutive_failures` stop. Each completed experiment generates its A5 retro (durable in `retros.jsonl` before it feeds the next round's proposer context); a retro-generation error aborts loudly after the accounting row is durable. Gated mode writes admitted specs to `pending/` and never runs them — `meta approve` SHA-256-verifies the file into the queue (drained through the identical codepath), `meta reject` records why. `meta stop` arms an atomic stop file the runner checks at the experiment boundary: the current experiment finishes, nothing new launches. CLI: `athome research meta run|stop|report|install|approve|reject`, with `MetaSettings` (`[research.meta]`: root, backend, tier).
 - **`athome.research.retro`** — post-experiment retrospective generation and durable, cc-notes-mirrored records.
@@ -16,9 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `qwen` model family in the judge's alias table (`qwen`/`qwq`/`qvq`/`alibaba` tokens), so `family_of` resolves qwen model strings and `ensure_cross_family` can pass a qwen generator against an anthropic judge instead of failing closed with `UnknownFamilyError`.
 - `athome research run --mirror-cc-notes` mirrors each research journal row to the installed `cc-notes` service; `athome research nightly install --mirror-cc-notes` persists the same opt-in behavior in the launchd agent.
 - Tinker pricing for `Qwen/Qwen3.5-9B`: $0.44/Mtok prefill and $1.33/Mtok for sampled and training tokens.
+- **`athome.research.procs`** — a durable proposal-process registry with a startup orphan scan: every detached proposal is registered before launch and terminalized only after its spend is durably journaled; campaign start/resume (and `athome research meta watch`) resolves non-terminal records as live (alarm + startup refusal), dead (abort latch), or unknown (persistent refusal) — liveness requires the recorded process identity to match, never a bare PID. Closes the harness-kill invisible-billing gap.
 
 ### Fixed
 - Training baseline comparability now fingerprints the evaluation task and identifying arm configuration as well as its ranking metrics, so changing the bake-off cannot reuse an unrelated frozen baseline. The baseline database is also opened and read during preflight, before a paid backend starts, and concurrent baseline writes are atomic while preserving exact-value conflicts.
+- The total accounting epilogue now guards its own error reporting (A3.12): the abort latch lands with a user-code-free reason before any stringification, `safe_describe` is total over `BaseException`, a failed initial latch write skips enrichment instead of invoking the renderer unlatched, and traceback-free logging keeps a hostile `repr` out of loguru diagnostics.
+- Campaign exactly-once hardening: terminal registry marks strictly follow the durable accounting write; a settle failure retries idempotently or latches, never double-recording spend; a recovered zero-cost envelope still writes its accounting event; the orphan scan cross-checks journal and sidecar evidence independently (run identity now threads both), so a torn sidecar cannot discard the journal's proof; crash descriptions are harness-authored type names, so candidate exception text never reaches contract history.
+- `workers.reap` no longer lets a failed `killpg` mask the original wire error, and bounds its post-kill wait instead of blocking forever on an unkillable worker.
+
+### Security
+- Queue verification parses the exact bytes it hashed (one read, `ExperimentSpec.loads`), closing the approve-to-launch file-swap window; per-invocation driver budgets carry the remaining experiment budget rather than the full cap, and recorded actuals reaching the campaign cap latch refusal of all new work.
+- Exception-controlled text is confined to operator-only fields: durable latch records split into a harness-authored `reason` (type name) and an operator-only `detail`, and every prompt-feeding path (proposer context, retros, contract history) reads only harness-authored text.
 
 ### Security
 - `metric_file` must now be a relative path confined to the work directory — no absolute paths, no `..` traversal — refused with `PolicyViolation` at policy load and `UnconfinedPath` at `ExperimentSpec` construction. An absolute `metric_file` previously produced an admitted spec whose pre-measure cleanup unlinked that external file: an arbitrary-file-deletion primitive.
@@ -148,7 +158,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI gate asserting the core imports on Python 3.14 free-threaded with the GIL still disabled.
 - The in-repo `athome` Claude Code plugin (marketplace + `cache`/`overnight` skills).
 
-[Unreleased]: https://github.com/yasyf/experiment-at-home/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/yasyf/experiment-at-home/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/yasyf/experiment-at-home/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/yasyf/experiment-at-home/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/yasyf/experiment-at-home/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/yasyf/experiment-at-home/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/yasyf/experiment-at-home/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/yasyf/experiment-at-home/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/yasyf/experiment-at-home/compare/v0.3.0...v0.3.1
