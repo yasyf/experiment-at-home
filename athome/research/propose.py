@@ -19,7 +19,7 @@ from athome.detach import NAME_RE
 from athome.research.errors import ResearchError
 from athome.research.judge import with_backoff
 from athome.research.policy import ExperimentTemplate, ProposalPolicy
-from athome.research.spec import Budget, ExperimentSpec
+from athome.research.spec import Budget, ExperimentSpec, positive_int
 
 if TYPE_CHECKING:
     from spawnllm import LlmBackend, TModel
@@ -132,6 +132,8 @@ def validate_proposal(proposal: Proposal, policy: ProposalPolicy, *, seq: int) -
     Raises:
         ProposalViolation: any policy violation, with the specific refusal reason.
     """
+    if not positive_int(seq):
+        raise ProposalViolation(f"seq must be a positive int, not {seq!r}: it forms the experiment identity")
     templates = {template.name: template for template in policy.templates}
     if (template := templates.get(proposal.template)) is None:
         raise ProposalViolation(f"unknown template {proposal.template!r}; the policy offers {sorted(templates)}")

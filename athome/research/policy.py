@@ -12,8 +12,16 @@ import tomllib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
+from athome.detach import NAME_RE
 from athome.research.errors import ResearchError
-from athome.research.spec import Budget, reject_unknown_fields, unbounded_glob
+from athome.research.spec import (
+    Budget,
+    escapes_workdir,
+    finite_number,
+    positive_int,
+    reject_unknown_fields,
+    unbounded_glob,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -45,6 +53,17 @@ class CampaignBudget:
     max_wall_s: float
     max_consecutive_failures: int
 
+    def __post_init__(self) -> None:
+        for label, value in (
+            ("max_experiments", self.max_experiments),
+            ("max_consecutive_failures", self.max_consecutive_failures),
+        ):
+            if not positive_int(value):
+                raise PolicyViolation(f"campaign {label} must be a positive int, not {value!r}")
+        for label, value in (("max_total_usd", self.max_total_usd), ("max_wall_s", self.max_wall_s)):
+            if not (finite_number(value) and value > 0):
+                raise PolicyViolation(f"campaign {label} must be a finite positive number, not {value!r}")
+
 
 @dataclass(frozen=True, slots=True)
 class ExperimentTemplate:
@@ -74,12 +93,19 @@ class ExperimentTemplate:
     metric_file: str = ".athome-metric.json"
 
     def __post_init__(self) -> None:
+        if not NAME_RE.fullmatch(self.name):
+            raise PolicyViolation(f"template name {self.name!r} must fully match {NAME_RE.pattern}")
         if self.direction not in ("min", "max"):
             raise PolicyViolation(f"template {self.name!r} direction must be 'min' or 'max', not {self.direction!r}")
         if bad := [pattern for pattern in self.mutable_allowlist if unbounded_glob(pattern)]:
             raise PolicyViolation(f"template {self.name!r} allowlists unbounded globs: {bad}")
         if not self.mutable_allowlist:
             raise PolicyViolation(f"template {self.name!r} has an empty mutable_allowlist; it can admit no proposal")
+        if escapes_workdir(self.metric_file):
+            raise PolicyViolation(
+                f"template {self.name!r} metric_file {self.metric_file!r} must be a relative path "
+                "inside the work directory"
+            )
 
 
 @dataclass(frozen=True, slots=True)

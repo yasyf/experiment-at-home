@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tomllib
 from dataclasses import dataclass, fields
+from math import isfinite
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Literal
 
@@ -24,6 +25,14 @@ class BudgetExhausted(ResearchError):
     """A run consumed its work-unit, wall-clock, or dollar budget."""
 
 
+class InvalidBudget(ResearchError):
+    """A budget or ceiling carried a non-finite, non-positive, or non-integer cap; refused, never clamped."""
+
+
+class UnconfinedPath(ResearchError):
+    """A spec path escapes the work directory (absolute, ``..`` traversal, or empty)."""
+
+
 class PoisonedJournal(ResearchError):
     """A resumed journal carried a non-finite metric or an invalid spend value."""
 
@@ -42,6 +51,18 @@ class ProposalTimeout(ResearchError):
 
 def unbounded_glob(pattern: str) -> bool:
     return PurePosixPath(pattern).parts[0] in {"*", "**"}
+
+
+def finite_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(value)
+
+
+def positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def escapes_workdir(path: str) -> bool:
+    return not (pure := PurePosixPath(path)).parts or pure.is_absolute() or ".." in pure.parts
 
 
 def reject_unknown_fields(cls: type, data: Mapping[str, object], *, source: str) -> None:
@@ -78,6 +99,17 @@ class Budget:
     hard_kill_s: float | None = None
     max_usd: float | None = None
 
+    def __post_init__(self) -> None:
+        if not positive_int(self.max_units):
+            raise InvalidBudget(f"max_units must be a positive int, not {self.max_units!r}")
+        for label, value in (
+            ("max_wall_s", self.max_wall_s),
+            ("hard_kill_s", self.hard_kill_s),
+            ("max_usd", self.max_usd),
+        ):
+            if value is not None and not (finite_number(value) and value > 0):
+                raise InvalidBudget(f"{label} must be a finite positive number, not {value!r}")
+
 
 @dataclass(frozen=True, slots=True)
 class ExperimentSpec:
@@ -106,6 +138,8 @@ class ExperimentSpec:
     def __post_init__(self) -> None:
         if bad := [pattern for pattern in self.mutable_paths if unbounded_glob(pattern)]:
             raise ImmutableViolation(f"mutable_paths must be a tight allowlist; unbounded globs rejected: {bad}")
+        if escapes_workdir(self.metric_file):
+            raise UnconfinedPath(f"metric_file {self.metric_file!r} must be a relative path inside the work directory")
 
     @classmethod
     def load(cls, path: Path) -> ExperimentSpec:

@@ -12,7 +12,6 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
-from math import isfinite
 from pathlib import Path
 from subprocess import PIPE, STDOUT
 from typing import TYPE_CHECKING, Literal
@@ -25,7 +24,7 @@ from athome.research.contract import build_contract
 from athome.research.driver import describe_change, read_reported_metric
 from athome.research.gate import immutable_violations, monotone_gate, parse_diff_tree
 from athome.research.journal import Journal, JournalRow, Verdict
-from athome.research.spec import BudgetExhausted, ConcurrentRun, PoisonedJournal, ProposalTimeout
+from athome.research.spec import BudgetExhausted, ConcurrentRun, PoisonedJournal, ProposalTimeout, finite_number
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -98,9 +97,6 @@ async def run_metric(command: tuple[str, ...], workdir: Path, *, hard_kill_s: fl
         return result.returncode, result.stdout
     return None, b""
 
-
-def finite_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(value)
 
 
 def finite_metric(text: str, key: str) -> float | None:

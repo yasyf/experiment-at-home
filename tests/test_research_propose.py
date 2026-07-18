@@ -86,6 +86,12 @@ def test_admitted_spec_copies_template_verbatim_and_prefixes_seq() -> None:
     assert spec.hypothesis == "A lower learning rate converges further."
 
 
+@pytest.mark.parametrize("seq", [0, -3, True], ids=["zero", "negative", "bool"])
+def test_seq_must_be_a_positive_non_bool_int(seq: int) -> None:
+    with pytest.raises(ProposalViolation, match="seq"):
+        validate_proposal(make_proposal(), make_policy(), seq=seq)
+
+
 def test_unknown_template_is_refused() -> None:
     with pytest.raises(ProposalViolation, match="unknown template"):
         validate_proposal(make_proposal(template="ghost"), make_policy(), seq=1)

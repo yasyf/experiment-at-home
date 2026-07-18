@@ -66,6 +66,10 @@ FAMILY_ALIASES: dict[str, str] = {
     "meta": "meta",
     "mistral": "mistral",
     "mixtral": "mistral",
+    "qwen": "qwen",
+    "qwq": "qwen",
+    "qvq": "qwen",
+    "alibaba": "qwen",
 }
 PROVIDER_FAMILIES: dict[str, str] = {
     "claude": "anthropic",

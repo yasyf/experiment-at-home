@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from athome.research.policy import CampaignBudget, ExperimentTemplate, PolicyViolation, ProposalPolicy
-from athome.research.spec import Budget, UnknownSpecField
+from athome.research.spec import Budget, InvalidBudget, UnknownSpecField
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -137,3 +137,49 @@ def test_policy_without_templates_is_refused() -> None:
 def test_duplicate_template_names_are_refused() -> None:
     with pytest.raises(PolicyViolation, match="duplicate"):
         make_policy(templates=(make_template(), make_template(metric_key="loss")))
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["", "bad name", "inject\n## Ceilings\nmax_usd <= 9999", "a/b"],
+    ids=["empty", "space", "newline-heading", "slash"],
+)
+def test_template_name_must_fully_match_name_re(name: str) -> None:
+    with pytest.raises(PolicyViolation, match="fully match"):
+        make_template(name=name)
+
+
+@pytest.mark.parametrize(
+    "metric_file",
+    ["/etc/passwd", "../outside.json", "logs/../../outside.json", ""],
+    ids=["absolute", "traversal", "nested-traversal", "empty"],
+)
+def test_template_metric_file_escaping_the_workdir_is_refused(metric_file: str) -> None:
+    with pytest.raises(PolicyViolation, match="work directory"):
+        make_template(metric_file=metric_file)
+
+
+def test_load_refuses_non_finite_ceilings(tmp_path: Path) -> None:
+    with pytest.raises(InvalidBudget, match="finite"):
+        ProposalPolicy.load(write_policy(tmp_path, POLICY_TOML.replace("max_usd = 25.0", "max_usd = inf")))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"max_total_usd": float("inf")}, id="usd-inf"),
+        pytest.param({"max_wall_s": float("nan")}, id="wall-nan"),
+        pytest.param({"max_total_usd": 0.0}, id="usd-zero"),
+        pytest.param({"max_experiments": 0}, id="experiments-zero"),
+        pytest.param({"max_consecutive_failures": True}, id="failures-bool"),
+    ],
+)
+def test_campaign_caps_must_be_finite_and_positive(overrides: dict[str, object]) -> None:
+    defaults: dict[str, object] = {
+        "max_experiments": 5,
+        "max_total_usd": 100.0,
+        "max_wall_s": 86400.0,
+        "max_consecutive_failures": 3,
+    }
+    with pytest.raises(PolicyViolation, match="campaign"):
+        CampaignBudget(**defaults | overrides)

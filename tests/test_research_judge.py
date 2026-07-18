@@ -182,13 +182,17 @@ def test_coin_is_deterministic_and_spans_both_slots() -> None:
         pytest.param("claude-3-7-sonnet", "anthropic", id="claude-model"),
         pytest.param("azure-openai", "openai", id="azure-openai"),
         pytest.param("gpt-4o", "openai", id="gpt-4o"),
+        pytest.param("qwen", "qwen", id="qwen-bare"),
+        pytest.param("qwen3-coder", "qwen", id="qwen-model"),
+        pytest.param("Qwen/Qwen2.5-72B-Instruct", "qwen", id="qwen-hub-path"),
+        pytest.param("qwq-32b", "qwen", id="qwq-model"),
     ],
 )
 def test_family_of_resolves_model_names(value: str, family: str) -> None:
     assert family_of(value) == family
 
 
-@pytest.mark.parametrize("value", ["qwen3-coder", "", "claude-gpt-hybrid"])
+@pytest.mark.parametrize("value", ["deepseek-r1", "", "claude-gpt-hybrid"])
 def test_family_of_fails_closed_on_unknown_or_ambiguous(value: str) -> None:
     with pytest.raises(UnknownFamilyError):
         family_of(value)
@@ -218,10 +222,14 @@ def test_ensure_cross_family_allows_a_different_family() -> None:
     ensure_cross_family("anthropic", "openai")
 
 
+def test_ensure_cross_family_allows_a_qwen_generator_against_an_anthropic_judge() -> None:
+    ensure_cross_family("anthropic", "qwen")
+
+
 def test_ensure_cross_family_fails_closed_on_an_unknown_generator() -> None:
     # JG2: the old normalize_family fell back to the raw string, silently ALLOWING an unknown family.
     with pytest.raises(UnknownFamilyError):
-        ensure_cross_family("anthropic", "qwen3-coder")
+        ensure_cross_family("anthropic", "deepseek-r1")
 
 
 # --- JG1: Judge bound to a concrete backend ---------------------------------------------------
@@ -642,7 +650,7 @@ async def test_pairwise_vote_fails_closed_on_unknown_family_before_the_cache_loo
     with pytest.raises(UnknownFamilyError):
         await pairwise_vote(
             judge,
-            generator_family="qwen3",
+            generator_family="deepseek-r1",
             grant=PanelGrant(verified()),
             context=CTX,
             row_id="r",

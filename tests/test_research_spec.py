@@ -5,7 +5,15 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from athome.research.spec import Budget, ExperimentSpec, ImmutableViolation, UnknownSpecField, unbounded_glob
+from athome.research.spec import (
+    Budget,
+    ExperimentSpec,
+    ImmutableViolation,
+    InvalidBudget,
+    UnconfinedPath,
+    UnknownSpecField,
+    unbounded_glob,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -109,7 +117,7 @@ def test_unbounded_glob(pattern: str, expected: bool) -> None:
     assert unbounded_glob(pattern) is expected
 
 
-def make_spec(*, mutable_paths: tuple[str, ...]) -> ExperimentSpec:
+def make_spec(*, mutable_paths: tuple[str, ...], metric_file: str = ".athome-metric.json") -> ExperimentSpec:
     return ExperimentSpec(
         name="toy",
         metric_command=("python", "score.py"),
@@ -118,6 +126,7 @@ def make_spec(*, mutable_paths: tuple[str, ...]) -> ExperimentSpec:
         mutable_paths=mutable_paths,
         immutable_paths=("score.py",),
         budget=Budget(max_units=1),
+        metric_file=metric_file,
     )
 
 
@@ -132,3 +141,35 @@ def test_post_init_rejects_unbounded_mutable_globs(pattern: str) -> None:
 def test_post_init_accepts_anchored_mutable_globs() -> None:
     spec = make_spec(mutable_paths=("train.py", "src/*.py", "eval/**"))
     assert spec.mutable_paths == ("train.py", "src/*.py", "eval/**")
+
+
+@pytest.mark.parametrize(
+    "metric_file",
+    ["/etc/passwd", "../outside.json", "logs/../../outside.json", ""],
+    ids=["absolute", "traversal", "nested-traversal", "empty"],
+)
+def test_post_init_refuses_a_metric_file_escaping_the_workdir(metric_file: str) -> None:
+    with pytest.raises(UnconfinedPath, match="work directory"):
+        make_spec(mutable_paths=("train.py",), metric_file=metric_file)
+
+
+def test_post_init_accepts_a_nested_relative_metric_file() -> None:
+    assert make_spec(mutable_paths=("train.py",), metric_file="logs/.metric.json").metric_file == "logs/.metric.json"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({"max_units": 0}, id="units-zero"),
+        pytest.param({"max_units": -2}, id="units-negative"),
+        pytest.param({"max_units": True}, id="units-bool"),
+        pytest.param({"max_usd": float("inf")}, id="usd-inf"),
+        pytest.param({"max_wall_s": float("nan")}, id="wall-nan"),
+        pytest.param({"hard_kill_s": 0.0}, id="kill-zero"),
+        pytest.param({"max_usd": -1.0}, id="usd-negative"),
+        pytest.param({"max_wall_s": True}, id="wall-bool"),
+    ],
+)
+def test_budget_refuses_non_finite_or_non_positive_caps(overrides: dict[str, object]) -> None:
+    with pytest.raises(InvalidBudget):
+        Budget(**{"max_units": 5} | overrides)
