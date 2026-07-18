@@ -4,6 +4,24 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-07-18
+
+### Added
+- **`athome.train.observe`** — the evaluate-only entrypoint. None existed, and `train`/`retrain` refuse non-local bases by contract, so cc-steer and write-like-me each hand-rolled the same fit-then-score budget arithmetic around raw `TinkerBackend` calls; `observe(backend, spec, rows, *, budget, select, sink, checkpoints, eval_rows)` closes that hole: `fit`, argmax the caller's `select` over the saved checkpoints, `score` the winner — all under one spend envelope, hosted-only bases welcome. Returns the frozen `ObserveOutcome(report, best, scored)`; `best.path` is the `tinker://` sampler address that was scored. The caller owns the sink and its retention, and fire-probability/AUC math stays consumer-side.
+- **`SpendGuard(max_usd=None)`** — the deliberate spelling of an unbounded envelope: it never refuses yet still accumulates `spent` for reporting. `None` can only be a spelled argument (the field keeps no default), so an uncapped call can never arise from an omitted parameter; a float cap must be finite and non-negative (`InvalidBudget` refuses `inf`/`nan`/negatives at construction; `0.0` stays the legal spend-nothing). External spend debits the same envelope through the public `check`/`record` — pre-authorize the projection, reconcile the actual, `release` on failure — documented on the class.
+- `athome.train` facade exports: `TinkerBackend`, `observe`/`ObserveOutcome`, and re-exported `SpendGuard`/`SpendExceeded`/`InvalidBudget` — no consumer imports `athome.train.tinker` again.
+- `require_servable(base, *, kind)` in `athome.train.spec` — the one servability chokepoint behind `train`, `retrain`, modal, and both sidecar conversions; five copy-pasted `serves_locally` refusals collapse into it with their messages byte-identical.
+
+### Changed
+- **Breaking: every billable `TinkerBackend` call takes a required keyword-only `budget: SpendGuard`.** `fit(spec, *, sink, budget, checkpoints, eval_rows)` no longer reads `spec.max_usd` at all, and `score`/`sample` lose their `max_usd` parameter along with the configured-cap fallback — the caller declares one budget and the machinery composes within it: one guard threaded through `fit` and then `score` bills both against one cap, `fit`'s recorded actuals drawing down what `score` may still reserve, which deletes the `cap − train_cost_usd` arithmetic every consumer hand-rolled. `retrain` gains the same required `budget:`, threaded into its fit (scoring stays on the injected `artifact_scorer`). `TinkerBackend.train` remains the one site where a spec-declared cap converts into an envelope.
+- A billable call that fails mid-flight now releases its un-reconciled reservation back to the envelope (the `metered()` settled-flag idiom, shielded against cancellation), so a transient client or stream failure can no longer permanently erode a shared envelope's cap: `score` and `sample` release their full projection, and `fit` tracks its outstanding reservation per drained slice, releasing exactly the un-drained remainder.
+
+### Fixed
+- Campaign cap enforcement — three confirmed gaps, each reproduced before fixing:
+  - Crash-resume no longer undercounts overshooting spend: `Campaign.reconcile()` runs at startup and closes every crash-orphaned reservation with a terminal `RECONCILED` ledger row at `max(reserved, durable actual)` — never assume-zero, idempotent, and a torn experiment journal refuses startup. (A $4 actual journaled against a $3 reservation previously resumed counting $3, admitting a new $2 reservation under a $5 cap.) `RECONCILED` behaves like `ABORTED` in run accounting — the slot is consumed and the failure streak resets — and older athome cannot parse ledgers containing it.
+  - A surviving accounting-abort latch now refuses campaign startup: `run_campaign` checks the new `procs.abort_latches()` before the orphan scan and raises `AccountingIntegrityError` while any `<experiment>.abort.json` persists — previously a restart's procs scan marked the record accounted and the next sequence launched with the latch still on disk.
+  - Preflight time now counts against the `max_wall_s` reservation: `started`/`deadline` precede `driver.preflight()`, which runs inside the wall's cancel scope — settlement can no longer bill wall time the reservation never covered.
+
 ## [0.8.0] - 2026-07-18
 
 ### Added

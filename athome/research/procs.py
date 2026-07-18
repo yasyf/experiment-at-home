@@ -192,6 +192,20 @@ async def abort_latch(repo: Path, experiment: str) -> Path:
     return journal.with_name(f"{experiment}.abort.json")
 
 
+async def abort_latches(repo: Path) -> list[Path]:
+    """Every surviving accounting-abort latch under the campaign's journal directory.
+
+    A latch — written by the inner loop when a unit's accounting abort escapes
+    (:func:`athome.research.failures.record_accounting_abort`) or by :func:`scan`
+    for a provably-dead detached proposal — refuses campaign startup regardless of
+    the proposal-process registry's own state, which a spend-recorded record marked
+    ``accounted`` no longer surfaces through :func:`scan` or :func:`unreconciled`.
+    """
+    from athome.research import nightly
+
+    return sorted([Path(latch) async for latch in anyio.Path(await nightly.journal_dir(repo)).glob("*.abort.json")])
+
+
 async def spend_recorded(repo: Path, record: ProposalProcess) -> bool:
     from athome.research import nightly
 
@@ -224,6 +238,13 @@ def refusal(orphans: Sequence[Orphan]) -> str:
     described = "; ".join(f"{orphan.record.run} ({orphan_status(orphan)})" for orphan in orphans)
     return (
         f"detached proposal processes with unreconciled spend: {described}; "
+        "check the provider ledger, reconcile the spend, then delete each latch file"
+    )
+
+
+def latch_refusal(latches: Sequence[Path]) -> str:
+    return (
+        f"unreconciled accounting-abort latch: {'; '.join(str(latch) for latch in latches)}; "
         "check the provider ledger, reconcile the spend, then delete each latch file"
     )
 

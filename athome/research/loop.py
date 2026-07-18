@@ -629,20 +629,21 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
 
         worktrees = Path(tempfile.mkdtemp(prefix=f"athome-{spec.name}-")).resolve()
         try:
-            await driver.preflight()
-            report = await preflight(
-                spec,
-                repo=repo,
-                incumbent=incumbent,
-                scratch_dir=worktrees / "preflight",
-                baseline_path=Path(athome_dir) / f"{spec.name}.baseline.json",
-                resume=resumed,
-            )
-            if incumbent_metric is None:
-                incumbent_metric = report.baseline
-            baseline = report.baseline
             started = time.monotonic()
             deadline = None if spec.budget.max_wall_s is None else started + spec.budget.max_wall_s
+            with anyio.move_on_after(spec.budget.max_wall_s):
+                await driver.preflight()
+                report = await preflight(
+                    spec,
+                    repo=repo,
+                    incumbent=incumbent,
+                    scratch_dir=worktrees / "preflight",
+                    baseline_path=Path(athome_dir) / f"{spec.name}.baseline.json",
+                    resume=resumed,
+                )
+                if incumbent_metric is None:
+                    incumbent_metric = report.baseline
+                baseline = report.baseline
             for unit in range(journal.resume_unit(), spec.budget.max_units):
                 elapsed = time.monotonic() - started
                 if spec.budget.max_wall_s is not None and elapsed >= spec.budget.max_wall_s:

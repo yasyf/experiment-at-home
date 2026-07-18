@@ -5,7 +5,7 @@ import json
 import subprocess
 import sys
 import textwrap
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -15,16 +15,17 @@ import pytest
 from click.testing import CliRunner
 
 from athome import launchd
-from athome.research import meta
+from athome.research import meta, procs
 from athome.research.cli import cli
 from athome.research.driver import StubProposal
-from athome.research.errors import PreflightFailure
+from athome.research.errors import AccountingIntegrityError, PreflightFailure
+from athome.research.journal import Journal, JournalRow, Verdict
 from athome.research.loop import experiment_lock
 from athome.research.meta import CampaignEvent, Ledger, LedgerRow, PoisonedLedger
 from athome.research.policy import CampaignBudget, ExperimentTemplate, ProposalPolicy
 from athome.research.propose import MAX_PROPOSAL_ATTEMPTS, Proposal
 from athome.research.retro import RetroJournal, RetroVerdict
-from athome.research.spec import Budget, ConcurrentRun, ExperimentSpec
+from athome.research.spec import Budget, ConcurrentRun, ExperimentSpec, PoisonedJournal
 from tests.test_research_propose import scripted_backend
 
 if TYPE_CHECKING:
@@ -1010,3 +1011,157 @@ def test_cli_meta_install_is_wired(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     assert agent.command == ("athome", "research", "meta", "run", str(policy_path.resolve()))
     assert agent.schedule == launchd.Calendar(hour=3, minute=0)
     assert agent.working_dir == repo
+
+
+async def crashed_reservation(
+    tmp_path: Path, *, max_total_usd: float = 5.0
+) -> tuple[meta.Campaign, ExperimentSpec, Path]:
+    """Resume state for an experiment that reserved $3 then crashed before its terminal ledger row."""
+    repo = toy_repo(tmp_path / "repo")
+    root = tmp_path / "meta"
+    name = "001-toy"
+    spec = ExperimentSpec(
+        name=name,
+        metric_command=(sys.executable, "score.py"),
+        metric_key="loss",
+        direction="min",
+        mutable_paths=("train.py",),
+        immutable_paths=("score.py",),
+        budget=Budget(max_units=4, max_wall_s=600.0, hard_kill_s=120.0, max_usd=3.0),
+    )
+    audit = root / meta.EXPERIMENTS_DIR / name
+    audit.mkdir(parents=True)
+    (audit / meta.SPEC_NAME).write_text(meta.spec_toml(spec))
+
+    # The campaign crashed after RESERVED + STARTED but before any terminal release row.
+    ledger = Ledger.open(root / meta.LEDGER_NAME)
+    await ledger.append(
+        LedgerRow(seq=1, event=CampaignEvent.RESERVED, usd=3.0, wall_s=600.0, reason="", extra={"name": name})
+    )
+    await ledger.append(
+        LedgerRow(seq=1, event=CampaignEvent.STARTED, usd=0.0, wall_s=0.0, reason="", extra={"name": name})
+    )
+    campaign = meta.Campaign(
+        policy=make_campaign_policy(max_total_usd=max_total_usd),
+        repo=repo,
+        root=root,
+        backend=scripted_backend([]),
+        driver_factory=forbidden_factory,
+        tier="large",
+        mirror_cc_notes=False,
+        ledger=ledger,
+        retros=RetroJournal.open(root / meta.RETROS_NAME, mirror_cc_notes=False),
+    )
+    return campaign, spec, await meta.nightly.journal_path(repo, name)
+
+
+async def test_reconcile_closes_a_crashed_reservation_at_the_durable_actual(tmp_path: Path) -> None:
+    campaign, spec, journal_path = await crashed_reservation(tmp_path)
+    # A durable experiment journal recording $4 of actual spend — a post-hoc overshoot of the $3 grant.
+    await Journal.open(journal_path).append(
+        JournalRow(
+            unit=0,
+            commit="0" * 40,
+            metric=0.9,
+            verdict=Verdict.KEEP,
+            resources={"wall_s": 5.0, "usd": 4.0},
+            description="one paid unit",
+        )
+    )
+    newcomer = replace(spec, name="002-toy", budget=replace(spec.budget, max_usd=2.0))
+
+    # The recompute undercounts: $4 is durable in the experiment journal, yet the open reservation
+    # counts only its $3 grant, so a $2 newcomer is wrongly admitted ($3 + $2 = $5, at the cap).
+    assert campaign.ledger.total_usd() == 3.0
+    assert await campaign.actual_usd(spec) == 4.0
+    assert campaign.reservation_refusal(newcomer) is None
+
+    await campaign.reconcile()
+
+    reconciled = [row for row in campaign.ledger.rows() if row.event is CampaignEvent.RECONCILED]
+    assert len(reconciled) == 1 and reconciled[0].usd == 4.0  # max(reserved $3, durable $4), never assume-zero
+    assert campaign.ledger.open_reservations() == {}  # the crash-orphaned reservation is released
+    assert campaign.ledger.total_usd() == 4.0
+    # A $2 newcomer now takes the campaign to $6, over the $5 cap → refused.
+    assert campaign.reservation_refusal(newcomer) is not None
+
+    # Idempotent: a second reconcile over the same state appends nothing.
+    rows_before = len(campaign.ledger.rows())
+    await campaign.reconcile()
+    assert len(campaign.ledger.rows()) == rows_before
+
+
+async def test_reconcile_floors_a_crashed_reservation_at_the_reserved_grant(tmp_path: Path) -> None:
+    campaign, spec, journal_path = await crashed_reservation(tmp_path)
+    # The durable journal undershot the grant ($1 < $3): reconcile never assumes zero, it floors at the $3 grant.
+    await Journal.open(journal_path).append(
+        JournalRow(
+            unit=0,
+            commit="0" * 40,
+            metric=0.9,
+            verdict=Verdict.KEEP,
+            resources={"wall_s": 5.0, "usd": 1.0},
+            description="one cheap unit",
+        )
+    )
+    await campaign.reconcile()
+
+    reconciled = [row for row in campaign.ledger.rows() if row.event is CampaignEvent.RECONCILED]
+    assert len(reconciled) == 1 and reconciled[0].usd == 3.0  # max(reserved $3, durable $1)
+    assert campaign.ledger.total_usd() == 3.0
+
+
+async def test_reconcile_refuses_startup_on_a_poisoned_experiment_journal(tmp_path: Path) -> None:
+    campaign, _, journal_path = await crashed_reservation(tmp_path)
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_text('{"unit": 0, "commit": "x", "metric": 0.9, "resources')  # a torn final line
+
+    with pytest.raises(PoisonedJournal):
+        await campaign.reconcile()  # crash loudly; never silently skip the unparseable overshoot
+
+
+async def test_run_campaign_refuses_a_surviving_loop_written_abort_latch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Finding 2: a loop-written latch whose record the scan terminalizes `accounted` escapes both
+    # scan and `unreconciled`, yet must still refuse the outer campaign startup, not advance a seq.
+    repo = toy_repo(tmp_path / "repo")
+    root = tmp_path / "meta"
+
+    registry = procs.ProcessRegistry(root / procs.PROCS_NAME)
+    handle = registry.experiment("001-round1", seq=1, spec_digest="d" * 64)
+    handle.register("run-a", log=root / "run-a.log", pid_file=root / "run-a.pid", exit_file=root / "run-a.exit")
+    handle.bind("run-a", pid=4242, pgid=4242)
+
+    journal = await meta.nightly.journal_path(repo, "001-round1")
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    journal.write_text(
+        json.dumps(
+            {
+                "unit": 0,
+                "commit": "c" * 40,
+                "metric": None,
+                "verdict": "crash",
+                "resources": {"wall_s": 1.0, "usd": 0.42, "run": "run-a"},
+                "description": "settle failed after the spend was durable",
+            }
+        )
+        + "\n"
+    )
+    (await procs.abort_latch(repo, "001-round1")).write_text(
+        json.dumps({"unit": 0, "reason": "AccountingIntegrityError", "ts": 0.0})
+    )
+
+    monkeypatch.setattr(procs, "pid_alive", lambda pid: False)
+    monkeypatch.setattr(procs, "process_table", lambda: {})
+    # Absent the latch gate, startup marks the record accounted, finds no orphan, and reaches this stop.
+    await meta.request_stop(root, reason="operator reconciling")
+    backend = scripted_backend([])
+
+    with pytest.raises(AccountingIntegrityError, match="unreconciled accounting-abort latch"):
+        await meta.run_campaign(
+            make_campaign_policy(), repo=repo, root=root, backend=backend, driver_factory=forbidden_factory
+        )
+
+    assert backend.calls == []  # refused before any proposer round; the next sequence never starts
+    assert (await procs.abort_latch(repo, "001-round1")).exists()  # the refusal never deletes the operator's latch

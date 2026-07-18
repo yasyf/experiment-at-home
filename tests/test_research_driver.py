@@ -663,7 +663,7 @@ async def test_wall_cancel_recovery_read_failure_aborts_accounting(
     repo = toy_repo(repo_dir)
     if read_fails:
         make_run_log_unreadable(monkeypatch)
-    spec = make_spec(budget=Budget(max_units=1, max_wall_s=0.2))
+    spec = make_spec(budget=Budget(max_units=1, max_wall_s=2.0))
     driver = ClaudeCodeDriver(spec, command=fake_claude(tmp_path, body), poll=30.0, timeout_s=10.0)
 
     with anyio.fail_after(5.0):
@@ -676,7 +676,7 @@ async def test_wall_cancel_recovery_read_failure_aborts_accounting(
 
 async def test_wall_cancel_with_partial_cost_envelope_aborts_accounting(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path)
-    spec = make_spec(budget=Budget(max_units=1, max_wall_s=1.0))
+    spec = make_spec(budget=Budget(max_units=1, max_wall_s=2.0))
     driver = ClaudeCodeDriver(
         spec,
         command=fake_claude(tmp_path, FAKE_CLAUDE_PARTIAL_COST_THEN_HANGS),

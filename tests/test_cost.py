@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+import anyio
 import pytest
 from loguru import logger
 
 from athome.llm.pricing import PRICES, Price, UnpricedModel, cost
-from athome.llm.spend import SpendExceeded, SpendGuard
+from athome.llm.spend import InvalidBudget, SpendExceeded, SpendGuard
 from athome.llm.telemetry import CallLog, CallRecord
 
 if TYPE_CHECKING:
@@ -68,6 +69,77 @@ async def test_spend_guard_accumulates_and_then_blocks() -> None:
     assert guard.reserved == pytest.approx(0.0)
     with pytest.raises(SpendExceeded):
         await guard.check(0.5)
+
+
+async def test_an_unbounded_envelope_is_spelled_none_and_never_refuses() -> None:
+    guard = SpendGuard(max_usd=None)
+    await guard.check(1_000_000.0)
+    await guard.check(1_000_000.0)
+    assert guard.reserved == pytest.approx(2_000_000.0)
+
+
+async def test_an_unbounded_envelope_still_accumulates_spend_for_reporting() -> None:
+    guard = SpendGuard(max_usd=None)
+    await guard.check(5.0)
+    await guard.record(5.0, 4.2)
+    assert guard.spent == pytest.approx(4.2)
+    assert guard.reserved == pytest.approx(0.0)
+
+
+async def test_external_spend_debits_share_the_envelope_with_hosted_reservations() -> None:
+    guard = SpendGuard(max_usd=1.0)
+    await guard.check(0.4)
+    await guard.record(0.4, 0.4)
+    await guard.check(0.3)
+    await guard.record(0.3, 0.3)
+    assert guard.spent == pytest.approx(0.7)
+    with pytest.raises(SpendExceeded):
+        await guard.check(0.4)
+    await guard.record(0.0, 0.2)
+    assert guard.spent == pytest.approx(0.9)
+    assert guard.reserved == pytest.approx(0.0)
+
+
+async def test_concurrent_reservations_never_overcommit_a_shared_envelope() -> None:
+    guard = SpendGuard(max_usd=1.0)
+    outcomes: list[bool] = []
+
+    async def reserve() -> None:
+        try:
+            await guard.check(0.3)
+        except SpendExceeded:
+            outcomes.append(False)
+        else:
+            outcomes.append(True)
+
+    async with anyio.create_task_group() as tg:
+        for _ in range(10):
+            tg.start_soon(reserve)
+
+    assert sum(outcomes) == 3
+    assert guard.reserved == pytest.approx(3 * 0.3)
+    assert guard.reserved <= guard.max_usd
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param(float("inf"), id="inf"),
+        pytest.param(float("-inf"), id="-inf"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(-1.0, id="negative"),
+    ],
+)
+def test_an_invalid_budget_is_refused_at_construction(bad: float) -> None:
+    with pytest.raises(InvalidBudget, match="finite and non-negative"):
+        SpendGuard(max_usd=bad)
+
+
+async def test_a_zero_cap_is_legal_and_refuses_all_spend() -> None:
+    guard = SpendGuard(max_usd=0.0)
+    await guard.check(0.0)
+    with pytest.raises(SpendExceeded):
+        await guard.check(0.01)
 
 
 def test_calllog_total_usd_sums_records() -> None:

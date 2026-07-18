@@ -23,8 +23,8 @@ from athome.train.spec import (
     Method,
     ModalTrainSettings,
     TrainSpec,
-    UnservableBase,
     lora_keys,
+    require_servable,
     spend_cap,
 )
 
@@ -351,15 +351,13 @@ class ModalTrainBackend:
         """
         import modal
 
-        if not spec.base.serves_locally:
-            raise UnservableBase(
-                f"{spec.base.mlx} has no mlx-lm LoRA counterpart, so a Modal adapter cannot be fused into it"
-            )
+        require_servable(spec.base, kind="Modal")
         parity = service_spec(self.settings, spec.lora, spec.base)
         await ensure_write_auth()
-        guard = SpendGuard(max_usd=spend_cap(spec, self.settings.spend_cap_usd))
+        cap = spend_cap(spec, self.settings.spend_cap_usd)
+        guard = SpendGuard(max_usd=cap)
         await guard.check(projected := projected_usd(spec, self.settings))
-        timeout = budget_seconds(guard.max_usd, self.settings)
+        timeout = budget_seconds(cap, self.settings)
         config = RemoteConfig(
             base=spec.base,
             repo=f"{self.settings.hf_repo_prefix}/{spec.name}",
@@ -382,8 +380,8 @@ class ModalTrainBackend:
                 raise ParityMismatch(f"{self.settings.app_name}: " + "; ".join(mismatches))
             result: RemoteResult = await trainer.remote.aio(config, dataset)
         await guard.record(projected, actual := billed_usd(result.seconds, self.settings))
-        if guard.spent > guard.max_usd:
-            raise SpendExceeded(f"modal run billed ${guard.spent:.4f}, over the ${guard.max_usd:.4f} cap")
+        if guard.spent > cap:
+            raise SpendExceeded(f"modal run billed ${guard.spent:.4f}, over the ${cap:.4f} cap")
         await sink.append(
             {"stage": "trained", "repo": result.repo, "revision": result.revision, "usd": actual, "step": result.step}
         )

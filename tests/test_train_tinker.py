@@ -238,6 +238,10 @@ def sink(tmp_path: Path) -> RunSink:
     return RunSink.open(tmp_path / "run.jsonl")
 
 
+def budget(max_usd: float | None = 60.0) -> SpendGuard:
+    return SpendGuard(max_usd=max_usd)
+
+
 def step_records(path: Path) -> list[dict[str, object]]:
     return [record for record in load_journal(path) if record.get("event") != "checkpoint"]
 
@@ -392,7 +396,7 @@ async def test_over_long_examples_never_reach_a_batch(
     )
     request = spec(LocalJsonlRef(path=path), hyperparams=Hyperparams(steps=2, batch_size=1, max_seq_len=32))
 
-    report = await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path))
+    report = await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path), budget=budget())
 
     lengths = {datum.model_input.length for batch, _ in service.clients[0].forward_backward for datum in batch}
     assert lengths == {len("<user>q<assistant>ok") - 1}
@@ -435,6 +439,29 @@ async def test_a_zero_cap_spends_nothing_rather_than_the_configured_sixty_dollar
 
     assert service.clients == []
     assert not (tmp_path / "run").exists()
+
+
+async def test_fit_refuses_before_spend_when_its_projection_alone_exceeds_the_envelope(
+    service: FakeService, tmp_path: Path
+) -> None:
+    request = spec(corpus(tmp_path, method="sft"), hyperparams=Hyperparams(steps=1000, batch_size=4))
+
+    with pytest.raises(SpendExceeded, match="exceeds cap"):
+        await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path), budget=SpendGuard(max_usd=1e-6))
+
+    assert service.clients == []
+
+
+async def test_fit_ignores_the_spec_cap_in_favor_of_the_envelope(service: FakeService, tmp_path: Path) -> None:
+    """fit reads only the passed envelope: a spec cap that would refuse under train is never consulted."""
+    envelope = SpendGuard(max_usd=60.0)
+    request = spec(corpus(tmp_path, method="sft"), max_usd=1e-9)
+
+    report = await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path), budget=envelope)
+
+    assert len(report.steps) == 3
+    assert report.train_cost_usd == pytest.approx(envelope.spent)
+    assert envelope.spent > 1e-9
 
 
 @pytest.mark.parametrize(
@@ -502,7 +529,7 @@ async def test_an_under_filled_pool_aborts_before_the_guard_and_client(
     )
 
     with pytest.raises(InsufficientData) as raised:
-        await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path))
+        await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path), budget=budget())
 
     assert raised.value.count == 2
     assert service.clients == []
@@ -517,7 +544,7 @@ async def test_an_overlong_eval_row_fails_the_whole_set_up_front(service: FakeSe
     request = spec(corpus(tmp_path, method="sft"), hyperparams=Hyperparams(steps=3, batch_size=2, max_seq_len=32))
 
     with pytest.raises(OverlongEvalRows) as raised:
-        await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path), eval_rows=rows)
+        await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path), budget=budget(), eval_rows=rows)
 
     assert raised.value.count == 1
     assert service.clients == []
@@ -532,7 +559,7 @@ async def test_fit_snapshots_at_the_cadence_with_names_ttls_and_eval_scores(
     )
 
     report = await TinkerBackend.from_settings().fit(
-        request, sink=sink(tmp_path), checkpoints=CheckpointPolicy(at=(0.5,)), eval_rows=rows
+        request, sink=sink(tmp_path), budget=budget(), checkpoints=CheckpointPolicy(at=(0.5,)), eval_rows=rows
     )
 
     assert service.clients[0].saves == [("watcher-step00002", 604_800), ("watcher-sft-4", None)]
@@ -551,7 +578,7 @@ async def test_the_sink_interleaves_step_records_and_checkpoint_events_in_order(
         corpus(tmp_path, method="sft", rows=8), hyperparams=Hyperparams(steps=4, batch_size=2, max_seq_len=64)
     )
 
-    await TinkerBackend.from_settings().fit(request, sink=run, checkpoints=CheckpointPolicy(at=(0.5,)))
+    await TinkerBackend.from_settings().fit(request, sink=run, budget=budget(), checkpoints=CheckpointPolicy(at=(0.5,)))
 
     kinds = ["checkpoint" if record.get("event") == "checkpoint" else "step" for record in load_journal(run.path)]
     assert kinds == ["step", "step", "checkpoint", "step", "step", "checkpoint"]
@@ -568,7 +595,7 @@ async def test_the_report_orders_checkpoints_and_totals_the_spend(service: FakeS
     )
 
     report = await TinkerBackend.from_settings().fit(
-        request, sink=sink(tmp_path), checkpoints=CheckpointPolicy(at=(0.25, 0.75))
+        request, sink=sink(tmp_path), budget=budget(), checkpoints=CheckpointPolicy(at=(0.25, 0.75))
     )
 
     assert [checkpoint.step for checkpoint in report.checkpoints] == [1, 3, 4]
@@ -586,7 +613,7 @@ async def test_eval_prefill_is_billed_into_the_run_cost(service: FakeService, tm
     )
 
     report = await TinkerBackend.from_settings().fit(
-        request, sink=sink(tmp_path), checkpoints=CheckpointPolicy(at=(0.5,)), eval_rows=rows
+        request, sink=sink(tmp_path), budget=budget(), checkpoints=CheckpointPolicy(at=(0.5,)), eval_rows=rows
     )
 
     train_tokens = sum(record.tokens for record in report.steps)
@@ -600,15 +627,20 @@ async def test_a_mid_stream_failure_leaves_the_sink_with_only_the_drained_steps(
     instance = FakeService("sk-tinker-test", fail_fb=3)
     sdk.ServiceClient = lambda api_key: instance
     run = sink(tmp_path)
+    envelope = budget()
     request = spec(
         corpus(tmp_path, method="sft", rows=8), hyperparams=Hyperparams(steps=5, batch_size=2, max_seq_len=64)
     )
 
     with pytest.raises(Boom):
-        await TinkerBackend.from_settings().fit(request, sink=run)
+        await TinkerBackend.from_settings().fit(request, sink=run, budget=envelope)
 
-    assert [record["step"] for record in step_records(run.path)] == [1, 2]
+    drained = step_records(run.path)
+    assert [record["step"] for record in drained] == [1, 2]
     assert checkpoint_events(run.path) == []
+    assert envelope.reserved == pytest.approx(0.0)
+    assert envelope.spent == pytest.approx(sum(record["tokens"] for record in drained) / 1e6 * 0.40)
+    await envelope.check(envelope.max_usd - envelope.spent)
 
 
 async def test_dpo_scores_against_a_frozen_reference_client(
@@ -818,7 +850,9 @@ async def test_score_preserves_row_order_and_reduces_the_shifted_token_positions
     sampling_service.sampling.slow = first
     sampling_service.sampling.release = anyio.Event()
 
-    scores = await TinkerBackend.from_settings().score("tinker://run/step2", rows, base=BASE_MODELS["qwen3-8b"])
+    scores = await TinkerBackend.from_settings().score(
+        "tinker://run/step2", rows, base=BASE_MODELS["qwen3-8b"], budget=budget()
+    )
 
     assert sampling_service.sampling.finished == [second, first]
     assert sampling_service.sampling_paths == ["tinker://run/step2"]
@@ -852,8 +886,8 @@ async def test_fit_and_post_hoc_score_have_identical_weighted_reductions(
     backend = TinkerBackend.from_settings()
     request = spec(corpus(tmp_path, method="sft"))
 
-    report = await backend.fit(request, sink=sink(tmp_path), eval_rows=(row,))
-    scores = await backend.score(report.final.path, (row,), base=request.base)
+    report = await backend.fit(request, sink=sink(tmp_path), budget=budget(), eval_rows=(row,))
+    scores = await backend.score(report.final.path, (row,), base=request.base, budget=budget())
 
     assert report.final.scores is not None
     assert scores == report.final.scores
@@ -861,32 +895,144 @@ async def test_fit_and_post_hoc_score_have_identical_weighted_reductions(
     assert scores[0].weight == 3.0
 
 
+async def test_a_shared_envelope_draws_fit_actuals_down_against_a_later_score(
+    sampling_service: FakeSamplingService, tmp_path: Path
+) -> None:
+    backend = TinkerBackend.from_settings()
+    request = spec(corpus(tmp_path, method="sft"))
+    rows = (EvalRow(tokens=(1, 2, 3), weights=(0.0, 0.0, 1.0)),)
+
+    probe = SpendGuard(max_usd=None)
+    report = await backend.fit(request, sink=sink(tmp_path), budget=probe)
+    fit_spent = probe.spent
+    score_projection = backend.cost(model=tinker_model(request.base), prefill=3, sample=1)
+    assert fit_spent > 0.0
+
+    shared = SpendGuard(max_usd=fit_spent + score_projection / 2)
+    await backend.fit(request, sink=sink(tmp_path), budget=shared)
+    with pytest.raises(SpendExceeded):
+        await backend.score(report.final.path, rows, base=request.base, budget=shared)
+
+    fresh = SpendGuard(max_usd=fit_spent + score_projection / 2)
+    assert len(await backend.score(report.final.path, rows, base=request.base, budget=fresh)) == 1
+
+
+async def test_a_transient_score_failure_on_a_shared_envelope_releases_its_reservation(
+    sampling_service: FakeSamplingService, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    backend = TinkerBackend.from_settings()
+    request = spec(corpus(tmp_path, method="sft"))
+    rows = (EvalRow(tokens=(1, 2, 3), weights=(0.0, 0.0, 1.0)),)
+
+    shared = SpendGuard(max_usd=None)
+    report = await backend.fit(request, sink=sink(tmp_path), budget=shared)
+    fit_spent = shared.spent
+    assert fit_spent > 0.0
+    assert shared.reserved == pytest.approx(0.0)
+
+    fail = {"on": True}
+    real_client = FakeSamplingService.create_sampling_client_async
+
+    async def flaky_client(instance: FakeSamplingService, **kwargs: object) -> FakeSampling:
+        if fail["on"]:
+            raise Boom("sampling client unavailable")
+        return await real_client(instance, **kwargs)
+
+    monkeypatch.setattr(FakeSamplingService, "create_sampling_client_async", flaky_client)
+
+    with pytest.raises(Boom):
+        await backend.score(report.final.path, rows, base=request.base, budget=shared)
+    assert shared.reserved == pytest.approx(0.0)
+    assert shared.spent == pytest.approx(fit_spent)
+
+    fail["on"] = False
+    retry = await backend.score(report.final.path, rows, base=request.base, budget=shared)
+    assert len(retry) == 1
+    assert shared.reserved == pytest.approx(0.0)
+    assert shared.spent == pytest.approx(
+        fit_spent + backend.cost(model=tinker_model(request.base), prefill=3, sample=1)
+    )
+
+
+async def test_a_transient_sample_failure_on_a_shared_envelope_releases_its_reservation(
+    sampling_service: FakeSamplingService, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    backend = TinkerBackend.from_settings()
+    request = spec(corpus(tmp_path, method="sft"))
+    prompts = [[{"role": "user", "content": "one"}]]
+
+    shared = SpendGuard(max_usd=None)
+    report = await backend.fit(request, sink=sink(tmp_path), budget=shared)
+    fit_spent = shared.spent
+    assert fit_spent > 0.0
+
+    fail = {"on": True}
+    real_sample = FakeSampling.sample_async
+
+    async def flaky_sample(
+        instance: FakeSampling, prompt: FakeModelInput, num_samples: int, sampling_params: FakeSamplingParams
+    ) -> FakeSampleResponse:
+        if fail["on"]:
+            raise Boom("sampler unavailable")
+        return await real_sample(instance, prompt, num_samples, sampling_params)
+
+    monkeypatch.setattr(FakeSampling, "sample_async", flaky_sample)
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await backend.sample(
+            report.final.path, prompts, base=request.base, budget=shared, max_tokens=8, temperature=0.7
+        )
+    assert raised.group_contains(Boom)
+    assert shared.reserved == pytest.approx(0.0)
+    assert shared.spent == pytest.approx(fit_spent)
+
+    fail["on"] = False
+    retry = await backend.sample(
+        report.final.path, prompts, base=request.base, budget=shared, max_tokens=8, temperature=0.7
+    )
+    assert len(retry) == 1
+    assert shared.reserved == pytest.approx(0.0)
+    assert shared.spent == pytest.approx(fit_spent + retry[0].usd)
+
+
+async def test_cancelling_a_sample_mid_gather_still_releases_its_reservation(
+    sampling_service: FakeSamplingService,
+) -> None:
+    backend = TinkerBackend.from_settings()
+    prompts = [[{"role": "user", "content": "hang"}]]
+    sampling_service.sampling.slow = prompt_ids(prompts[0])
+    sampling_service.sampling.release = anyio.Event()
+
+    shared = SpendGuard(max_usd=None)
+    with anyio.move_on_after(0.1):
+        await backend.sample(None, prompts, base=BASE_MODELS["qwen3-8b"], budget=shared, max_tokens=8, temperature=0.5)
+
+    assert not sampling_service.sampling.finished
+    assert shared.reserved == pytest.approx(0.0)
+    assert shared.spent == pytest.approx(0.0)
+
+
 async def test_score_projects_full_prefill_plus_one_sample_token_per_row(
-    sampling_service: FakeSamplingService, monkeypatch: pytest.MonkeyPatch
+    sampling_service: FakeSamplingService,
 ) -> None:
     seen: dict[str, object] = {}
 
     class RecordingGuard:
-        def __init__(self, *, max_usd: float) -> None:
-            seen["max_usd"] = max_usd
-
         async def check(self, projected: float) -> None:
             seen["checked"] = projected
 
         async def record(self, reserved: float, actual: float) -> None:
             seen["recorded"] = (reserved, actual)
 
-    monkeypatch.setattr(tinker, "SpendGuard", RecordingGuard)
     rows = (
         EvalRow(tokens=(1, 2, 3), weights=(0.0, 0.0, 1.0)),
         EvalRow(tokens=(4, 5), weights=(0.0, 1.0)),
     )
     backend = TinkerBackend.from_settings()
 
-    await backend.score("tinker://run/final", rows, base=BASE_MODELS["qwen3-8b"])
+    await backend.score("tinker://run/final", rows, base=BASE_MODELS["qwen3-8b"], budget=RecordingGuard())
 
     projected = backend.cost(model=TinkerModelId("Qwen/Qwen3-8B"), prefill=5, sample=2)
-    assert seen["max_usd"] == backend.settings.spend_cap_usd
     assert seen["checked"] == pytest.approx(projected)
     assert seen["recorded"] == pytest.approx((projected, projected))
     assert sampling_service.sampling.calls == [row.tokens for row in rows]
@@ -905,7 +1051,9 @@ async def test_score_rejects_an_over_cap_projection_before_creating_a_service_cl
     rows = (EvalRow(tokens=(1, 2, 3), weights=(0.0, 0.0, 1.0)),)
 
     with pytest.raises(SpendExceeded):
-        await TinkerBackend.from_settings().score("tinker://run/final", rows, base=BASE_MODELS["qwen3-8b"], max_usd=0.0)
+        await TinkerBackend.from_settings().score(
+            "tinker://run/final", rows, base=BASE_MODELS["qwen3-8b"], budget=SpendGuard(max_usd=0.0)
+        )
 
     assert service_calls == []
 
@@ -926,7 +1074,13 @@ async def test_sample_preserves_prompt_order_and_seeds_each_prompt_by_index(
     sampling_service.sampling.release = anyio.Event()
 
     sampled = await TinkerBackend.from_settings().sample(
-        "tinker://run/step2", prompts, base=BASE_MODELS["qwen3-8b"], max_tokens=8, temperature=0.7, seed=100
+        "tinker://run/step2",
+        prompts,
+        base=BASE_MODELS["qwen3-8b"],
+        budget=budget(),
+        max_tokens=8,
+        temperature=0.7,
+        seed=100,
     )
 
     assert sampling_service.sampling.finished == [prompt_ids(prompts[1]), prompt_ids(prompts[0])]
@@ -945,7 +1099,7 @@ async def test_sample_leaves_the_seed_unset_when_none_is_given(sampling_service:
     prompts = [[{"role": "user", "content": "hi"}]]
 
     await TinkerBackend.from_settings().sample(
-        "tinker://run/step2", prompts, base=BASE_MODELS["qwen3-8b"], max_tokens=4, temperature=0.5
+        "tinker://run/step2", prompts, base=BASE_MODELS["qwen3-8b"], budget=budget(), max_tokens=4, temperature=0.5
     )
 
     assert [params.seed for _, _, params in sampling_service.sampling.sample_calls] == [None]
@@ -955,7 +1109,7 @@ async def test_sample_with_no_path_routes_to_a_base_model_client(sampling_servic
     prompts = [[{"role": "user", "content": "hi"}]]
 
     await TinkerBackend.from_settings().sample(
-        None, prompts, base=BASE_MODELS["qwen3-8b"], max_tokens=4, temperature=0.5
+        None, prompts, base=BASE_MODELS["qwen3-8b"], budget=budget(), max_tokens=4, temperature=0.5
     )
 
     assert sampling_service.sampling_paths == [None]
@@ -966,7 +1120,7 @@ async def test_sample_with_a_path_routes_to_a_model_path_client(sampling_service
     prompts = [[{"role": "user", "content": "hi"}]]
 
     await TinkerBackend.from_settings().sample(
-        "tinker://run/step2", prompts, base=BASE_MODELS["qwen3-8b"], max_tokens=4, temperature=0.5
+        "tinker://run/step2", prompts, base=BASE_MODELS["qwen3-8b"], budget=budget(), max_tokens=4, temperature=0.5
     )
 
     assert sampling_service.sampling_paths == ["tinker://run/step2"]
@@ -985,28 +1139,24 @@ async def test_sample_rejects_an_over_cap_projection_before_creating_a_service_c
 
     with pytest.raises(SpendExceeded):
         await TinkerBackend.from_settings().sample(
-            None, prompts, base=BASE_MODELS["qwen3-8b"], max_tokens=4, temperature=0.5, max_usd=0.0
+            None, prompts, base=BASE_MODELS["qwen3-8b"], budget=SpendGuard(max_usd=0.0), max_tokens=4, temperature=0.5
         )
 
     assert service_calls == []
 
 
 async def test_sample_records_the_actual_short_output_cost_below_the_projection(
-    sampling_service: FakeSamplingService, monkeypatch: pytest.MonkeyPatch
+    sampling_service: FakeSamplingService,
 ) -> None:
     seen: dict[str, object] = {}
 
     class RecordingGuard:
-        def __init__(self, *, max_usd: float) -> None:
-            seen["max_usd"] = max_usd
-
         async def check(self, projected: float) -> None:
             seen["checked"] = projected
 
         async def record(self, reserved: float, actual: float) -> None:
             seen["recorded"] = (reserved, actual)
 
-    monkeypatch.setattr(tinker, "SpendGuard", RecordingGuard)
     prompts = [[{"role": "user", "content": "one"}], [{"role": "user", "content": "two"}]]
     sampling_service.sampling.generated = {
         prompt_ids(prompts[0]): [ord("A"), ord("B")],
@@ -1014,12 +1164,13 @@ async def test_sample_records_the_actual_short_output_cost_below_the_projection(
     }
     backend = TinkerBackend.from_settings()
 
-    sampled = await backend.sample(None, prompts, base=BASE_MODELS["qwen3-8b"], max_tokens=10, temperature=0.7)
+    sampled = await backend.sample(
+        None, prompts, base=BASE_MODELS["qwen3-8b"], budget=RecordingGuard(), max_tokens=10, temperature=0.7
+    )
 
     model = TinkerModelId("Qwen/Qwen3-8B")
     projected = backend.cost(model=model, prefill=sum(len(prompt_ids(prompt)) for prompt in prompts), sample=20)
     actual = sum(sequence.usd for sequence in sampled)
-    assert seen["max_usd"] == backend.settings.spend_cap_usd
     assert seen["checked"] == pytest.approx(projected)
     assert seen["recorded"] == pytest.approx((projected, actual))
     assert actual < projected
@@ -1032,7 +1183,7 @@ async def test_sample_runs_for_a_hosted_only_base_with_a_tinker_id(sampling_serv
     prompts = [[{"role": "user", "content": "hi"}]]
 
     sampled = await TinkerBackend.from_settings().sample(
-        None, prompts, base=BASE_MODELS["qwen3.5-4b"], max_tokens=4, temperature=0.5
+        None, prompts, base=BASE_MODELS["qwen3.5-4b"], budget=budget(), max_tokens=4, temperature=0.5
     )
 
     assert sampling_service.sampling_base_models == ["Qwen/Qwen3.5-4B"]
@@ -1056,7 +1207,7 @@ def test_tinker_model_refuses_a_base_with_no_tinker_id() -> None:
 async def test_fit_runs_for_a_hosted_only_base_with_a_tinker_id(service: FakeService, tmp_path: Path) -> None:
     request = spec(corpus(tmp_path, method="sft"), base=BASE_MODELS["qwen3.5-4b"])
 
-    report = await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path))
+    report = await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path), budget=budget())
 
     assert service.clients[0].base_model == "Qwen/Qwen3.5-4B"
     assert (report.final.step, len(report.steps)) == (3, 3)
@@ -1065,7 +1216,9 @@ async def test_fit_runs_for_a_hosted_only_base_with_a_tinker_id(service: FakeSer
 async def test_score_runs_for_a_hosted_only_base_with_a_tinker_id(sampling_service: FakeSamplingService) -> None:
     rows = (EvalRow(tokens=(1, 2, 3), weights=(0.0, 1.0, 2.0)),)
 
-    scores = await TinkerBackend.from_settings().score("tinker://run/step2", rows, base=BASE_MODELS["qwen3.5-4b"])
+    scores = await TinkerBackend.from_settings().score(
+        "tinker://run/step2", rows, base=BASE_MODELS["qwen3.5-4b"], budget=budget()
+    )
 
     assert sampling_service.sampling_paths == ["tinker://run/step2"]
     assert len(scores) == 1

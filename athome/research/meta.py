@@ -22,9 +22,13 @@ remaining budget (never the full ``max_usd`` cap), terminal ledger rows record
 true journal-measured actuals overshoot included, and the moment recorded
 actuals reach ``max_total_usd`` the boundary latches refusal of all new work —
 the worst-case breach is bounded by one invocation's overshoot, and the cap is
-never stretched. On start and resume the runner reconciles ``completed`` ledger
-rows against ``retros.jsonl`` and generates catch-up retros for any gap before
-the next proposal round; a catch-up failure aborts as loudly as a live one.
+never stretched. On start and resume the runner first reconciles every open
+reservation to durable actuals — a ``reconciled`` ledger row at
+``max(reserved, journal-measured actual)``, so a crash after the journal write
+but before the terminal row never undercounts an overshoot — then reconciles
+``completed`` ledger rows against ``retros.jsonl`` and generates catch-up retros
+for any gap before the next proposal round; a catch-up failure aborts as loudly
+as a live one.
 Proposer and retro LLM spend is count-bounded (at most
 ``MAX_PROPOSAL_ATTEMPTS`` extract calls plus one retro per round), not measured;
 experiment spend is the precisely-measured cap.
@@ -97,7 +101,9 @@ class CampaignEvent(StrEnum):
     ``TERMINAL`` events release a reservation to actuals, ``FAILURES`` feed the
     consecutive-failure stop, ``RUNS`` consume a candidate-experiment slot
     (and reset the failure streak), and ``LAUNCHED`` events mark a sequence
-    whose launch already began, barring a queue replay.
+    whose launch already began, barring a queue replay. A ``RECONCILED`` row
+    closes a crash-orphaned reservation on resume at ``max(reserved, durable
+    actual)`` — terminal, and (like ``ABORTED``) a run that resets the streak.
     """
 
     PROPOSED = "proposed"
@@ -110,12 +116,13 @@ class CampaignEvent(StrEnum):
     ABORTED = "aborted"
     INFRA_ABORTED = "infra_aborted"
     COMPLETED = "completed"
+    RECONCILED = "reconciled"
     STOPPED = "stopped"
 
-    TERMINAL = nonmember(frozenset({COMPLETED, ABORTED, INFRA_ABORTED, PREFLIGHT_FAILED}))
+    TERMINAL = nonmember(frozenset({COMPLETED, ABORTED, INFRA_ABORTED, PREFLIGHT_FAILED, RECONCILED}))
     FAILURES = nonmember(frozenset({REJECTED, PREFLIGHT_FAILED, INFRA_ABORTED}))
     LAUNCHED = nonmember(frozenset({RESERVED, STARTED, COMPLETED, ABORTED, INFRA_ABORTED, PREFLIGHT_FAILED}))
-    RUNS = nonmember(frozenset({COMPLETED, ABORTED}))
+    RUNS = nonmember(frozenset({COMPLETED, ABORTED, RECONCILED}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,8 +180,10 @@ class Ledger:
     consecutive-failure streak, and open reservations are all derived from the
     JSONL rows on every :meth:`open`, never cached across processes. An
     experiment holding a ``reserved`` row without a terminal release counts its
-    full worst case in the totals, so a crash mid-experiment can only
-    over-reserve, never breach the cap.
+    full worst case in the totals; a durable journal that already overshot that
+    grant would otherwise be undercounted on resume, so :meth:`Campaign.reconcile`
+    closes every open reservation at ``max(reserved, durable actual)`` before any
+    new admission — a crash mid-experiment can only over-count, never breach the cap.
 
     Example:
         >>> ledger = Ledger.open(root / "ledger.jsonl")
@@ -403,12 +412,27 @@ class Campaign:
     retros: RetroJournal
 
     async def run(self) -> CampaignResult:
+        await self.reconcile()
         await self.reconcile_retros()
         match self.policy.mode:
             case "auto":
                 return await self.run_auto()
             case "gated":
                 return await self.run_gated()
+
+    async def reconcile(self) -> None:
+        for seq, reservation in self.ledger.open_reservations().items():
+            spec = ExperimentSpec.load(self.root / EXPERIMENTS_DIR / str(reservation.extra["name"]) / SPEC_NAME)
+            await self.ledger.append(
+                LedgerRow(
+                    seq=seq,
+                    event=CampaignEvent.RECONCILED,
+                    usd=max(reservation.usd, await self.actual_usd(spec)),
+                    wall_s=reservation.wall_s,
+                    reason="reconciled crash-orphaned reservation to durable actuals",
+                    extra={"name": reservation.extra["name"]},
+                )
+            )
 
     async def reconcile_retros(self) -> None:
         durable = {record.experiment for record in self.retros.records()}
@@ -682,11 +706,18 @@ async def run_campaign(
 ) -> CampaignResult:
     """Run campaign rounds under the flock until a boundary halts them.
 
-    On entry, the proposal-process registry is scanned for orphans of a
+    On entry, any surviving ``<experiment>.abort.json`` latch under the journal
+    directory refuses startup before the orphan scan — a latch the inner loop
+    wrote on a settle failure outlives its proposal-process record once the scan
+    marks that record ``accounted``, so the registry alone no longer surfaces it.
+    Then the proposal-process registry is scanned for orphans of a
     harness-level kill: a startup with a live orphan still billing, a
     freshly-dead one (its accounting-abort latch is written and the record
     marked terminal), or a previously-latched orphan whose latch has not been
-    reconciled away refuses to run (:mod:`athome.research.procs`). Then
+    reconciled away refuses to run (:mod:`athome.research.procs`). Then every
+    open reservation is reconciled to durable actuals — a ``reconciled`` ledger
+    row at ``max(reserved, journal-measured actual)`` closes a crash-orphaned
+    grant so a recorded overshoot is never undercounted on resume — after which
     ``completed`` ledger rows missing a durable retro get catch-up
     retros before any proposal round. Each auto-mode round: kill-switch and
     cumulative-cap boundary check (recorded actuals at or over ``max_total_usd``
@@ -724,15 +755,20 @@ async def run_campaign(
     Raises:
         ConcurrentRun: Another live runner holds the campaign lock.
         PoisonedLedger: The ledger on disk is unreadable, malformed, or torn.
-        AccountingIntegrityError: The inner loop latched an accounting abort, or
-            the startup scan found an orphaned proposal process with
-            unreconciled spend.
+        AccountingIntegrityError: The inner loop latched an accounting abort, a
+            surviving ``<experiment>.abort.json`` latch from a prior run remains
+            unreconciled at startup, the startup scan found an orphaned proposal
+            process with unreconciled spend, or an open reservation's experiment
+            journal is poisoned and reconcile refuses to resume rather than
+            undercount it.
         RetroError: A completed experiment's retrospective could not be generated.
     """
     from spawnllm.backends.registry import BACKENDS_BY_NAME
 
     await anyio.Path(root).mkdir(parents=True, exist_ok=True)
     async with experiment_lock(root / LOCK_NAME):
+        if latches := await procs.abort_latches(repo):
+            raise AccountingIntegrityError(procs.latch_refusal(latches))
         registry = procs.ProcessRegistry(root / procs.PROCS_NAME)
         if orphans := [*await procs.scan(registry, repo=repo), *await procs.unreconciled(registry, repo=repo)]:
             raise AccountingIntegrityError(procs.refusal(orphans))

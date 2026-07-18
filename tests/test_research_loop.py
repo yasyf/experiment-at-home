@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
 EXPERIMENT_NAME = "toy"
+WALL_CANCEL_BUDGET_S = 0.6
 
 # Immutable evaluator: metric from train.py to the JSON channel, a LYING 999.0 to stdout.
 SCORE_PY = textwrap.dedent(
@@ -189,6 +190,30 @@ class SlowDriver:
 
     async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         await anyio.sleep(self.delay)
+        (Path(workdir) / "train.py").write_text("LOSS = 0.1\n")
+        return 0.0
+
+    async def recover_cost(self) -> float:
+        return 0.0
+
+    def pending_run(self) -> str | None:
+        return None
+
+    def settle(self) -> None:
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class SlowPreflightDriver:
+    """Burns the whole wall budget inside preflight, then would happily propose a keepable edit."""
+
+    preflight_delay: float
+    label: str = "slow-preflight"
+
+    async def preflight(self) -> None:
+        await anyio.sleep(self.preflight_delay)
+
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
         (Path(workdir) / "train.py").write_text("LOSS = 0.1\n")
         return 0.0
 
@@ -1154,7 +1179,7 @@ async def test_cleanup_epilogue_survives_a_recovery_error_with_a_broken_str(tmp_
 
     with anyio.fail_after(3.0):
         with pytest.raises(BrokenStrRecovery) as excinfo:
-            await run(make_spec(budget=Budget(max_units=1, max_wall_s=0.2)), driver=driver, repo=repo)
+            await run(make_spec(budget=Budget(max_units=1, max_wall_s=WALL_CANCEL_BUDGET_S)), driver=driver, repo=repo)
 
     assert excinfo.value is driver.error
     latch = repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json"
@@ -1227,7 +1252,7 @@ async def test_invalid_recovered_cost_aborts_before_wall_cancel_sidecar(tmp_path
     with anyio.fail_after(3.0):
         with pytest.raises(AccountingIntegrityError):
             await run(
-                make_spec(budget=Budget(max_units=1, max_wall_s=0.2)),
+                make_spec(budget=Budget(max_units=1, max_wall_s=WALL_CANCEL_BUDGET_S)),
                 driver=RecoveryCostDriver(math.nan),
                 repo=repo,
             )
@@ -1264,7 +1289,7 @@ async def test_accounting_abort_restart_preserves_prior_sidecar_spend(tmp_path: 
 
     with anyio.fail_after(3.0):
         result = await run(
-            make_spec(budget=Budget(max_units=1, max_wall_s=0.2)),
+            make_spec(budget=Budget(max_units=1, max_wall_s=WALL_CANCEL_BUDGET_S)),
             driver=RecoveryCostDriver(0.4),
             repo=repo,
         )
@@ -1539,6 +1564,23 @@ async def test_bp3_wall_budget_bounds_work_within_a_unit(tmp_path: Path) -> None
     assert result.kept == 0
 
 
+async def test_preflight_time_counts_against_the_wall_reservation(tmp_path: Path) -> None:
+    # Finding 3: preflight runs inside max_wall_s, so a preflight that alone outlasts the wall
+    # exhausts it and no unit runs — the settled wall never breaches the booked reservation.
+    repo = toy_repo(tmp_path)
+
+    with anyio.fail_after(3.0):
+        started = time.monotonic()
+        result = await run(
+            make_spec(budget=Budget(max_units=1, max_wall_s=0.3)), driver=SlowPreflightDriver(0.6), repo=repo
+        )
+        elapsed = time.monotonic() - started
+
+    assert journal_rows(repo) == []  # preflight burned the wall; no unit may run or be journaled
+    assert result.kept == 0
+    assert elapsed < 0.6  # cut at the wall, not after the full 0.6s preflight plus a bonus unit
+
+
 async def test_recovered_zero_cost_envelope_still_records_an_event(tmp_path: Path) -> None:
     # R3 fix 2: a recovered zero-cost envelope must terminalize with an accounting artifact —
     # a 0.0-cost wall-cancel event — so "terminal implies an artifact" holds for the orphan scan.
@@ -1546,7 +1588,9 @@ async def test_recovered_zero_cost_envelope_still_records_an_event(tmp_path: Pat
     driver = ZeroEnvelopeRecoveryDriver()
 
     with anyio.fail_after(3.0):
-        result = await run(make_spec(budget=Budget(max_units=1, max_wall_s=0.2)), driver=driver, repo=repo)
+        result = await run(
+            make_spec(budget=Budget(max_units=1, max_wall_s=WALL_CANCEL_BUDGET_S)), driver=driver, repo=repo
+        )
 
     assert result.kept == 0 and journal_rows(repo) == []
     [event] = infra_events(repo)
@@ -1562,7 +1606,7 @@ async def test_settle_failure_after_the_durable_write_never_re_records(tmp_path:
     driver = FlakySettleRecoveryDriver(cost=0.6, settle_failures=[1])
 
     with anyio.fail_after(3.0):
-        await run(make_spec(budget=Budget(max_units=1, max_wall_s=0.2)), driver=driver, repo=repo)
+        await run(make_spec(budget=Budget(max_units=1, max_wall_s=WALL_CANCEL_BUDGET_S)), driver=driver, repo=repo)
 
     [event] = infra_events(repo)  # exactly one record for the attempt: no double count
     assert (event["kind"], event["cost"]) == ("wall_cancel", pytest.approx(0.6))
@@ -1577,7 +1621,7 @@ async def test_persistent_settle_failure_latches_without_re_recording(tmp_path: 
 
     with anyio.fail_after(3.0):
         with pytest.raises(AccountingIntegrityError, match="could not be settled"):
-            await run(make_spec(budget=Budget(max_units=1, max_wall_s=0.2)), driver=driver, repo=repo)
+            await run(make_spec(budget=Budget(max_units=1, max_wall_s=WALL_CANCEL_BUDGET_S)), driver=driver, repo=repo)
 
     events = infra_events(repo)
     assert [event["kind"] for event in events] == ["wall_cancel", "accounting_abort"]  # single count, then latch
@@ -2125,7 +2169,7 @@ async def test_wall_cancel_after_proposal_records_cost_for_resume(tmp_path: Path
 
     with anyio.fail_after(3.0):
         result = await run(
-            make_spec(budget=Budget(max_units=1, max_wall_s=0.3)),
+            make_spec(budget=Budget(max_units=1, max_wall_s=WALL_CANCEL_BUDGET_S)),
             driver=HostileDriver(
                 lambda workdir: (workdir / "train.py").write_text("LOSS = 0.5\n# SLOW_SCORE\n"), cost=0.6
             ),
@@ -2164,7 +2208,7 @@ async def test_wall_cancel_during_billed_claude_proposal_recovers_cost_for_resum
         + "\n"
     )
     fake_claude.chmod(0o755)
-    spec = make_spec(budget=Budget(max_units=1, max_wall_s=1.0))
+    spec = make_spec(budget=Budget(max_units=1, max_wall_s=2.0))
 
     with anyio.fail_after(4.0):
         result = await run(

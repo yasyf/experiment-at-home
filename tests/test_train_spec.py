@@ -24,8 +24,10 @@ from athome.train.spec import (
     TinkerSettings,
     TrainSettings,
     TrainSpec,
+    UnservableBase,
     UnsupportedLoraShape,
     lora_keys,
+    require_servable,
     spend_cap,
     std_lora_keys,
 )
@@ -69,6 +71,33 @@ def test_base_models_catalog() -> None:
         serves_locally=True,
     )
     assert BASE_MODELS["qwen3.5-4b"].serves_locally is False
+
+
+@pytest.mark.parametrize("kind", ["Tinker", "Modal"])
+def test_require_servable_passes_a_locally_servable_base(kind: str) -> None:
+    assert require_servable(BASE_MODELS["qwen3-8b"], kind=kind) is None
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        pytest.param(
+            "Tinker",
+            "mlx-community/Qwen3.5-4B-4bit has no mlx-lm LoRA counterpart, so a Tinker adapter cannot be fused into it",
+            id="tinker-wording",
+        ),
+        pytest.param(
+            "Modal",
+            "mlx-community/Qwen3.5-4B-4bit has no mlx-lm LoRA counterpart, so a Modal adapter cannot be fused into it",
+            id="modal-wording",
+        ),
+    ],
+)
+def test_require_servable_refuses_a_non_servable_base_with_the_backend_named(kind: str, expected: str) -> None:
+    """The one chokepoint the five fuse paths share reproduces each site's message byte-for-byte."""
+    with pytest.raises(UnservableBase) as exc:
+        require_servable(BASE_MODELS["qwen3.5-4b"], kind=kind)
+    assert str(exc.value) == expected
 
 
 def test_every_base_pins_both_repos_to_a_commit() -> None:

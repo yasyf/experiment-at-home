@@ -13,6 +13,7 @@ import anyio
 
 from athome import registry
 from athome.config import load
+from athome.llm.spend import InvalidBudget, SpendExceeded, SpendGuard
 from athome.registry import VersionInfo
 from athome.train.backend import NoBackendAvailable, TrainBackend, backends, select
 from athome.train.data import (
@@ -27,6 +28,7 @@ from athome.train.data import (
     render_tinker_sft,
     render_trl,
 )
+from athome.train.observe import ObserveOutcome, observe
 from athome.train.preflight import PreflightFailure, PreflightReport, preflight
 from athome.train.retrain import RetrainOutcome, retrain
 from athome.train.spec import (
@@ -65,6 +67,7 @@ from athome.train.spec import (
     spend_cap,
     std_lora_keys,
 )
+from athome.train.tinker import TinkerBackend
 
 if TYPE_CHECKING:
     from collections.abc import Mapping

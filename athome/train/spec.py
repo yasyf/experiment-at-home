@@ -41,6 +41,25 @@ class UnservableBase(AthomeError):
     """Raised when the spec's base model cannot produce a servable fused MLX artifact."""
 
 
+def require_servable(base: BaseModelSpec, *, kind: str) -> None:
+    """Refuse a base with no mlx-lm counterpart, in the one place every fuse path shares.
+
+    Every backend converges on a fused mlx-lm model, so a base that cannot load into mlx-lm
+    is unservable everywhere; the Tinker and Modal fuse paths funnel their identical precheck
+    through here instead of each copy-pasting it.
+
+    Args:
+        base: The base model the run would fuse an adapter into.
+        kind: The backend named in the refusal — ``"Tinker"`` or ``"Modal"``.
+
+    Raises:
+        UnservableBase: ``base.serves_locally`` is False, so the LoRA has no mlx-lm
+            counterpart to fuse into.
+    """
+    if not base.serves_locally:
+        raise UnservableBase(f"{base.mlx} has no mlx-lm LoRA counterpart, so a {kind} adapter cannot be fused into it")
+
+
 class UnsupportedLoraShape(AthomeError):
     """Raised when a :class:`LoraSpec` asks for an adapter the MLX fuse path cannot express."""
 

@@ -46,9 +46,13 @@ async def repo_root(spec_path: Path) -> Path:
     return Path((await run_git(spec_path.resolve().parent, "rev-parse", "--show-toplevel")).strip())
 
 
-async def journal_path(repo: Path, name: str) -> Path:
+async def journal_dir(repo: Path) -> Path:
     common = Path((await run_git(repo, "rev-parse", "--git-common-dir")).strip())
-    return (common if common.is_absolute() else repo / common) / "athome" / f"{name}.jsonl"
+    return (common if common.is_absolute() else repo / common) / "athome"
+
+
+async def journal_path(repo: Path, name: str) -> Path:
+    return await journal_dir(repo) / f"{name}.jsonl"
 
 
 async def install(

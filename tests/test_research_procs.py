@@ -328,7 +328,8 @@ async def test_run_campaign_refuses_startup_until_the_orphan_latch_is_reconciled
     latch = await procs.abort_latch(repo, "001-round1")
     assert latch.exists()
 
-    with pytest.raises(AccountingIntegrityError, match="latched"):  # the latch still refuses the next startup
+    # The surviving latch refuses the next startup ahead of the orphan scan (procs.abort_latches).
+    with pytest.raises(AccountingIntegrityError, match="unreconciled accounting-abort latch"):
         await meta.run_campaign(
             make_campaign_policy(), repo=repo, root=root, backend=backend, driver_factory=forbidden_factory
         )

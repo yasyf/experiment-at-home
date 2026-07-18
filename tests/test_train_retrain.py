@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from athome.llm.spend import SpendGuard
 from athome.train.gate import GateVerdict
 from athome.train.retrain import RetrainOutcome, retrain
 from athome.train.spec import (
@@ -24,6 +25,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
 TRAIN_COST_USD = 1.25
+BUDGET_CAP_USD = 100.0
+FIT_PROJECTED_USD = 3.0
 CHECKPOINTS: tuple[SavedCheckpoint, ...] = (
     SavedCheckpoint(step=3, path="tinker://run/3", final=False, scores=None),
     SavedCheckpoint(step=6, path="tinker://run/6", final=False, scores=None),
@@ -51,6 +54,7 @@ class FakeAdapter:
 class FitCall:
     spec: TrainSpec
     sink: object
+    budget: SpendGuard
     checkpoints: CheckpointPolicy
     eval_rows: object
 
@@ -82,11 +86,14 @@ class ScriptedBackend:
         spec: TrainSpec,
         *,
         sink: object,
+        budget: SpendGuard,
         checkpoints: CheckpointPolicy,
         eval_rows: Sequence[EvalRow] | None,
     ) -> TrainReport:
         self.calls.append("fit")
-        self.fit_calls.append(FitCall(spec, sink, checkpoints, eval_rows))
+        self.fit_calls.append(FitCall(spec, sink, budget, checkpoints, eval_rows))
+        await budget.check(FIT_PROJECTED_USD)
+        await budget.record(FIT_PROJECTED_USD, self.report.train_cost_usd)
         return self.report
 
     async def materialize(self, saved: SavedCheckpoint, spec: TrainSpec, *, work_dir: Path, cost: float) -> FakeAdapter:
@@ -135,6 +142,10 @@ def backend() -> ScriptedBackend:
     return ScriptedBackend(report=report(), adapter=adapter())
 
 
+def guard() -> SpendGuard:
+    return SpendGuard(max_usd=BUDGET_CAP_USD)
+
+
 def by_step_select(scores: dict[int, float] = SELECT_SCORES) -> Callable[[SavedCheckpoint], float]:
     return lambda saved: scores[saved.step]
 
@@ -142,6 +153,7 @@ def by_step_select(scores: dict[int, float] = SELECT_SCORES) -> Callable[[SavedC
 async def run(
     *,
     be: ScriptedBackend,
+    budget: SpendGuard | None = None,
     select: Callable[[SavedCheckpoint], float] | None = None,
     artifact_scorer: Callable[[FakeAdapter], dict[str, float]] | None = None,
     gate: Callable[[dict[str, float]], GateVerdict] | None = None,
@@ -153,6 +165,7 @@ async def run(
         spec(),
         checkpoints=CHECKPOINT_POLICY,
         eval_rows=EVAL_ROWS,
+        budget=budget or guard(),
         select=select or by_step_select(),
         artifact_scorer=artifact_scorer or (lambda _adapter: SERVED),
         gate=gate or (lambda _served: VERDICT),
@@ -161,14 +174,15 @@ async def run(
     )
 
 
-async def test_fit_receives_spec_sink_checkpoints_and_eval_rows_verbatim(tmp_path: Path) -> None:
-    be, sink, train_spec = backend(), object(), spec()
+async def test_fit_receives_spec_sink_budget_checkpoints_and_eval_rows_verbatim(tmp_path: Path) -> None:
+    be, sink, train_spec, envelope = backend(), object(), spec(), guard()
 
     await retrain(
         be,  # type: ignore[arg-type]
         train_spec,
         checkpoints=CHECKPOINT_POLICY,
         eval_rows=EVAL_ROWS,
+        budget=envelope,
         select=by_step_select(),
         artifact_scorer=lambda _adapter: SERVED,
         gate=lambda _served: VERDICT,
@@ -179,6 +193,7 @@ async def test_fit_receives_spec_sink_checkpoints_and_eval_rows_verbatim(tmp_pat
     [call] = be.fit_calls
     assert call.spec is train_spec
     assert call.sink is sink
+    assert call.budget is envelope
     assert call.checkpoints is CHECKPOINT_POLICY
     assert call.eval_rows is EVAL_ROWS
 
@@ -219,6 +234,7 @@ async def test_materialize_receives_best_spec_work_dir_and_report_cost(tmp_path:
         train_spec,
         checkpoints=CHECKPOINT_POLICY,
         eval_rows=EVAL_ROWS,
+        budget=guard(),
         select=by_step_select(),
         artifact_scorer=lambda _adapter: SERVED,
         gate=lambda _served: VERDICT,
@@ -272,6 +288,7 @@ async def test_retrain_refuses_a_hosted_only_base_before_any_billable_call(tmp_p
             replace(spec(), base=BASE_MODELS["qwen3.5-4b"]),
             checkpoints=CHECKPOINT_POLICY,
             eval_rows=EVAL_ROWS,
+            budget=guard(),
             select=by_step_select(),
             artifact_scorer=lambda _adapter: SERVED,
             gate=lambda _served: VERDICT,
@@ -301,3 +318,14 @@ async def test_retrain_outcome_field_integrity(tmp_path: Path) -> None:
     assert outcome.adapter is be.adapter
     assert outcome.served is SERVED
     assert outcome.verdict is VERDICT
+
+
+async def test_retrain_bills_fit_against_the_callers_guard(tmp_path: Path) -> None:
+    be, envelope = backend(), SpendGuard(max_usd=5.0)
+
+    await run(be=be, budget=envelope, sink=object(), work_dir=tmp_path)
+
+    [call] = be.fit_calls
+    assert call.budget is envelope
+    assert envelope.reserved == 0.0
+    assert envelope.spent == TRAIN_COST_USD

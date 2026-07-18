@@ -176,7 +176,7 @@ async def test_report_counts_accounting_aborts_from_the_sidecar(tmp_path: Path) 
 
 async def test_report_excludes_wall_cancel_from_retries_but_keeps_its_cost(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path)
-    spec = make_spec(Budget(max_units=1, max_wall_s=0.3))
+    spec = make_spec(Budget(max_units=1, max_wall_s=0.6))
 
     with anyio.fail_after(3.0):
         result = await run(

@@ -10,7 +10,7 @@ from time import perf_counter
 from typing import TYPE_CHECKING, ClassVar
 
 import httpx
-from anyio import to_thread
+from anyio import CancelScope, to_thread
 
 from athome.concurrency import gather_bounded
 from athome.config import load
@@ -46,6 +46,7 @@ from athome.train.spec import (
     UnservableBase,
     UnsupportedLoraShape,
     lora_keys,
+    require_servable,
     spend_cap,
     std_lora_keys,
 )
@@ -281,8 +282,26 @@ def assemble(
     return tuple(ops), meta
 
 
+@dataclass(slots=True)
+class Reservation:
+    guard: SpendGuard
+    outstanding: float = 0.0
+
+    async def reserve(self, projected: float) -> None:
+        await self.guard.check(projected)
+        self.outstanding += projected
+
+    async def reconcile(self, amount: float) -> None:
+        await self.guard.record(amount, amount)
+        self.outstanding -= amount
+
+    async def release(self) -> None:
+        await self.guard.release(self.outstanding)
+        self.outstanding = 0.0
+
+
 async def reference_pass(
-    frozen: tinker.TrainingClient, datums: Sequence[tinker.Datum], *, guard: SpendGuard, price: TinkerPrice
+    frozen: tinker.TrainingClient, datums: Sequence[tinker.Datum], *, reservation: Reservation, price: TinkerPrice
 ) -> list[tuple[float, float]]:
     """The frozen policy's chosen/rejected sequence logprobs, scored on the batched scorer.
 
@@ -291,7 +310,7 @@ async def reference_pass(
     """
     [scored] = [result async for result in execute(frozen, (ScoreOp(tuple(datums)),))]
     spent = price.prefill * token_count(datums) / 1e6
-    await guard.record(spent, spent)
+    await reservation.reconcile(spent)
     scores = [sequence_logprob(output, datum) for output, datum in zip(scored.outputs, datums, strict=True)]
     return list(zip(scores[0::2], scores[1::2], strict=True))
 
@@ -303,7 +322,7 @@ async def run_schedule(
     meta: Sequence[tuple[int, bool]],
     dropped: int,
     *,
-    guard: SpendGuard,
+    reservation: Reservation,
     price: TinkerPrice,
     sink: RunSink,
     eval_datums: Sequence[tinker.Datum],
@@ -322,18 +341,19 @@ async def run_schedule(
             case TrainDone(op=op, output=output):
                 tokens = token_count(op.datums)
                 cost = price.train * tokens * op.loss.passes / 1e6
-                await guard.record(cost, cost)
+                await reservation.reconcile(cost)
                 metrics = step_metrics(op.loss, output, op.datums)
                 step = len(records) + 1
                 await sink.append(
-                    {"step": step, "method": spec.method, "tokens": tokens, "cost_usd": guard.spent} | metrics
+                    {"step": step, "method": spec.method, "tokens": tokens, "cost_usd": reservation.guard.spent}
+                    | metrics
                 )
                 records.append(StepRecord(step, tokens, cost, metrics))
             case SnapshotDone(op=op, path=path, outputs=outputs):
                 step, final = next(snapshots)
                 if outputs is not None:
                     eval_cost = price.prefill * token_count(op.eval) / 1e6
-                    await guard.record(eval_cost, eval_cost)
+                    await reservation.reconcile(eval_cost)
                 scores = reduce_eval(outputs, eval_datums) if outputs is not None else None
                 saved.append(SavedCheckpoint(step=step, path=path, final=final, scores=scores))
                 await sink.append({"event": "checkpoint", "step": step, "path": path, "final": final})
@@ -343,7 +363,7 @@ async def run_schedule(
         checkpoints=tuple(saved),
         dropped=dropped,
         wall_s=perf_counter() - start,
-        train_cost_usd=guard.spent,
+        train_cost_usd=reservation.guard.spent,
     )
 
 
@@ -460,6 +480,7 @@ class TinkerBackend:
         spec: TrainSpec,
         *,
         sink: RunSink,
+        budget: SpendGuard,
         checkpoints: CheckpointPolicy = CheckpointPolicy(),
         eval_rows: Sequence[EvalRow] | None = None,
     ) -> TrainReport:
@@ -467,12 +488,14 @@ class TinkerBackend:
 
         The pool is rendered and under-filled runs aborted before anything billable; the whole
         schedule — training, the DPO reference pass, and every checkpoint's eval scoring — is
-        projected against the spend cap in one reservation. The stream then runs, spend and the
+        projected against ``budget`` in one reservation. The stream then runs, spend and the
         journal reconciling at each drain point.
 
         Args:
-            spec: The fine-tuning request: base, dataset, hyperparams, method, LoRA, spend cap.
+            spec: The fine-tuning request: base, dataset, hyperparams, method, LoRA.
             sink: The run journal; one record lands per step, plus a checkpoint event per save.
+            budget: The spend envelope; the whole schedule's projected cost is reserved against it
+                before the first billable call and reconciled to actuals as the run drains.
             checkpoints: Which fractions of the run to snapshot as intermediates; the final step
                 is always snapshotted and kept forever.
             eval_rows: Pre-tokenized rows scored against every checkpoint's weights, or None.
@@ -498,19 +521,46 @@ class TinkerBackend:
         if overlong := sum(not fits(datum, spec.hyperparams.max_seq_len) for datum in eval_datums):
             raise OverlongEvalRows(overlong, spec.hyperparams.max_seq_len)
 
-        guard = SpendGuard(max_usd=spend_cap(spec, self.settings.spend_cap_usd))
-        match spec.method:
-            case "sft":
-                schedule, meta, dropped, client = await self.prepare_sft(
-                    spec, model=model, checkpoints=checkpoints, eval_datums=eval_datums, guard=guard, price=price
-                )
-            case "dpo":
-                schedule, meta, dropped, client = await self.prepare_dpo(
-                    spec, model=model, checkpoints=checkpoints, eval_datums=eval_datums, guard=guard, price=price
-                )
-        return await run_schedule(
-            spec, client, schedule, meta, dropped, guard=guard, price=price, sink=sink, eval_datums=eval_datums
-        )
+        reservation = Reservation(budget)
+        settled = False
+        try:
+            match spec.method:
+                case "sft":
+                    schedule, meta, dropped, client = await self.prepare_sft(
+                        spec,
+                        model=model,
+                        checkpoints=checkpoints,
+                        eval_datums=eval_datums,
+                        reservation=reservation,
+                        price=price,
+                    )
+                case "dpo":
+                    schedule, meta, dropped, client = await self.prepare_dpo(
+                        spec,
+                        model=model,
+                        checkpoints=checkpoints,
+                        eval_datums=eval_datums,
+                        reservation=reservation,
+                        price=price,
+                    )
+            report = await run_schedule(
+                spec,
+                client,
+                schedule,
+                meta,
+                dropped,
+                reservation=reservation,
+                price=price,
+                sink=sink,
+                eval_datums=eval_datums,
+            )
+            settled = True
+            return report
+        finally:
+            if not settled:
+                # Shield so a cancellation delivered mid-release cannot abort it and strand the reservation.
+                with CancelScope(shield=True):
+                    await reservation.release()
 
     async def prepare_sft(
         self,
@@ -519,7 +569,7 @@ class TinkerBackend:
         model: TinkerModelId,
         checkpoints: CheckpointPolicy,
         eval_datums: tuple[tinker.Datum, ...],
-        guard: SpendGuard,
+        reservation: Reservation,
         price: TinkerPrice,
     ) -> tuple[tuple[Op, ...], list[tuple[int, bool]], int, tinker.TrainingClient]:
         examples = await data.normalize(spec.dataset, method="sft")
@@ -534,7 +584,7 @@ class TinkerBackend:
         schedule, meta = assemble(
             spec, [(batch, CrossEntropy()) for batch in plan], checkpoints=checkpoints, eval_datums=eval_datums
         )
-        await guard.check(projection(schedule, price))
+        await reservation.reserve(projection(schedule, price))
         client = await self.lora_client(self.service(), spec, model=model)
         return schedule, meta, len(examples) - len(pool), client
 
@@ -545,7 +595,7 @@ class TinkerBackend:
         model: TinkerModelId,
         checkpoints: CheckpointPolicy,
         eval_datums: tuple[tinker.Datum, ...],
-        guard: SpendGuard,
+        reservation: Reservation,
         price: TinkerPrice,
     ) -> tuple[tuple[Op, ...], list[tuple[int, bool]], int, tinker.TrainingClient]:
         examples = await data.normalize(spec.dataset, method="dpo")
@@ -568,11 +618,11 @@ class TinkerBackend:
             checkpoints=checkpoints,
             eval_datums=eval_datums,
         )
-        await guard.check(projection(shape, price) + price.prefill * token_count(reference_datums) / 1e6)
+        await reservation.reserve(projection(shape, price) + price.prefill * token_count(reference_datums) / 1e6)
 
         service = self.service()
         reference = await reference_pass(
-            await self.lora_client(service, spec, model=model), reference_datums, guard=guard, price=price
+            await self.lora_client(service, spec, model=model), reference_datums, reservation=reservation, price=price
         )
         client = await self.lora_client(service, spec, model=model)
         schedule, _ = assemble(
@@ -607,11 +657,9 @@ class TinkerBackend:
             InsufficientData: The surviving pool is smaller than one batch.
             SpendExceeded: The projected run cost crosses the spend cap.
         """
-        if not spec.base.serves_locally:
-            raise UnservableBase(
-                f"{spec.base.mlx} has no mlx-lm LoRA counterpart, so a Tinker adapter cannot be fused into it"
-            )
-        report = await self.fit(spec, sink=sink)
+        require_servable(spec.base, kind="Tinker")
+        budget = SpendGuard(max_usd=spend_cap(spec, self.settings.spend_cap_usd))
+        report = await self.fit(spec, sink=sink, budget=budget)
         adapter = await self.materialize(report.final, spec, work_dir=work_dir, cost=report.train_cost_usd)
         return await self.fuse(adapter, spec, work_dir=work_dir)
 
@@ -659,7 +707,7 @@ class TinkerBackend:
         rows: Sequence[EvalRow],
         *,
         base: BaseModelSpec,
-        max_usd: float | None = None,
+        budget: SpendGuard,
     ) -> tuple[ScoredSequence, ...]:
         """Score weighted token sequences against a saved Tinker sampling checkpoint.
 
@@ -667,14 +715,15 @@ class TinkerBackend:
             path: The opaque ``tinker://`` sampler checkpoint path.
             rows: Pre-tokenized weighted rows to score, in return order.
             base: The base model identity used to price the sampling requests.
-            max_usd: The scoring spend cap, or None for the configured Tinker cap.
+            budget: The spend envelope; the projected prefill and one sampled token per row are
+                reserved against it before any client exists, then reconciled once the rows score.
 
         Returns:
             One weighted sequence score per row, preserving input order.
 
         Raises:
             UnservableBase: The base has no Tinker identity.
-            SpendExceeded: The projected prefill and one sampled token per row cross the cap.
+            SpendExceeded: The projected prefill and one sampled token per row cross the envelope.
         """
         import tinker
 
@@ -684,22 +733,29 @@ class TinkerBackend:
             prefill=sum(len(row.tokens) for row in rows),
             sample=len(rows),
         )
-        guard = SpendGuard(max_usd=self.settings.spend_cap_usd if max_usd is None else max_usd)
-        await guard.check(projected)
-        client = await self.service().create_sampling_client_async(model_path=path)
-        prompts = [tinker.ModelInput.from_ints(list(row.tokens)) for row in rows]
-        outputs = await gather_bounded(
-            [partial(client.compute_logprobs_async, prompt) for prompt in prompts],
-            concurrency=64,
-        )
-        await guard.record(projected, projected)
-        return tuple(
-            score_sequence(
-                tuple(logprob for logprob in output[1:] if logprob is not None),
-                row.weights[1:],
+        await budget.check(projected)
+        settled = False
+        try:
+            client = await self.service().create_sampling_client_async(model_path=path)
+            prompts = [tinker.ModelInput.from_ints(list(row.tokens)) for row in rows]
+            outputs = await gather_bounded(
+                [partial(client.compute_logprobs_async, prompt) for prompt in prompts],
+                concurrency=64,
             )
-            for output, row in zip(outputs, rows, strict=True)
-        )
+            await budget.record(projected, projected)
+            settled = True
+            return tuple(
+                score_sequence(
+                    tuple(logprob for logprob in output[1:] if logprob is not None),
+                    row.weights[1:],
+                )
+                for output, row in zip(outputs, rows, strict=True)
+            )
+        finally:
+            if not settled:
+                # Shield so a cancellation delivered mid-release cannot abort it and strand the reservation.
+                with CancelScope(shield=True):
+                    await budget.release(projected)
 
     async def sample(
         self,
@@ -707,18 +763,18 @@ class TinkerBackend:
         prompts: Sequence[Sequence[Message]],
         *,
         base: BaseModelSpec,
+        budget: SpendGuard,
         max_tokens: int,
         temperature: float,
         seed: int | None = None,
-        max_usd: float | None = None,
     ) -> tuple[SampledSequence, ...]:
         """Sample free-form completions from a Tinker checkpoint, or the base model when ``path`` is None.
 
         Every prompt is rendered with the base's training chat template and a generation prompt, so a
         sample matches what the policy was trained to continue. The whole batch is projected against
-        the spend cap in one conservative reservation — full prefill plus ``max_tokens`` per prompt —
+        ``budget`` in one conservative reservation — full prefill plus ``max_tokens`` per prompt —
         before any sampling client exists, then reconciled to the real generated token counts, so a
-        batch that cannot fit the cap aborts having spent nothing and a short generation bills less.
+        batch that cannot fit the envelope aborts having spent nothing and a short generation bills less.
 
         Args:
             path: The opaque ``tinker://`` sampler checkpoint to sample from, or None to sample the
@@ -726,11 +782,12 @@ class TinkerBackend:
             prompts: The chat prompts to complete, one completion returned per prompt, in input order.
             base: The base model identity: its chat template tokenizes the prompts and its price sheet
                 bills the run, and, when ``path`` is None, its Tinker id is the model sampled.
+            budget: The spend envelope; the conservative full-prefill-plus-``max_tokens`` projection is
+                reserved against it before any client exists, then reconciled to the real generated cost.
             max_tokens: The generation cap per prompt; also the per-prompt sample count the projection reserves.
             temperature: The sampling temperature applied to every prompt.
             seed: The base seed; prompt ``i`` samples with ``seed + i`` for reproducibility, or None to
                 leave every prompt unseeded.
-            max_usd: The sampling spend cap, or None for the configured Tinker cap.
 
         Returns:
             One sampled sequence per prompt, preserving input order, each with its decoded text, token
@@ -738,7 +795,7 @@ class TinkerBackend:
 
         Raises:
             UnservableBase: The base has no Tinker identity.
-            SpendExceeded: The projected prefill and ``max_tokens`` per prompt cross the cap.
+            SpendExceeded: The projected prefill and ``max_tokens`` per prompt cross the envelope.
         """
         import tinker
 
@@ -750,38 +807,45 @@ class TinkerBackend:
             prefill=sum(len(ids) for ids in prompt_ids),
             sample=max_tokens * len(prompts),
         )
-        guard = SpendGuard(max_usd=self.settings.spend_cap_usd if max_usd is None else max_usd)
-        await guard.check(projected)
-        client = await (
-            self.service().create_sampling_client_async(base_model=model)
-            if path is None
-            else self.service().create_sampling_client_async(model_path=path)
-        )
-        responses = await gather_bounded(
-            [
-                partial(
-                    client.sample_async,
-                    tinker.ModelInput.from_ints(ids),
-                    1,
-                    tinker.SamplingParams(
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        seed=None if seed is None else seed + index,
-                    ),
-                )
-                for index, ids in enumerate(prompt_ids)
-            ],
-            concurrency=64,
-        )
-        sampled = tuple(
-            SampledSequence(
-                text=tok.decode(sequence.tokens),
-                prompt_tokens=len(ids),
-                sampled_tokens=len(sequence.tokens),
-                usd=self.cost(model=model, prefill=len(ids), sample=len(sequence.tokens)),
+        await budget.check(projected)
+        settled = False
+        try:
+            client = await (
+                self.service().create_sampling_client_async(base_model=model)
+                if path is None
+                else self.service().create_sampling_client_async(model_path=path)
             )
-            for ids, response in zip(prompt_ids, responses, strict=True)
-            for sequence in (response.sequences[0],)
-        )
-        await guard.record(projected, sum(sequence.usd for sequence in sampled))
-        return sampled
+            responses = await gather_bounded(
+                [
+                    partial(
+                        client.sample_async,
+                        tinker.ModelInput.from_ints(ids),
+                        1,
+                        tinker.SamplingParams(
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            seed=None if seed is None else seed + index,
+                        ),
+                    )
+                    for index, ids in enumerate(prompt_ids)
+                ],
+                concurrency=64,
+            )
+            sampled = tuple(
+                SampledSequence(
+                    text=tok.decode(sequence.tokens),
+                    prompt_tokens=len(ids),
+                    sampled_tokens=len(sequence.tokens),
+                    usd=self.cost(model=model, prefill=len(ids), sample=len(sequence.tokens)),
+                )
+                for ids, response in zip(prompt_ids, responses, strict=True)
+                for sequence in (response.sequences[0],)
+            )
+            await budget.record(projected, sum(sequence.usd for sequence in sampled))
+            settled = True
+            return sampled
+        finally:
+            if not settled:
+                # Shield so a cancellation delivered mid-release cannot abort it and strand the reservation.
+                with CancelScope(shield=True):
+                    await budget.release(projected)

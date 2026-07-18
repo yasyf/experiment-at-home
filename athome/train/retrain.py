@@ -3,12 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from athome.train.spec import UnservableBase
+from athome.train.spec import require_servable
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
     from pathlib import Path
 
+    from athome.llm.spend import SpendGuard
     from athome.progress import RunSink
     from athome.train.gate import GateVerdict
     from athome.train.spec import (
@@ -50,6 +51,7 @@ async def retrain(
     *,
     checkpoints: CheckpointPolicy,
     eval_rows: Sequence[EvalRow] | None,
+    budget: SpendGuard,
     select: Callable[[SavedCheckpoint], float],
     artifact_scorer: Callable[[Adapter], dict[str, float]],
     gate: Callable[[dict[str, float]], GateVerdict],
@@ -71,6 +73,10 @@ async def retrain(
         spec: The fine-tuning request forwarded to ``fit`` and ``materialize``.
         checkpoints: Which fractions of the run to snapshot, passed straight to ``fit``.
         eval_rows: Pre-tokenized rows scored against every checkpoint's weights, or None.
+        budget: The spend envelope threaded verbatim into ``fit``; the training schedule's projected
+            cost reserves against it before the first billable call and reconciles to actuals as the
+            run drains. ``retrain`` mints no envelope of its own, so this caller-owned cap is the one
+            ledger every billable call in the run debits.
         select: Scores one checkpoint; ``retrain`` materializes the argmax over
             ``report.checkpoints``. A raising ``select`` propagates and fails the run.
         artifact_scorer: Reads scores off the materialized adapter, synchronously and locally.
@@ -86,11 +92,8 @@ async def retrain(
         UnservableBase: The base has no mlx-lm LoRA counterpart to materialize into, so the run
             would bill a full hosted fit only to refuse at ``materialize``; it aborts before ``fit``.
     """
-    if not spec.base.serves_locally:
-        raise UnservableBase(
-            f"{spec.base.mlx} has no mlx-lm LoRA counterpart, so a Tinker adapter cannot be fused into it"
-        )
-    report = await backend.fit(spec, sink=sink, checkpoints=checkpoints, eval_rows=eval_rows)
+    require_servable(spec.base, kind="Tinker")
+    report = await backend.fit(spec, sink=sink, budget=budget, checkpoints=checkpoints, eval_rows=eval_rows)
     best = max(report.checkpoints, key=select)
     adapter = await backend.materialize(best, spec, work_dir=work_dir, cost=report.train_cost_usd)
     served = artifact_scorer(adapter)
