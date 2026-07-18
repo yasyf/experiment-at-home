@@ -6,10 +6,12 @@ from pathlib import Path
 import anyio
 import click
 
-from athome import launchd
+from athome import config, launchd
 from athome.cli import coro, emit, json_option
-from athome.research import loop, nightly, watchdog
+from athome.research import loop, meta, nightly, watchdog
 from athome.research.driver import ClaudeCodeDriver
+from athome.research.meta import MetaSettings
+from athome.research.policy import ProposalPolicy
 from athome.research.spec import ExperimentSpec
 
 INIT_TEMPLATE = """\
@@ -160,3 +162,108 @@ async def nightly_install_command(
 async def nightly_install_watch_command(spec_path: Path, *, as_json: bool) -> None:
     """Install a launchd agent checking SPEC_PATH's quiet alarm every ten minutes."""
     emit({"installed": str(await watchdog.install(spec_path))}, as_json=as_json)
+
+
+policy_argument = click.argument("policy_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+root_option = click.option(
+    "--root",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="The campaign state root (default: the [research.meta] settings root).",
+)
+
+
+def meta_root(root: Path | None) -> Path:
+    return root.resolve() if root is not None else config.load(MetaSettings).root
+
+
+@cli.group("meta")
+def meta_group() -> None:
+    """Run the autonomous campaign outer loop."""
+
+
+@meta_group.command("run")
+@policy_argument
+@repo_option
+@root_option
+@click.option("--backend", default=None, help="spawnllm backend registry name (default: settings).")
+@click.option("--tier", default=None, help="Abstract spawnllm model tier (default: settings).")
+@mirror_cc_notes_option
+@json_option
+@coro
+async def meta_run_command(
+    policy_path: Path,
+    repo: Path | None,
+    root: Path | None,
+    backend: str | None,
+    tier: str | None,
+    *,
+    mirror_cc_notes: bool,
+    as_json: bool,
+) -> None:
+    """Run POLICY_PATH's campaign rounds until a boundary halts them."""
+    settings = config.load(MetaSettings)
+    result = await meta.run_campaign(
+        ProposalPolicy.load(policy_path),
+        repo=await resolve_repo(policy_path, repo),
+        root=meta_root(root),
+        backend=backend or settings.backend,
+        tier=tier or settings.tier,
+        mirror_cc_notes=mirror_cc_notes,
+    )
+    emit({"completed": result.completed, "total_usd": result.total_usd, "halted": result.halted}, as_json=as_json)
+
+
+@meta_group.command("stop")
+@root_option
+@click.option("--reason", default="operator stop", show_default=True, help="Recorded in the stop file and ledger.")
+@json_option
+@coro
+async def meta_stop_command(root: Path | None, reason: str, *, as_json: bool) -> None:
+    """Arm the kill switch: the runner halts at the next experiment boundary."""
+    emit({"stop": str(await meta.request_stop(meta_root(root), reason=reason))}, as_json=as_json)
+
+
+@meta_group.command("report")
+@root_option
+@json_option
+@coro
+async def meta_report_command(root: Path | None, *, as_json: bool) -> None:
+    """Summarize the campaign ledger: totals, event counts, and the kill-switch state."""
+    emit(await meta.campaign_report(meta_root(root)), as_json=as_json)
+
+
+@meta_group.command("approve")
+@click.argument("seq", type=int)
+@root_option
+@json_option
+@coro
+async def meta_approve_command(seq: int, root: Path | None, *, as_json: bool) -> None:
+    """Digest-verify pending experiment SEQ and move it into the run queue."""
+    emit({"queued": str(await meta.approve(meta_root(root), seq))}, as_json=as_json)
+
+
+@meta_group.command("reject")
+@click.argument("seq", type=int)
+@click.option("--reason", required=True, help="Why the operator refused the proposal.")
+@root_option
+@json_option
+@coro
+async def meta_reject_command(seq: int, reason: str, root: Path | None, *, as_json: bool) -> None:
+    """Remove pending experiment SEQ and ledger why it was refused."""
+    await meta.reject(meta_root(root), seq, reason=reason)
+    emit({"rejected": seq, "reason": reason}, as_json=as_json)
+
+
+@meta_group.command("install")
+@policy_argument
+@click.option("--hour", type=int, default=2, show_default=True, help="Local hour the agent fires.")
+@click.option("--minute", type=int, default=0, show_default=True, help="Minute the agent fires.")
+@json_option
+@coro
+async def meta_install_command(policy_path: Path, hour: int, minute: int, *, as_json: bool) -> None:
+    """Install a launchd agent running POLICY_PATH's campaign overnight."""
+    emit(
+        {"installed": str(await meta.install(policy_path, calendar=launchd.Calendar(hour=hour, minute=minute)))},
+        as_json=as_json,
+    )
