@@ -185,7 +185,7 @@ class ExperimentSpec:
         Raises:
             UnknownSpecField: the TOML carries a field the spec or its budget does not declare.
         """
-        return cls.loads(path.read_text(), source=str(path))
+        return cls.loads(path.read_text(encoding="utf-8"), source=str(path))
 
 
 @dataclass(frozen=True, slots=True)
