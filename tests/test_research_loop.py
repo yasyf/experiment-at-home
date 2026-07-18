@@ -275,6 +275,35 @@ class ZeroEnvelopeRecoveryDriver:
 
 
 @dataclass(frozen=True, slots=True)
+class FlakySettleRecoveryDriver:
+    """Runs until wall cancellation, recovers a fixed cost, and fails settle a scripted number of times."""
+
+    cost: float
+    settle_failures: list[int]
+    settles: list[str] = field(default_factory=list)
+    label: str = "flaky-settle"
+
+    async def preflight(self) -> None:
+        return None
+
+    async def propose(self, contract: str, workdir: Path, *, budget_usd: float | None) -> float:
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable")
+
+    async def recover_cost(self) -> float:
+        return self.cost
+
+    def pending_run(self) -> str | None:
+        return None if self.settles else "run-flaky"
+
+    def settle(self) -> None:
+        if self.settle_failures[0] > 0:
+            self.settle_failures[0] -= 1
+            raise OSError("registry append failed")
+        self.settles.append("run-flaky")
+
+
+@dataclass(frozen=True, slots=True)
 class OuterCancellingDriver:
     """Cancels its caller during or immediately after a proposal and exposes recovery evidence."""
 
@@ -1475,6 +1504,37 @@ async def test_recovered_zero_cost_envelope_still_records_an_event(tmp_path: Pat
     assert (event["kind"], event["cost"], event["run"]) == ("wall_cancel", 0.0, "run-zero")
     assert driver.settles == ["run-zero"]
     assert not (repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json").exists()
+
+
+async def test_settle_failure_after_the_durable_write_never_re_records(tmp_path: Path) -> None:
+    # R3 fix 3: recorded spend counts exactly once — a settle failure retries the idempotent
+    # settlement, never the accounting write.
+    repo = toy_repo(tmp_path)
+    driver = FlakySettleRecoveryDriver(cost=0.6, settle_failures=[1])
+
+    with anyio.fail_after(3.0):
+        await run(make_spec(budget=Budget(max_units=1, max_wall_s=0.2)), driver=driver, repo=repo)
+
+    [event] = infra_events(repo)  # exactly one record for the attempt: no double count
+    assert (event["kind"], event["cost"]) == ("wall_cancel", pytest.approx(0.6))
+    assert driver.settles == ["run-flaky"]
+    assert not (repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json").exists()
+
+
+async def test_persistent_settle_failure_latches_without_re_recording(tmp_path: Path) -> None:
+    # R3 fix 3: when settlement keeps failing the run latches; the recorded cost still appears once.
+    repo = toy_repo(tmp_path)
+    driver = FlakySettleRecoveryDriver(cost=0.6, settle_failures=[10])
+
+    with anyio.fail_after(3.0):
+        with pytest.raises(AccountingIntegrityError, match="could not be settled"):
+            await run(make_spec(budget=Budget(max_units=1, max_wall_s=0.2)), driver=driver, repo=repo)
+
+    events = infra_events(repo)
+    assert [event["kind"] for event in events] == ["wall_cancel", "accounting_abort"]  # single count, then latch
+    assert events[0]["cost"] == pytest.approx(0.6)
+    assert (repo / ".git" / "athome" / f"{EXPERIMENT_NAME}.abort.json").exists()
+    assert driver.settles == []
 
 
 async def test_wr1_resume_reconciles_a_lost_branch_update_with_the_journal(tmp_path: Path) -> None:

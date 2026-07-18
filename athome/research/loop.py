@@ -35,6 +35,7 @@ from athome.research.failures import (
     infra_log,
     record_accounting_abort,
     record_infra_event,
+    safe_describe,
 )
 from athome.research.gate import immutable_violations, monotone_gate, parse_diff_tree
 from athome.research.journal import Journal, JournalRow, Verdict
@@ -151,6 +152,21 @@ def validate_driver_cost(unit: int, cost: object) -> float:
                 if finite_number(converted) and converted >= 0:
                     return converted
     raise AccountingIntegrityError(f"unit {unit}: driver returned invalid cost of type {type(cost).__name__}")
+
+
+def settle_spend(driver: Driver, unit: int) -> None:
+    # Runs only after the durable accounting write: a settle failure must never re-record,
+    # so it retries the idempotent settlement once and then escalates to the abort latch.
+    try:
+        driver.settle()
+    except Exception as exc:
+        logger.warning("unit {} settle failed once, retrying: {}", unit, safe_describe(exc))
+        try:
+            driver.settle()
+        except Exception as retry_exc:
+            raise AccountingIntegrityError(
+                f"unit {unit}: proposal registration could not be settled after its spend was durably recorded"
+            ) from retry_exc
 
 
 def finite_metric(text: str, key: str) -> float | None:
@@ -482,8 +498,8 @@ async def execute_unit(
                                 kind="wall_cancel",
                                 run=driver.pending_run(),
                             )
-                        driver.settle()
-                    recorded = True
+                        recorded = True
+                        settle_spend(driver, unit)
                     return None
                 # A committed candidate re-scores (bill its cost once); a pre-commit failure re-proposes.
                 attempt_cost = (committed.cost if not billed else 0.0) if committed is not None else cost
@@ -497,8 +513,8 @@ async def execute_unit(
                     kind="retry",
                     run=driver.pending_run(),
                 )
-                driver.settle()
                 recorded = True
+                settle_spend(driver, unit)
                 spent += attempt_cost
                 logger.warning("unit {} infra failure, attempt {}/{}: {!r}", unit, attempt, MAX_INFRA_RETRIES, infra)
                 if spec.budget.max_usd is not None and spent > spec.budget.max_usd:
@@ -526,7 +542,7 @@ async def execute_unit(
                                 kind="wall_cancel",
                                 run=driver.pending_run(),
                             )
-                        driver.settle()
+                        settle_spend(driver, unit)
                     except (Exception, anyio.get_cancelled_exc_class()) as exc:
                         await record_accounting_abort(abort, events, unit=unit, reason=exc)
 
@@ -668,7 +684,11 @@ async def run(spec: ExperimentSpec, *, driver: Driver, repo: Path, mirror_cc_not
                     reason = f"could not append journal row for unit {unit} to {journal.sink.path}"
                     await record_accounting_abort(abort, events, unit=unit, reason=reason)
                     raise AccountingIntegrityError(reason) from exc
-                driver.settle()
+                try:
+                    settle_spend(driver, unit)
+                except AccountingIntegrityError as exc:
+                    await record_accounting_abort(abort, events, unit=unit, reason=exc)
+                    raise
                 if outcome.verdict is Verdict.KEEP:
                     await run_git(repo, "branch", "-f", branch, outcome.commit)
                     incumbent, incumbent_metric = outcome.commit, outcome.metric
