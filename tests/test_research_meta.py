@@ -381,6 +381,60 @@ async def test_stop_armed_during_the_proposer_halts_before_launch(
     assert not any(row.event in CampaignEvent.LAUNCHED for row in rows)
 
 
+async def test_gated_stop_armed_after_the_boundary_check_halts_before_the_proposer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = toy_repo(tmp_path / "repo")
+    root = tmp_path / "meta"
+    boundary = meta.Campaign.boundary
+
+    async def arming_boundary(self: meta.Campaign) -> str | None:
+        reason = await boundary(self)
+        await meta.request_stop(self.root, reason="armed after boundary")
+        return reason
+
+    monkeypatch.setattr(meta.Campaign, "boundary", arming_boundary)
+    backend = scripted_backend([])
+
+    result = await meta.run_campaign(
+        make_campaign_policy(mode="gated"), repo=repo, root=root, backend=backend, driver_factory=forbidden_factory
+    )
+
+    assert result.halted == "stop requested: armed after boundary"
+    assert backend.calls == []
+    assert [row.event for row in ledger_rows(root)] == [CampaignEvent.STOPPED]
+
+
+async def test_gated_stop_armed_after_the_boundary_check_halts_before_the_queued_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = toy_repo(tmp_path / "repo")
+    root = tmp_path / "meta"
+    policy = make_campaign_policy(mode="gated")
+    await meta.run_campaign(
+        policy, repo=repo, root=root, backend=scripted_backend([make_proposal(1)]), driver_factory=forbidden_factory
+    )
+    queued = await meta.approve(root, 1)
+    boundary = meta.Campaign.boundary
+
+    async def arming_boundary(self: meta.Campaign) -> str | None:
+        reason = await boundary(self)
+        await meta.request_stop(self.root, reason="armed before launch")
+        return reason
+
+    monkeypatch.setattr(meta.Campaign, "boundary", arming_boundary)
+
+    result = await meta.run_campaign(
+        policy, repo=repo, root=root, backend=scripted_backend([]), driver_factory=forbidden_factory
+    )
+
+    assert result.halted == "stop requested: armed before launch"
+    assert queued.exists()  # the approved spec stays queued for the next runner
+    rows = ledger_rows(root)
+    assert rows[-1].event is CampaignEvent.STOPPED
+    assert not any(row.event in CampaignEvent.LAUNCHED for row in rows)
+
+
 async def test_out_of_policy_proposals_ledger_rejected_until_the_failure_cap(tmp_path: Path) -> None:
     repo = toy_repo(tmp_path / "repo")
     root = tmp_path / "meta"
@@ -465,6 +519,38 @@ async def test_actual_overshoot_latches_refusal_and_ledgers_true_spend(tmp_path:
     assert len(aborted) == 1 and aborted[0].usd == 3.5  # true actuals, overshoot included, never clamped to the cap
     assert result.halted is not None and "campaign budget exhausted" in result.halted
     assert len(backend.calls) == 1  # the latch refused the next proposer round
+
+    relaunch = scripted_backend([])
+    again = await meta.run_campaign(
+        make_campaign_policy(max_total_usd=3.0),
+        repo=repo,
+        root=root,
+        backend=relaunch,
+        driver_factory=forbidden_factory,
+    )
+    assert again.halted is not None and "campaign budget exhausted" in again.halted
+    assert relaunch.calls == []
+
+
+async def test_actuals_exactly_at_the_cap_refuse_the_next_round(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path / "repo")
+    root = tmp_path / "meta"
+    contracts: list[str] = []
+    backend = scripted_backend([make_proposal(1, max_usd=3.0), make_verdict("spent to the cap exactly")])
+
+    result = await meta.run_campaign(
+        make_campaign_policy(max_total_usd=3.0),
+        repo=repo,
+        root=root,
+        backend=backend,
+        driver_factory=lambda spec: PaidDriver(iter([loss_proposal(0.9)]), contracts, cost=3.0),
+    )
+
+    assert result.completed == 1
+    completed = [row for row in ledger_rows(root) if row.event is CampaignEvent.COMPLETED]
+    assert [row.usd for row in completed] == [3.0]  # recorded actuals land exactly on max_total_usd
+    assert result.halted is not None and "campaign budget exhausted" in result.halted
+    assert len(backend.calls) == 2  # one proposal + one retro; equality alone latched the refusal
 
     relaunch = scripted_backend([])
     again = await meta.run_campaign(
