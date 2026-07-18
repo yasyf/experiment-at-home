@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 import anyio
 import pytest
+from loguru import logger
 
 from athome import workers
 from athome.wire import LENGTH_PREFIX, WIRE_VERSION, WireError, decode, encode, read_frame, validate
@@ -251,9 +252,17 @@ async def test_cleanup_killpg_failure_never_masks_the_wire_error(monkeypatch: py
         raise PermissionError(1, "Operation not permitted")
 
     monkeypatch.setattr(os, "killpg", deny_killpg)
-    async with running(NON_WIRE_SOURCE) as worker:
-        with pytest.raises(WireError):  # the poisoning path's own killpg failure stays suppressed
-            await worker.call("echo", "x")
+    messages: list[str] = []
+    sink = logger.add(lambda message: messages.append(str(message)), level="DEBUG")
+    try:
+        async with running(NON_WIRE_SOURCE) as worker:
+            with pytest.raises(WireError):  # the poisoning path's own killpg failure stays suppressed
+                await worker.call("echo", "x")
+    finally:
+        logger.remove(sink)
+    assert any(  # R3 fix 6: the suppressed killpg failure is still visible at debug level
+        "exited on its own after killpg failed" in message and "PermissionError" in message for message in messages
+    )
 
 
 async def test_unkillable_worker_bounds_the_reap_wait_and_the_wire_error_still_propagates(
@@ -270,14 +279,20 @@ async def test_unkillable_worker_bounds_the_reap_wait_and_the_wire_error_still_p
     monkeypatch.setattr(workers, "REAP_WAIT_TIMEOUT", 0.2)
     monkeypatch.setattr(workers, "STDERR_JOIN_TIMEOUT", 0.1)
     worker = PipeWorker(WorkerSpec((sys.executable, "-c", STUBBORN_NON_WIRE_SOURCE)))
+    messages: list[str] = []
+    sink = logger.add(lambda message: messages.append(str(message)), level="WARNING")
     try:
         with anyio.fail_after(5.0):  # the bounded wait, not a hang, must deliver the error
             with pytest.raises(WireError):
                 await worker.call("echo", "x")
     finally:
+        logger.remove(sink)
         for pgid in denied:  # the deliberately-leaked worker must not outlive the test
             with suppress(OSError):
                 real_killpg(pgid, signal.SIGKILL)
+    assert any(  # R3 fix 6: the leak warning names the killpg failure and its errno
+        "kill failed" in message and "PermissionError" in message and "errno 1" in message for message in messages
+    )
 
 
 async def test_worker_crash_raises_worker_crashed_with_returncode_and_stderr() -> None:

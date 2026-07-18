@@ -149,15 +149,19 @@ class PipeWorker:
         # when the kill failed, so neither can mask the original wire error.
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except OSError:
+        except OSError as exc:
             with anyio.move_on_after(REAP_WAIT_TIMEOUT) as scope:
                 await process.wait()
             if scope.cancelled_caught:
                 logger.warning(
-                    "leaking worker process {}: kill failed and it did not exit within {}s",
+                    "leaking worker process {}: kill failed ({!r}, errno {}) and it did not exit within {}s",
                     process.pid,
+                    exc,
+                    exc.errno,
                     REAP_WAIT_TIMEOUT,
                 )
+            else:
+                logger.debug("worker process {} exited on its own after killpg failed ({!r})", process.pid, exc)
         else:
             await process.wait()
         if (thread := self.stderr_thread) is not None:
