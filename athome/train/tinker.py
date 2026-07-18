@@ -606,6 +606,10 @@ class TinkerBackend:
             InsufficientData: The surviving pool is smaller than one batch.
             SpendExceeded: The projected run cost crosses the spend cap.
         """
+        if not spec.base.serves_locally:
+            raise UnservableBase(
+                f"{spec.base.mlx} has no mlx-lm LoRA counterpart, so a Tinker adapter cannot be fused into it"
+            )
         report = await self.fit(spec, sink=sink)
         adapter = await self.materialize(report.final, spec, work_dir=work_dir, cost=report.train_cost_usd)
         return await self.fuse(adapter, spec, work_dir=work_dir)

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from athome.train.spec import UnservableBase
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
     from pathlib import Path
@@ -79,7 +81,15 @@ async def retrain(
     Returns:
         The report, the selected checkpoint, its materialized adapter, the artifact scores, and the
         gate's verdict.
+
+    Raises:
+        UnservableBase: The base has no mlx-lm LoRA counterpart to materialize into, so the run
+            would bill a full hosted fit only to refuse at ``materialize``; it aborts before ``fit``.
     """
+    if not spec.base.serves_locally:
+        raise UnservableBase(
+            f"{spec.base.mlx} has no mlx-lm LoRA counterpart, so a Tinker adapter cannot be fused into it"
+        )
     report = await backend.fit(spec, sink=sink, checkpoints=checkpoints, eval_rows=eval_rows)
     best = max(report.checkpoints, key=select)
     adapter = await backend.materialize(best, spec, work_dir=work_dir, cost=report.train_cost_usd)

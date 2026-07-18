@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -17,6 +17,7 @@ from athome.train.spec import (
     SavedCheckpoint,
     TrainReport,
     TrainSpec,
+    UnservableBase,
 )
 
 if TYPE_CHECKING:
@@ -260,6 +261,25 @@ async def test_gate_receives_the_served_dict_and_its_verdict_lands_in_the_outcom
     assert received == [SERVED]
     assert received[0] is SERVED
     assert outcome.verdict is VERDICT
+
+
+async def test_retrain_refuses_a_hosted_only_base_before_any_billable_call(tmp_path: Path) -> None:
+    be = backend()
+
+    with pytest.raises(UnservableBase, match="mlx-lm LoRA counterpart"):
+        await retrain(
+            be,  # type: ignore[arg-type]
+            replace(spec(), base=BASE_MODELS["qwen3.5-4b"]),
+            checkpoints=CHECKPOINT_POLICY,
+            eval_rows=EVAL_ROWS,
+            select=by_step_select(),
+            artifact_scorer=lambda _adapter: SERVED,
+            gate=lambda _served: VERDICT,
+            work_dir=tmp_path,
+            sink=object(),
+        )
+
+    assert be.calls == []
 
 
 async def test_backend_sees_only_fit_and_materialize(tmp_path: Path) -> None:

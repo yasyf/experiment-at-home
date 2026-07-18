@@ -899,6 +899,15 @@ async def test_score_runs_for_a_hosted_only_base_with_a_tinker_id(sampling_servi
     assert len(scores) == 1
 
 
+async def test_train_refuses_a_hosted_only_base_before_any_billable_call(service: FakeService, tmp_path: Path) -> None:
+    request = spec(corpus(tmp_path, method="sft"), base=BASE_MODELS["qwen3.5-4b"])
+
+    with pytest.raises(UnservableBase, match="mlx-lm LoRA counterpart"):
+        await TinkerBackend.from_settings().train(request, sink=sink(tmp_path), work_dir=tmp_path / "run")
+
+    assert service.clients == []
+
+
 async def test_download_adapter_unpacks_the_signed_archive(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     member = tmp_path / "adapter_model.safetensors"
     member.write_bytes(b"weights")
