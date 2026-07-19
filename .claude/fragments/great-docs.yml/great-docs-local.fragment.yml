@@ -18,6 +18,7 @@ accent_color:
 # Open Graph / social-card image for link unfurls (path relative to repo root).
 social_cards:
   image: docs/assets/social-preview.jpg
+  twitter_site: "@yasyf"
 
 # Navbar logo + favicon are auto-detected from docs/assets/logo.png (the
 # generated mascot); no logo key is needed here.
