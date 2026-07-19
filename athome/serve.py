@@ -423,6 +423,15 @@ async def status_command(recipe: str, as_json: bool) -> None:
     emit({"recipe": recipe, "healthy": await ManagedServer(recipe).health()}, as_json=as_json)
 
 
+@cli.command("activator")
+@click.option("--host", default=None, help="Bind address; overrides the configured activator host.")
+def activator_command(host: str | None) -> None:
+    """Run the probe-safe idle-unload activator proxy (needs the ``activator`` extra)."""
+    from athome.activator import serve_activator
+
+    serve_activator(host=host)
+
+
 @click.command("status")
 @json_option
 @coro

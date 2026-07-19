@@ -146,6 +146,13 @@ reference:
     desc: A generic idle-unload lifecycle — single-flight load, reference-counted use, and a TTL reaper that unloads a value once it sits idle.
     contents:
       - idle.IdleResource
+  - title: Activator
+    desc: A probe-safe idle-unload proxy over IdleResource — probes answer locally while the child is down, wakes spawn it under a single-flight load, and the streamed relay's inflight count spans the whole response body.
+    contents:
+      - activator.ActivatorSettings
+      - activator.Activator
+      - activator.serve_activator
+      - activator.ActivatorError
   - title: Embed
     desc: Batch text-embedding backends and a digest-keyed incremental index with MMR rerank.
     contents:

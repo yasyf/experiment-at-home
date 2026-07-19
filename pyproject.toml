@@ -28,6 +28,7 @@ dependencies = [
 
 [project.optional-dependencies]
 serve = ["httpx>=0.28", "openai>=1.50"]
+activator = ["starlette>=0.40", "uvicorn>=0.30"]
 llm = ["spawnllm>=0.6.1"]
 ocr = ["ocrmac>=1.0"]
 modal = ["modal>=0.66"]
