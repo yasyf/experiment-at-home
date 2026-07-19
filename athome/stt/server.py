@@ -62,7 +62,8 @@ def duration_of(transcript: Transcript) -> float:
 
 
 def verbose_payload(transcript: Transcript) -> dict[str, object]:
-    return {
+    language = {} if transcript.language is None else {"language": transcript.language}
+    return language | {
         "task": "transcribe",
         "duration": duration_of(transcript),
         "text": transcript.text,

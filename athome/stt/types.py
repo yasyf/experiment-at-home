@@ -34,7 +34,8 @@ class Transcript:
 
     Every offset is in **seconds** (the native ``t0_ms``/``t1_ms`` are divided once, at the engine
     boundary). ``load_ms`` is the model's first-party cold/warm load timing for this run, carried
-    through so callers can size their own cold-start budgets.
+    through so callers can size their own cold-start budgets. ``language`` is the model-reported
+    language tag, ``None`` where the path exposes none (streaming).
 
     Example:
         >>> transcript.text
@@ -47,3 +48,4 @@ class Transcript:
     segments: tuple[Segment, ...]
     words: tuple[Word, ...]
     load_ms: float
+    language: str | None = None

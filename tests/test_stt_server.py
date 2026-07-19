@@ -41,6 +41,7 @@ CANNED = Transcript(
         Word(text="fox", start=1.5, end=2.0),
     ),
     load_ms=42.0,
+    language="en",
 )
 
 
@@ -114,6 +115,7 @@ def test_duration_of_prefers_segment_ends_then_words_then_zero() -> None:
 def test_verbose_payload_shape() -> None:
     payload = verbose_payload(CANNED)
     assert payload["task"] == "transcribe"
+    assert payload["language"] == "en"
     assert payload["duration"] == 2.0
     assert payload["text"] == "the quick brown fox"
     assert payload["segments"] == [
@@ -121,6 +123,12 @@ def test_verbose_payload_shape() -> None:
         {"id": 1, "start": 1.0, "end": 2.0, "text": "brown fox"},
     ]
     assert payload["words"][0] == {"word": "the", "start": 0.0, "end": 0.3}
+
+
+def test_verbose_payload_omits_an_unknown_language() -> None:
+    # Never fabricate: a transcript with no language (the stream path) carries no language key.
+    bare = Transcript(text="hi", segments=(), words=(), load_ms=0.0)
+    assert "language" not in verbose_payload(bare)
 
 
 # --- response shapes -------------------------------------------------------

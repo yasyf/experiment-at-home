@@ -76,6 +76,7 @@ def transcript_from_result(result: Result) -> Transcript:
         segments=tuple(segment_from(segment, result.words) for segment in result.segments),
         words=tuple(word_from(word) for word in result.words),
         load_ms=result.timings.load_ms,
+        language=result.language,
     )
 
 
