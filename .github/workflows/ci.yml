@@ -25,10 +25,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache-dependency-glob: uv.lock
 
-      - name: Sync (dev + llm + train-dpo + stt)
-        # llm: spawnllm judges. train-dpo: torch (DPO loss otherwise skips). stt: the
-        # transcribe-cpp binding for the FakeModel suite. Others stay out — macOS-only or mocked.
-        run: uv sync --extra dev --extra llm --extra train-dpo --extra stt
+      - name: Sync (dev + llm + train-dpo + stt + modal)
+        # llm: spawnllm judges. train-dpo: torch (DPO loss else skips). stt: transcribe-cpp for
+        # the FakeModel suite. modal: real-SDK FILE-registration proof. Others stay out —
+        # macOS-only or mocked.
+        run: uv sync --extra dev --extra llm --extra train-dpo --extra stt --extra modal
 
       - name: Type check (ty, warnings only)
         continue-on-error: true

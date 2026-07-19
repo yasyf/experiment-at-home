@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import io
+import ast
+import importlib.util
 import json
-import pickletools
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from importlib.machinery import ModuleSpec
@@ -33,6 +34,63 @@ VLLM_VERSION = "0.11.0"
 API_KEY = "sk-ccsteer-test-2f9c7a41b0"
 ENDPOINT = f"https://{WORKSPACE}--athome-modal-vllm-{serve_modal.ENDPOINT_FUNCTION}.modal.run/v1"
 WEB_URL = ENDPOINT.removesuffix("/v1")
+
+# Child interpreter: Modal present, non-stdlib paths dropped, athome hard-blocked — an athome or
+# third-party import in the synced entrypoint fails this probe.
+ENTRYPOINT_ISOLATION_PROBE = """
+import importlib.abc, importlib.util, sys, types
+
+entry = sys.argv[1]
+sys.modules.setdefault("modal", types.ModuleType("modal"))
+sys.path[:] = [p for p in sys.path if "site-packages" not in p]
+
+
+class BlockAthome(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        if name == "athome" or name.startswith("athome."):
+            raise ImportError("athome is not importable in the synced entrypoint: " + name)
+        return None
+
+
+sys.meta_path.insert(0, BlockAthome())
+for name in [n for n in sys.modules if n == "athome" or n.startswith("athome.")]:
+    del sys.modules[name]
+
+try:
+    import athome
+except ImportError:
+    pass
+else:
+    raise SystemExit("athome was importable; the athome-less isolation is vacuous")
+
+spec = importlib.util.spec_from_file_location("vllm_serve_entry", entry)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert callable(module.serve), "the synced entrypoint has no callable serve()"
+print("SYNCED-IMPORT-OK")
+"""
+
+
+FILE_SYNC_PROBE = """
+import importlib.util, sys
+
+import modal_proto.api_pb2 as api_pb2
+from modal._utils.function_utils import FunctionInfo, FunctionInfoType
+
+entry, module_name = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_file_location(module_name, entry)
+module = importlib.util.module_from_spec(spec)
+sys.modules[module_name] = module
+spec.loader.exec_module(module)
+
+info = FunctionInfo(module.serve, serialized=False)
+assert info.is_serialized() is False, info.is_serialized()
+assert info._type is FunctionInfoType.FILE, info._type
+assert info.get_definition_type() == api_pb2.Function.DEFINITION_TYPE_FILE, info.get_definition_type()
+assert info.module_name == module_name, info.module_name
+assert list(info.get_entrypoint_mount()) == [module_name], list(info.get_entrypoint_mount())
+print("FILE-SYNC-OK")
+"""
 
 
 def configure_modal_vllm(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
@@ -484,7 +542,7 @@ def test_build_app_pins_image_gpu_volumes_secret_and_endpoint(monkeypatch: pytes
     assert rec.function_options["scaledown_window"] == 300
     assert rec.function_options["min_containers"] == 0
     assert rec.function_options["timeout"] == 3600
-    assert rec.function_options["serialized"] is True
+    assert "serialized" not in rec.function_options
     assert rec.volumes == [("cc-steer-hf-cache", True), ("cc-steer-watcher-adapter", True)]
     assert rec.secrets == [{"VLLM_API_KEY": API_KEY}]
     assert rec.web_server["port"] == 8000
@@ -494,24 +552,68 @@ def test_build_app_pins_image_gpu_volumes_secret_and_endpoint(monkeypatch: pytes
     assert rec.concurrent["max_inputs"] == 32
 
 
-def test_the_web_server_entrypoint_is_serialized_by_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    cloudpickle = pytest.importorskip("cloudpickle")
+def test_the_web_server_entrypoint_is_a_top_level_module_global(monkeypatch: pytest.MonkeyPatch) -> None:
     configure_modal_vllm(monkeypatch)
     rec = install_fake_modal(monkeypatch)
 
     serve_modal.build_app(load(ModalVllmSettings))
-    payload = cloudpickle.dumps(rec.web_server["fn"])
+    fn = rec.web_server["fn"]
 
-    # A by-reference pickle is ~43 bytes and STACK_GLOBALs athome.serve_modal (unimportable cold).
-    assert len(payload) > 200
-    modules: list[str | None] = []
-    recent: list[str] = []
-    for op, arg, _ in pickletools.genops(io.BytesIO(payload)):
-        if op.name in ("SHORT_BINUNICODE", "BINUNICODE", "BINUNICODE8", "UNICODE") and isinstance(arg, str):
-            recent.append(arg)
-        elif op.name == "STACK_GLOBAL":
-            modules.append(recent[-2] if len(recent) >= 2 else None)
-    assert "athome.serve_modal" not in modules
+    # A module-level global in a top-level module (empty __package__) is what Modal registers by
+    # reference and mounts as a single file — never the athome package the container lacks.
+    assert fn is serve_modal.entrypoint().serve
+    assert fn.__qualname__ == "serve"
+    assert fn.__module__ == serve_modal.ENTRYPOINT_MODULE
+    assert "." not in fn.__module__
+    assert sys.modules[fn.__module__].__package__ == ""
+
+
+def test_argv_env_matches_the_synced_entrypoint() -> None:
+    assert serve_modal.ARGV_ENV == serve_modal.entrypoint().ARGV_ENV
+
+
+def test_the_synced_entrypoint_imports_only_the_standard_library() -> None:
+    tree = ast.parse(serve_modal.ENTRYPOINT_PATH.read_text())
+    roots = {
+        alias.name.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        node.module.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module
+    }
+    assert roots <= sys.stdlib_module_names
+    assert not any(root.startswith("athome") for root in roots)
+
+
+def test_the_synced_entrypoint_imports_in_a_stripped_athome_less_subprocess() -> None:
+    result = subprocess.run(
+        [sys.executable, "-c", ENTRYPOINT_ISOLATION_PROBE, str(serve_modal.ENTRYPOINT_PATH)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "SYNCED-IMPORT-OK" in result.stdout
+
+
+def test_build_app_registers_a_file_synced_non_serialized_function() -> None:
+    if importlib.util.find_spec("modal") is None:
+        pytest.skip("modal extra not installed")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            FILE_SYNC_PROBE,
+            str(serve_modal.ENTRYPOINT_PATH),
+            serve_modal.ENTRYPOINT_MODULE,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "FILE-SYNC-OK" in result.stdout
 
 
 async def test_deploy_builds_then_ships_the_app(monkeypatch: pytest.MonkeyPatch) -> None:

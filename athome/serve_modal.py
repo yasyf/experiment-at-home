@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from anyio import to_thread
 
 if TYPE_CHECKING:
+    from types import ModuleType
+
     import modal
 
     from athome.serve import ModalVllmSettings
@@ -20,6 +25,25 @@ ARGV_ENV = "VLLM_SERVE_ARGV"
 API_KEY_ENV = "VLLM_API_KEY"
 ENDPOINT_FUNCTION = "serve"
 FINGERPRINT_TAG = "athome-pins"
+ENTRYPOINT_MODULE = "vllm_serve_entry"
+ENTRYPOINT_PATH = Path(__file__).with_name(f"{ENTRYPOINT_MODULE}.py")
+
+
+def entrypoint() -> ModuleType:
+    """The container-synced vLLM launcher, loaded as a *top-level* module (never ``athome.vllm_serve_entry``).
+
+    Modal registers a non-serialized function by its module and qualname and syncs that module's source
+    into the container, importing it there to resolve the function by reference. Loading the launcher
+    top-level — so its ``__package__`` is empty — is what makes Modal treat it as a single-file mount and
+    import it by its bare stem, so the vLLM container (which has no ``athome``) never imports this package.
+    """
+    if (module := sys.modules.get(ENTRYPOINT_MODULE)) is not None:
+        return module
+    spec = importlib.util.spec_from_file_location(ENTRYPOINT_MODULE, ENTRYPOINT_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[ENTRYPOINT_MODULE] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def vllm_command(settings: ModalVllmSettings) -> list[str]:
@@ -100,13 +124,18 @@ def serve_image(settings: ModalVllmSettings) -> modal.Image:
 def build_app(settings: ModalVllmSettings) -> modal.App:
     """Assemble the Modal app: one scale-to-zero GPU web server fronting ``vllm serve``.
 
-    The web-server entrypoint is a nested function, not a module-level one: Modal serializes the
-    registered function with cloudpickle, and only a nested (or otherwise non-importable) function
-    is embedded by value. A module-level entrypoint would be pickled by reference — a 43-byte pickle
-    naming ``athome.serve_modal.serve`` — that every cold container fails to load, because the image
-    carries vLLM and ``huggingface_hub`` but never ``athome``. The entrypoint closes over nothing
-    from this module: the argv travels in the ``VLLM_SERVE_ARGV`` image env var, so its body reads
-    that variable and launches the server, preserving the no-drift design.
+    The web-server entrypoint is :func:`athome.vllm_serve_entry.serve`, a module-level function Modal
+    registers *by reference*: at deploy it records the function's module and qualname and syncs that one
+    file into the container, importing it there to resolve the endpoint. The launcher is deliberately a
+    top-level, standard-library-only module — the vLLM image carries vLLM and ``huggingface_hub`` but not
+    ``athome`` — so its container import needs nothing this app does not already provide. It closes over
+    nothing from this module: the argv travels in the ``VLLM_SERVE_ARGV`` image env var, so the launcher
+    reads that variable and starts the server, preserving the no-drift design.
+
+    Registering by reference — rather than ``serialized=True`` — is a hard requirement, not a preference:
+    a cloudpickled function must be unpickled by an interpreter matching the one that pickled it, and this
+    repo runs free-threaded Python (3.14t) that Modal refuses to build into an image, so a serialized
+    deploy is structurally unsatisfiable from the repo's own runtime.
 
     ``min_containers=0`` with ``scaledown_window`` is the scale-to-zero: the endpoint costs nothing
     idle and cold-starts on the next request, bounded by ``startup_timeout``. ``max_concurrent_inputs``
@@ -116,17 +145,8 @@ def build_app(settings: ModalVllmSettings) -> modal.App:
     """
     import modal
 
-    def serve() -> None:
-        import json
-        import os
-        import subprocess
-
-        subprocess.Popen(json.loads(os.environ[ARGV_ENV]))
-
-    serve.__name__ = ENDPOINT_FUNCTION
-
     app = modal.App(settings.app_name, tags={FINGERPRINT_TAG: fingerprint(settings)})
-    endpoint = modal.web_server(port=VLLM_PORT, startup_timeout=settings.startup_timeout)(serve)
+    endpoint = modal.web_server(port=VLLM_PORT, startup_timeout=settings.startup_timeout)(entrypoint().serve)
     endpoint = modal.concurrent(max_inputs=settings.max_concurrent_inputs)(endpoint)
     app.function(
         image=serve_image(settings),
@@ -139,7 +159,6 @@ def build_app(settings: ModalVllmSettings) -> modal.App:
         timeout=settings.request_timeout,
         scaledown_window=settings.scaledown_window,
         min_containers=0,
-        serialized=True,
     )(endpoint)
     return app
 
