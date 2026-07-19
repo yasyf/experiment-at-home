@@ -132,6 +132,7 @@ class FakeSession:
 
     def run_batch(self, pcms: list, *, timestamps: str = "auto", return_exceptions: bool = False) -> list:
         with self.model.tracker:
+            self.model.batch_sizes.append(len(pcms))
             time.sleep(self.model.delay)
             return list(self.model.batch)
 
@@ -167,6 +168,7 @@ class FakeModel:
         self.delay = delay
         self.load_ms = load_ms
         self.closed = closed if closed is not None else []
+        self.batch_sizes: list[int] = []
 
     def session(self) -> FakeSession:
         return FakeSession(self)
@@ -426,6 +428,41 @@ async def test_batch_isolates_per_slot_errors_and_preserves_order(monkeypatch: p
     assert [type(item).__name__ for item in out] == ["Transcript", "SttError", "Transcript"]
     assert out[0].text == "ok" and out[2].text == "ok"
     assert isinstance(out[1], SttError) and "bad audio" in str(out[1])
+
+
+def canned_result(text: str) -> Result:
+    return Result(
+        text=text,
+        language="en",
+        timestamp_kind="segment",
+        segments=(),
+        words=(),
+        tokens=(),
+        timings=Timings(load_ms=1.0, mel_ms=0, encode_ms=0, decode_ms=0),
+    )
+
+
+async def test_batch_validates_per_slot_and_dispatches_only_the_valid_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = FakeModel(batch=[canned_result("first"), canned_result("second")])
+    wire(monkeypatch, model)
+    out = await Transcriber("x").transcribe_batch([pcm(), array.array("f", []), pcm()])
+    assert [type(item).__name__ for item in out] == ["Transcript", "SttError", "Transcript"]
+    assert (out[0].text, out[2].text) == ("first", "second")
+    assert isinstance(out[1], SttError) and "empty" in str(out[1])
+    assert model.batch_sizes == [2]  # only the valid slots reached the native batch
+
+
+async def test_all_invalid_batch_never_touches_the_native_layer(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = FakeModel(batch=[canned_result("never")])
+    wire(monkeypatch, model)
+    stt = Transcriber("x")
+    out = await stt.transcribe_batch([array.array("f", []), array.array("h", [1, 2])])
+    assert [isinstance(item, SttError) for item in out] == [True, True]
+    assert "empty" in str(out[0]) and "float32" in str(out[1])
+    assert stt.resource.loaded is False  # the model was never loaded
+    assert model.batch_sizes == []  # and run_batch never ran
 
 
 # --- streaming committed-delta semantics -----------------------------------

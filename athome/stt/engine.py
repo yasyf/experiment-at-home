@@ -62,6 +62,13 @@ def segment_from(segment: NativeSegment, words: tuple[NativeWord, ...]) -> Segme
     )
 
 
+def validated_slot(pcm: Pcm) -> Pcm | SttError:
+    try:
+        return require_pcm(pcm)
+    except SttError as invalid:
+        return invalid
+
+
 def transcript_from_result(result: Result) -> Transcript:
     """Map a native ``Result`` into a :class:`Transcript`, dividing ms → seconds once, here."""
     return Transcript(
@@ -147,18 +154,22 @@ class Transcriber:
     async def transcribe_batch(self, pcms: Sequence[Pcm]) -> list[Transcript | SttError]:
         """Transcribe several buffers in one dispatch; each slot is a Transcript or its own error.
 
-        Order-preserving with per-slot isolation: a slot that fails to transcribe surfaces as an
-        :class:`SttError` in its position while the others return their transcripts.
+        Order-preserving with per-slot isolation: a slot that fails validation or transcription
+        surfaces as an :class:`SttError` in its position while the others return their transcripts.
+        Only valid slots reach the native batch; a batch with no valid slot never wakes the model.
         """
         from transcribe_cpp.errors import TranscribeError
 
-        validated = [require_pcm(pcm) for pcm in pcms]
+        slots = [validated_slot(pcm) for pcm in pcms]
+        if not (valid := [slot for slot in slots if not isinstance(slot, SttError)]):
+            return [slot for slot in slots if isinstance(slot, SttError)]
         async with self.resource.use() as model:
-            results = await self._compute(functools.partial(self._run_batch, model, validated))
-        return [
+            results = await self._compute(functools.partial(self._run_batch, model, valid))
+        transcripts = iter(
             SttError(str(item)) if isinstance(item, TranscribeError) else transcript_from_result(item)
             for item in results
-        ]
+        )
+        return [slot if isinstance(slot, SttError) else next(transcripts) for slot in slots]
 
     async def stream(self, *, lookahead_ms: int) -> SttStream:
         """Open a streaming transcription that holds the compute lock for its whole lifetime."""
