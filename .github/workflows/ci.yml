@@ -25,14 +25,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache-dependency-glob: uv.lock
 
-      - name: Sync (dev + llm + train-dpo)
-        # The `llm` extra brings spawnllm so the research-judge suite runs with real
-        # coverage. `train-dpo` brings torch, without which tinker's DPO loss — the whole
-        # custom-loss path — silently skips and ships unverified. Other extras (ocr's
-        # ocrmac is macOS-only; modal/hf/serve are mocked) stay out — their tests skip or
-        # mock. The free-threaded job below stays dev-only on purpose: its job is to prove
-        # the CORE imports with the GIL off, not to re-run the trainers.
-        run: uv sync --extra dev --extra llm --extra train-dpo
+      - name: Sync (dev + llm + train-dpo + stt)
+        # llm: spawnllm judges. train-dpo: torch (DPO loss otherwise skips). stt: the
+        # transcribe-cpp binding for the FakeModel suite. Others stay out — macOS-only or mocked.
+        run: uv sync --extra dev --extra llm --extra train-dpo --extra stt
 
       - name: Type check (ty, warnings only)
         continue-on-error: true
@@ -40,6 +36,12 @@ jobs:
 
       - name: Test (pytest)
         run: uv run pytest
+
+      - name: STT integration (real moonshine-tiny weights, CPU)
+        # ~34MB Q8 GGUF at the pinned revision decoding the committed fixture; Metal smokes stay dev-only.
+        run: uv run pytest tests/test_stt.py --run-live -k test_live_moonshine_tiny_batch_transcribes_the_fixture
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
       - name: Build + smoke-test wheel in a fresh venv
         run: |
@@ -73,7 +75,7 @@ jobs:
           import athome
           import athome.cache, athome.cli, athome.config, athome.detach, athome.errors
           import athome.launchd, athome.llmcache, athome.ocr, athome.progress
-          import athome.store, athome.sync, athome.wire, athome.workers
+          import athome.store, athome.stt, athome.sync, athome.wire, athome.workers
           assert not sys._is_gil_enabled(), 'an import re-enabled the GIL'
           print('GIL still disabled after importing athome core')
           "
