@@ -674,6 +674,18 @@ async def test_failed_native_reset_still_releases_the_lane(monkeypatch: pytest.M
         assert (await stt.transcribe(pcm())).text == "after"
 
 
+async def test_ops_on_a_closed_stream_raise_stt_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    wire(monkeypatch, FakeModel(script=[("", 0)], final=("done", 1000)))
+    stt = Transcriber("x")
+    stream = await stt.stream(lookahead_ms=1000)
+    await stream.aclose()
+
+    with pytest.raises(SttError, match="stream closed"):
+        await stream.feed(pcm())
+    with pytest.raises(SttError, match="stream closed"):
+        await stream.finalize()
+
+
 async def test_invalid_chunk_leaves_the_stream_open_and_usable(monkeypatch: pytest.MonkeyPatch) -> None:
     # Validation failure is fail-loud input rejection, not stream death: no native call happened.
     wire(monkeypatch, FakeModel(script=[("hello", 1000)], final=("hello", 1000)))
