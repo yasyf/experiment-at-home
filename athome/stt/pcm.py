@@ -52,6 +52,12 @@ def require_pcm(pcm: Pcm) -> Pcm:
     return pcm
 
 
+def scratch_path() -> str:
+    fd, path = tempfile.mkstemp(prefix="athome-stt-")
+    os.close(fd)
+    return path
+
+
 def ffmpeg_path() -> str:
     """Resolve an ffmpeg binary, preferring one on ``PATH`` and falling back to the static wheel.
 
@@ -80,8 +86,7 @@ async def decode(data: bytes) -> array.array:
         SttError: ffmpeg exited non-zero or produced no audio.
     """
     ffmpeg = await to_thread.run_sync(ffmpeg_path)
-    fd, path = tempfile.mkstemp(prefix="athome-stt-")
-    os.close(fd)
+    path = await to_thread.run_sync(scratch_path)
     try:
         await anyio.Path(path).write_bytes(data)
         result = await anyio.run_process(

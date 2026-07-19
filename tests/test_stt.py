@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import array
+import tempfile
 import threading
 import time
 import wave
@@ -20,7 +21,7 @@ from transcribe_cpp.errors import InvalidArgument, NotImplementedByModel, Output
 from athome.stt import catalog
 from athome.stt.catalog import DEFAULT_QUANT, VARIANTS, gguf_path, repo_for
 from athome.stt.engine import Transcriber, transcript_from_result
-from athome.stt.pcm import RATE_HZ, f32_from_s16, require_pcm
+from athome.stt.pcm import RATE_HZ, decode, f32_from_s16, require_pcm
 from athome.stt.types import Segment, SttError, Transcript
 
 FIXTURE = Path(__file__).parent / "fixtures" / "stt" / "hello.wav"
@@ -224,6 +225,32 @@ def test_require_pcm_accepts_float_array_and_rejects_bad_buffers() -> None:
         require_pcm(b"\x00\x00\x00")
     with pytest.raises(SttError, match="empty"):
         require_pcm(array.array("f", []))
+
+
+async def test_decode_stages_its_temp_file_off_the_event_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    loop_thread = threading.current_thread()
+    staging_threads: list[threading.Thread] = []
+    real_mkstemp = tempfile.mkstemp
+
+    def recording_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        staging_threads.append(threading.current_thread())
+        return real_mkstemp(*args, **kwargs)  # type: ignore[arg-type]
+
+    class FakeCompleted:
+        returncode = 0
+        stdout = array.array("f", [0.25]).tobytes()
+        stderr = b""
+
+    async def fake_run_process(cmd: list[str], *, check: bool = False) -> FakeCompleted:
+        return FakeCompleted()
+
+    monkeypatch.setattr("athome.stt.pcm.tempfile.mkstemp", recording_mkstemp)
+    monkeypatch.setattr("athome.stt.pcm.ffmpeg_path", lambda: "ffmpeg")
+    monkeypatch.setattr("athome.stt.pcm.anyio.run_process", fake_run_process)
+
+    samples = await decode(b"fake-container-bytes")
+    assert samples.tolist() == [0.25]
+    assert staging_threads and all(thread is not loop_thread for thread in staging_threads)
 
 
 # --- catalog ---------------------------------------------------------------
