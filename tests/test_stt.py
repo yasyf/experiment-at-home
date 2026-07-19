@@ -289,6 +289,7 @@ def test_transcript_from_result_divides_ms_to_seconds_once() -> None:
     assert transcript.segments[0].words[0].start == 1.234
     assert transcript.words[0].end == 5.678
     assert transcript.load_ms == 9.0
+    assert transcript.language == "en"  # the native language tag rides along
 
 
 async def test_transcribe_maps_seconds_and_carries_load_ms(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -298,6 +299,7 @@ async def test_transcribe_maps_seconds_and_carries_load_ms(monkeypatch: pytest.M
     assert transcript.text == "hi"
     assert transcript.segments[0].start == 0.5
     assert transcript.load_ms == 123.0
+    assert transcript.language == "en"  # round-trips from the native Result
 
 
 # --- warmup tolerates a truncated silent run -------------------------------
