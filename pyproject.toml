@@ -31,7 +31,7 @@ serve = ["httpx>=0.28", "openai>=1.50"]
 activator = ["starlette>=0.40", "uvicorn>=0.30"]
 llm = ["spawnllm>=0.6.1"]
 ocr = ["ocrmac>=1.0"]
-modal = ["modal>=0.66"]
+modal = ["modal>=1.0"]
 hf = ["huggingface-hub>=0.26"]
 embed = ["numpy>=2", "sentence-transformers>=3"]
 embed-voyage = ["voyageai>=0.3.7", "numpy>=2"]
@@ -43,7 +43,7 @@ gate = ["numpy>=2", "scipy>=1.14.1", "scikit-learn>=1.5"]
 # AutoTokenizer.apply_chat_template before handing tinker token IDs, and that call
 # needs jinja2 — which transformers pulls only under its `chat-template` extra, so
 # a bare install would ImportError on the first Tinker run.
-train = ["tinker>=0.22", "datasets>=4", "modal>=0.66", "transformers>=4.42", "jinja2>=3.1"]
+train = ["tinker>=0.22", "datasets>=4", "modal>=1.0", "transformers>=4.42", "jinja2>=3.1"]
 # Tinker DPO only. Its custom loss runs locally: `forward_backward_custom` returns
 # logprobs, and torch computes the log-sigmoid margin and backprops it into the
 # per-token weights. Modal DPO needs nothing here (torch lives in the Modal image),

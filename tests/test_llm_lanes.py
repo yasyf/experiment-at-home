@@ -60,7 +60,9 @@ def local_env(monkeypatch: pytest.MonkeyPatch, fake_spawn: ModuleType) -> Simple
     monkeypatch.setenv("ATHOME_SERVE_RAPID_MLX_VERSION", "0.10.9")
     monkeypatch.setenv("ATHOME_SERVE_RAPID_MLX_MODEL", "mlx-community/Qwen3-4bit")
     load.cache_clear()
-    handle = ServerHandle(recipe="rapid-mlx", port=8400, pid=None, base_url="http://127.0.0.1:8400/v1")
+    handle = ServerHandle(
+        recipe="rapid-mlx", port=8400, pid=None, base_url="http://127.0.0.1:8400/v1", api_key="local"
+    )
 
     async def fake_ensure(self: serve.ManagedServer, *, persistent: bool = False) -> ServerHandle:
         return handle
@@ -253,6 +255,33 @@ async def test_local_schema_validates_and_wraps_transport(local_env: SimpleNames
     assert backend.transport is local_env.transport
     assert local_env.spawn.extract.call_args.args[1] is Sentiment
     assert llm.default_log().records[-1].model == "claude-haiku-4-5"
+
+
+async def test_local_builds_a_hosted_backend_from_served_model_and_handle_key(
+    fake_spawn: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from athome import serve
+
+    monkeypatch.setenv("ATHOME_SERVE_MODAL_VLLM_WORKSPACE", "anetaco")
+    monkeypatch.setenv("ATHOME_SERVE_MODAL_VLLM_VLLM_VERSION", "0.11.0")
+    monkeypatch.setenv("ATHOME_SERVE_MODAL_VLLM_API_KEY", "sk-ccsteer-test")
+    load.cache_clear()
+    endpoint = "https://anetaco--athome-modal-vllm-serve.modal.run/v1"
+    handle = ServerHandle(recipe="modal-vllm", port=None, pid=None, base_url=endpoint, api_key="sk-ccsteer-test")
+
+    async def fake_ensure(self: serve.ManagedServer, *, persistent: bool = False) -> ServerHandle:
+        return handle
+
+    monkeypatch.setattr(serve.ManagedServer, "ensure", fake_ensure)
+    monkeypatch.setattr("athome.llmcache.transport", lambda **_: None)
+
+    fake_spawn.call.return_value = "hosted text"
+    result = await local("hi there", recipe="modal-vllm")
+    assert result == "hosted text"
+    backend = fake_spawn.call.call_args.kwargs["backend"]
+    assert backend.base_url == endpoint
+    assert backend.model == "qwen3-8b"
+    assert backend.api_key == "sk-ccsteer-test"
 
 
 def test_module_import_does_not_eagerly_pull_spawnllm() -> None:

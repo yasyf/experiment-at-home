@@ -44,3 +44,6 @@ coverage.xml
 # Great Docs build output
 great-docs/
 docs/scripts/.gd-build/
+
+# Spike scratch (untracked; do not commit)
+.spike-reference/

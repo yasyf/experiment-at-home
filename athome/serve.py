@@ -5,7 +5,7 @@ import os
 import shlex
 import signal
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, ClassVar, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
 import anyio
 import click
@@ -22,11 +22,12 @@ from athome.launchd import AgentSpec, KeepAlive, LaunchdError
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
 
-type Recipe = Literal["rapid-mlx", "mlx-vlm", "llama-server"]
+type Recipe = Literal["rapid-mlx", "mlx-vlm", "llama-server", "modal-vllm"]
 
-RECIPES: tuple[Recipe, ...] = ("rapid-mlx", "mlx-vlm", "llama-server")
+RECIPES: tuple[Recipe, ...] = ("rapid-mlx", "mlx-vlm", "llama-server", "modal-vllm")
 DEFAULT_RECIPE: Recipe = "rapid-mlx"
 HEALTH_TIMEOUT_S = 1.0
+MODAL_PROBE_TIMEOUT_S = 10.0
 READY_TIMEOUT_S = 120.0
 READY_POLL_S = 1.0
 IDENTITY_CHARS = 8
@@ -99,12 +100,55 @@ class LlamaServerSettings(SectionSettings):
     port: int = 8402
 
 
-type RecipeSettings = RapidMlxSettings | MlxVlmSettings | LlamaServerSettings
+class ModalVllmSettings(SectionSettings):
+    """The ``[serve.modal-vllm]`` section: a scale-to-zero hosted vLLM endpoint on Modal.
+
+    The hosted text lane. Every field the throwaway spike hard-coded lands here as a
+    configurable pin — the vLLM version, base model and its commit, the LoRA adapter, and
+    the GPU class — so the deployed endpoint is byte-reproducible and its served results
+    stay comparable with the local MLX baseline.
+
+    Unlike the local recipes it carries no ``port``: a Modal web endpoint answers on a
+    workspace-scoped HTTPS URL (``https://{workspace}--{app_name}-serve.modal.run``), not
+    a loopback port, and Modal's own ``scaledown_window`` — not launchd — reaps it once idle.
+
+    ``workspace``, ``vllm_version``, and ``api_key`` are required: the first two so the
+    endpoint URL and image are reproducible, the last so the public Modal URL is not open.
+    A recipe missing any of them reads as unconfigured and is skipped by ``probe_all``.
+    """
+
+    section: ClassVar[tuple[str, ...]] = ("serve", "modal-vllm")
+    workspace: str
+    vllm_version: str
+    api_key: str
+    app_name: str = "athome-modal-vllm"
+    gpu: str = "A10G"
+    base_model: str = "Qwen/Qwen3-8B"
+    hf_revision: str = "b968826d9c46dd6066d109eabc6255188de91218"
+    served_model_name: str = "qwen3-8b"
+    adapter_name: str = "watcher"
+    adapter_volume: str = "cc-steer-watcher-adapter"
+    hf_cache_volume: str = "cc-steer-hf-cache"
+    max_lora_rank: int = 32
+    max_model_len: int = 4096
+    gpu_memory_utilization: float = 0.92
+    max_logprobs: int = 40
+    max_concurrent_inputs: int = 32
+    scaledown_window: int = 300
+    startup_timeout: int = 900
+    request_timeout: int = 3600
+
+
+type RecipeSettings = RapidMlxSettings | MlxVlmSettings | LlamaServerSettings | ModalVllmSettings
 
 
 @dataclass(frozen=True, slots=True)
 class ServerHandle:
-    """A running recipe's port, pid (``None`` for a launchd service), and OpenAI base URL.
+    """A running recipe's port (``None`` for a hosted endpoint), pid (``None`` for a launchd
+    service or a hosted endpoint), OpenAI base URL, and the bearer credential that reaches it.
+
+    ``api_key`` is ``"local"`` for a loopback recipe and the recipe's configured key for a hosted
+    one, so a consumer holding only the handle can authenticate against the endpoint.
 
     Example:
         >>> handle = await up("mlx-vlm")
@@ -113,9 +157,10 @@ class ServerHandle:
     """
 
     recipe: Recipe
-    port: int
+    port: int | None
     pid: int | None
     base_url: str
+    api_key: str
 
 
 def settings_for(recipe: Recipe) -> RecipeSettings:
@@ -126,6 +171,8 @@ def settings_for(recipe: Recipe) -> RecipeSettings:
             return load(MlxVlmSettings)
         case "llama-server":
             return load(LlamaServerSettings)
+        case "modal-vllm":
+            return load(ModalVllmSettings)
 
 
 def command_for(recipe: Recipe, *, model: str | None = None, port: int | None = None) -> tuple[str, ...]:
@@ -159,6 +206,8 @@ def command_for(recipe: Recipe, *, model: str | None = None, port: int | None = 
             if model is not None or port is not None:
                 raise ServeError("llama-server is a full command string; it takes no model or port override")
             return tuple(shlex.split(load(LlamaServerSettings).command))
+        case "modal-vllm":
+            raise ServeError("modal-vllm is a hosted Modal recipe; it has no local command vector")
 
 
 def configured_model(recipe: Recipe) -> str | None:
@@ -167,6 +216,8 @@ def configured_model(recipe: Recipe) -> str | None:
             return model
         case LlamaServerSettings():
             return None
+        case ModalVllmSettings(served_model_name=model):
+            return model
 
 
 def configured(recipe: Recipe) -> bool:
@@ -186,16 +237,172 @@ def detach_name(recipe: Recipe) -> str:
 
 
 def health_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(timeout=HEALTH_TIMEOUT_S)
+    return httpx.AsyncClient()
 
 
 def kill_group(pid: int) -> None:
     os.killpg(os.getpgid(pid), signal.SIGTERM)
 
 
+@runtime_checkable
+class ServeBackend(Protocol):
+    """The substrate a recipe runs on, behind the one :class:`ManagedServer` abstraction.
+
+    Health, model verification, readiness polling, and the OpenAI client are substrate-agnostic
+    HTTP against ``base_url`` — they live on :class:`ManagedServer`. The rest differs between a
+    local subprocess and a hosted endpoint, and it is all a backend answers: where the endpoint
+    lives, which api key reaches it, the pid of an already-running instance, how to start and stop
+    it, how long a cold start and a single probe may take, and how to observe health without waking
+    a scale-to-zero endpoint.
+    """
+
+    def base_url(self, server: ManagedServer) -> str:
+        """The OpenAI-compatible ``/v1`` endpoint this recipe answers on."""
+        ...
+
+    def api_key(self, server: ManagedServer) -> str:
+        """The bearer credential that reaches the endpoint."""
+        ...
+
+    def adopt(self, server: ManagedServer) -> int | None:
+        """The pid of an instance already answering healthy, for the adopted handle."""
+        ...
+
+    def ready_timeout_s(self, server: ManagedServer) -> float:
+        """The cold-start budget: how long :meth:`ManagedServer.wait_healthy` waits before giving up."""
+        ...
+
+    def probe_timeout_s(self, server: ManagedServer) -> float:
+        """The per-probe timeout for a single ``GET /v1/models`` health check."""
+        ...
+
+    async def start(self, server: ManagedServer, *, persistent: bool) -> int | None:
+        """Bring the server up and return its pid, or ``None`` when it owns no local process."""
+        ...
+
+    async def stop(self, server: ManagedServer) -> None:
+        """Tear the server down."""
+        ...
+
+    async def probe(self, server: ManagedServer) -> bool:
+        """Report health without waking a scale-to-zero endpoint (a passive, side-effect-free check)."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class LocalServeBackend:
+    """A recipe served as a local uvx subprocess: a detached run, or a launchd KeepAlive agent."""
+
+    def base_url(self, server: ManagedServer) -> str:
+        return f"http://127.0.0.1:{server.served_port}/v1"
+
+    def api_key(self, server: ManagedServer) -> str:
+        return "local"
+
+    def adopt(self, server: ManagedServer) -> int | None:
+        return detach.running(server.run_name)
+
+    def ready_timeout_s(self, server: ManagedServer) -> float:
+        return READY_TIMEOUT_S
+
+    def probe_timeout_s(self, server: ManagedServer) -> float:
+        return HEALTH_TIMEOUT_S
+
+    async def start(self, server: ManagedServer, *, persistent: bool) -> int | None:
+        command = command_for(server.recipe, model=server.model, port=server.port)
+        if persistent:
+            await launchd.install(
+                AgentSpec(label=server.label, command=command, schedule=KeepAlive(), log_name=server.run_name)
+            )
+            return None
+        return (await detach.launch(command, name=server.run_name)).pid
+
+    async def stop(self, server: ManagedServer) -> None:
+        if server.label in launchd.installed():
+            try:
+                await launchd.uninstall(server.label)
+            except LaunchdError:
+                pass
+        if (pid := detach.running(server.run_name)) is not None:
+            try:
+                kill_group(pid)
+            except ProcessLookupError:
+                pass
+
+    async def probe(self, server: ManagedServer) -> bool:
+        return await server.health()
+
+
+@dataclass(frozen=True, slots=True)
+class ModalServeBackend:
+    """A recipe served as a scale-to-zero Modal vLLM web endpoint.
+
+    ``start`` deploys the athome-owned Modal app only when it is missing or its pins have drifted:
+    a warm, matching deployment is woken by :meth:`ManagedServer.wait_healthy`'s first request off a
+    cold, scaled-to-zero container, not redeployed. Deploy and wake are distinct — redeploying on
+    every cold start would mint a fresh revision, demand deploy credentials for a read-side wake, and
+    add control-plane latency to the readiness path. There is no local process to adopt or kill:
+    ``stop`` is a no-op, because Modal's ``scaledown_window`` — not athome — reaps an idle endpoint.
+    """
+
+    def base_url(self, server: ManagedServer) -> str:
+        from athome import serve_modal
+
+        settings = load(ModalVllmSettings)
+        return f"https://{settings.workspace}--{settings.app_name}-{serve_modal.ENDPOINT_FUNCTION}.modal.run/v1"
+
+    def api_key(self, server: ManagedServer) -> str:
+        return load(ModalVllmSettings).api_key
+
+    def adopt(self, server: ManagedServer) -> int | None:
+        return None
+
+    def ready_timeout_s(self, server: ManagedServer) -> float:
+        return float(load(ModalVllmSettings).startup_timeout)
+
+    def probe_timeout_s(self, server: ManagedServer) -> float:
+        return MODAL_PROBE_TIMEOUT_S
+
+    async def start(self, server: ManagedServer, *, persistent: bool) -> int | None:
+        from athome import serve_modal
+
+        if persistent:
+            raise ServeError("a hosted recipe has no launchd agent; Modal's scaledown owns its lifecycle")
+        settings = load(ModalVllmSettings)
+        if await serve_modal.deployed_fingerprint(settings) == serve_modal.fingerprint(settings):
+            return None
+        await serve_modal.deploy(settings)
+        resolved = serve_modal.web_url(await serve_modal.locate(settings))
+        expected = self.base_url(server).removesuffix("/v1")
+        if resolved is not None and resolved.rstrip("/") != expected:
+            raise ServeError(f"modal-vllm deployed at {resolved!r}, not the expected {self.base_url(server)!r}")
+        return None
+
+    async def stop(self, server: ManagedServer) -> None:
+        return None
+
+    async def probe(self, server: ManagedServer) -> bool:
+        from athome import serve_modal
+
+        return await serve_modal.locate(load(ModalVllmSettings)) is not None
+
+
+def backend_for(recipe: Recipe) -> ServeBackend:
+    match recipe:
+        case "rapid-mlx" | "mlx-vlm" | "llama-server":
+            return LocalServeBackend()
+        case "modal-vllm":
+            return ModalServeBackend()
+
+
 @dataclass(frozen=True, slots=True)
 class ManagedServer:
-    """A recipe-configured OpenAI-compatible local server with lifecycle + health.
+    """A recipe-configured OpenAI-compatible server with lifecycle + health, over any backend.
+
+    The recipe picks the backend: a local uvx subprocess (``rapid-mlx``, ``mlx-vlm``,
+    ``llama-server``) or a scale-to-zero hosted Modal vLLM endpoint (``modal-vllm``). Health,
+    model verification, readiness, and the client are identical across both — only where the
+    endpoint lives and how it starts and stops differ, which is all a :class:`ServeBackend` answers.
 
     ``model`` and ``port`` override the recipe's configured pair for one server — serving an
     arbitrary artifact (a freshly fused MLX directory, say) without touching the process-global
@@ -212,15 +419,49 @@ class ManagedServer:
     model: str | None = field(default=None, kw_only=True)
     port: int | None = field(default=None, kw_only=True)
 
+    def __post_init__(self) -> None:
+        if self.recipe != "modal-vllm":
+            return
+        if self.port is not None:
+            raise ServeError("modal-vllm answers on a workspace-scoped HTTPS URL; it takes no port override")
+        if self.model is not None:
+            raise ServeError("modal-vllm serves the model pinned by its deploy; it takes no model override")
+
     @property
     def served_model(self) -> str | None:
         """The model this server serves: the override, else the recipe's configured model."""
         return self.model if self.model is not None else configured_model(self.recipe)
 
     @property
-    def served_port(self) -> int:
-        """The port this server listens on: the override, else the recipe's configured port."""
-        return self.port if self.port is not None else settings_for(self.recipe).port
+    def required_models(self) -> set[str]:
+        """Every model id the endpoint must report, not just the base.
+
+        An override serves exactly the one model it names. A hosted vLLM recipe serves its base
+        model *and* the LoRA adapter it exists to score under a second id — an endpoint serving only
+        the base would pass a base-only identity check while missing the adapter. A ``llama-server``
+        command advertises nothing checkable, so it requires none.
+        """
+        if self.model is not None:
+            return {self.model}
+        match settings_for(self.recipe):
+            case ModalVllmSettings(served_model_name=base, adapter_name=adapter):
+                return {base, adapter}
+            case _:
+                return {model} if (model := configured_model(self.recipe)) is not None else set()
+
+    @property
+    def served_port(self) -> int | None:
+        """The port this server listens on: the override, else the configured port; ``None`` when hosted.
+
+        A hosted recipe answers on a workspace-scoped HTTPS URL, not a loopback port, so it has none.
+        """
+        if self.port is not None:
+            return self.port
+        match settings_for(self.recipe):
+            case ModalVllmSettings():
+                return None
+            case RapidMlxSettings(port=port) | MlxVlmSettings(port=port) | LlamaServerSettings(port=port):
+                return port
 
     @property
     def identity(self) -> str:
@@ -242,57 +483,90 @@ class ManagedServer:
         """The launchd label owning this server's agent."""
         return agent_label(self.recipe) if self.model is None else f"{agent_label(self.recipe)}-{self.identity}"
 
+    @property
+    def backend(self) -> ServeBackend:
+        """The substrate this recipe runs on: a local subprocess, or a hosted Modal endpoint."""
+        return backend_for(self.recipe)
+
+    @property
+    def base_url(self) -> str:
+        """The OpenAI-compatible ``/v1`` endpoint this server answers on."""
+        return self.backend.base_url(self)
+
+    @property
+    def api_key(self) -> str:
+        """The bearer credential that reaches this server's endpoint."""
+        return self.backend.api_key(self)
+
+    @property
+    def auth(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"}
+
     def handle(self, *, pid: int | None = None) -> ServerHandle:
-        port = self.served_port
-        return ServerHandle(recipe=self.recipe, port=port, pid=pid, base_url=f"http://127.0.0.1:{port}/v1")
+        return ServerHandle(
+            recipe=self.recipe, port=self.served_port, pid=pid, base_url=self.base_url, api_key=self.api_key
+        )
 
     async def health(self) -> bool:
-        """Return ``True`` when ``GET /v1/models`` answers 2xx within the health timeout."""
-        url = f"http://127.0.0.1:{self.served_port}/v1/models"
+        """Return ``True`` when ``GET /v1/models`` answers 2xx within the backend's probe timeout."""
         async with health_client() as client:
             try:
-                response = await client.get(url)
+                response = await client.get(
+                    f"{self.base_url}/models", headers=self.auth, timeout=self.backend.probe_timeout_s(self)
+                )
             except httpx.HTTPError:
                 return False
         return response.is_success
 
-    async def verify_served_model(self) -> None:
-        """Raise :class:`ServeError` unless ``GET /v1/models`` lists the model this server serves.
+    async def probe(self) -> bool:
+        """Report health without waking a scale-to-zero backend — a passive, side-effect-free check.
 
-        This is an identity check, not authentication: a hostile process holding the port could
-        spoof the model id, and trusting a localhost endpoint is inherent to the design.
+        A local recipe probes its loopback endpoint (free); a hosted recipe observes its deployment
+        through Modal's control plane, never an HTTP request that would cold-boot and bill a container.
         """
-        if (want := self.served_model) is None:
+        return await self.backend.probe(self)
+
+    async def verify_served_model(self) -> None:
+        """Raise :class:`ServeError` unless ``GET /v1/models`` lists every model this server requires.
+
+        This is an identity check, not authentication: a process holding the endpoint could spoof
+        the model ids, and trusting the resolved endpoint is inherent to the design.
+        """
+        if not (want := self.required_models):
             return
-        port = self.served_port
         async with health_client() as client:
-            response = await client.get(f"http://127.0.0.1:{port}/v1/models")
-        if want not in (served := [model["id"] for model in response.json()["data"]]):
-            raise ServeError(f"{self.recipe} on port {port} serves {served}, not the configured model {want!r}")
+            response = await client.get(
+                f"{self.base_url}/models", headers=self.auth, timeout=self.backend.probe_timeout_s(self)
+            )
+        served = {model["id"] for model in response.json()["data"]}
+        if missing := (want - served):
+            raise ServeError(
+                f"{self.recipe} at {self.base_url} is missing {sorted(missing)}; it serves {sorted(served)}"
+            )
 
     async def wait_healthy(self) -> None:
-        deadline = anyio.current_time() + READY_TIMEOUT_S
+        timeout = self.backend.ready_timeout_s(self)
+        deadline = anyio.current_time() + timeout
         while True:
             healthy = await self.health()
             if anyio.current_time() >= deadline:
-                raise HealthTimeout(
-                    f"{self.recipe} not healthy on port {self.served_port} after {READY_TIMEOUT_S:.0f}s"
-                )
+                raise HealthTimeout(f"{self.recipe} not healthy at {self.base_url} after {timeout:.0f}s")
             if healthy:
                 await self.verify_served_model()
                 return
             await anyio.sleep(READY_POLL_S)
 
     async def ensure(self, *, persistent: bool = False) -> ServerHandle:
-        """Return a healthy server for this recipe, spawning it if necessary.
+        """Return a healthy server for this recipe, starting it if necessary.
 
-        A recipe already answering healthy on its port returns its handle without
-        respawning. Otherwise the recipe's command vector is launched — detached via
+        A recipe already answering healthy returns its handle without restarting. Otherwise the
+        backend brings it up — a local recipe launches its command vector, detached via
         :mod:`athome.detach` (``persistent=False``) or as a launchd ``KeepAlive`` agent
-        (``persistent=True``) — and the call blocks until health polling succeeds.
+        (``persistent=True``); a hosted recipe deploys its Modal app — and the call blocks until
+        health polling succeeds.
 
         Args:
-            persistent: Install a launchd KeepAlive agent instead of a detached run.
+            persistent: Install a launchd KeepAlive agent instead of a detached run (local recipes only).
 
         Returns:
             The running server's handle.
@@ -303,21 +577,10 @@ class ManagedServer:
         """
         if await self.health():
             await self.verify_served_model()
-            return self.handle(pid=detach.running(self.run_name))
-        command = command_for(self.recipe, model=self.model, port=self.port)
+            return self.handle(pid=self.backend.adopt(self))
         pid: int | None = None
         try:
-            if persistent:
-                await launchd.install(
-                    AgentSpec(
-                        label=self.label,
-                        command=command,
-                        schedule=KeepAlive(),
-                        log_name=self.run_name,
-                    )
-                )
-            else:
-                pid = (await detach.launch(command, name=self.run_name)).pid
+            pid = await self.backend.start(self, persistent=persistent)
             await self.wait_healthy()
         except BaseException:
             with anyio.CancelScope(shield=True):
@@ -326,21 +589,13 @@ class ManagedServer:
         return self.handle(pid=pid)
 
     async def stop(self) -> None:
-        """Stop this recipe — boot out its launchd agent *and* kill its detached process group.
+        """Stop this recipe by tearing down its backend.
 
-        The two teardowns run independently: a launchd uninstall failure never skips the
-        detached-process kill.
+        A local recipe boots out its launchd agent *and* kills its detached process group — the
+        two run independently, so a launchd uninstall failure never skips the process kill. A
+        hosted recipe has no local process: Modal's scaledown reaps it, so this is a no-op.
         """
-        if self.label in launchd.installed():
-            try:
-                await launchd.uninstall(self.label)
-            except LaunchdError:
-                pass
-        if (pid := detach.running(self.run_name)) is not None:
-            try:
-                kill_group(pid)
-            except ProcessLookupError:
-                pass
+        await self.backend.stop(self)
 
     def idle(self, *, ttl_s: float) -> IdleResource[ServerHandle]:
         """An :class:`~athome.idle.IdleResource` that spawns this server on first use and stops it once idle.
@@ -363,13 +618,13 @@ class ManagedServer:
             cached: Route requests through :func:`athome.llmcache.transport` for record/replay.
 
         Returns:
-            A client with ``base_url`` set to the recipe's ``/v1`` endpoint and a local api key.
+            A client with ``base_url`` set to the recipe's ``/v1`` endpoint and its api key.
         """
         from openai import AsyncOpenAI
 
         return AsyncOpenAI(
-            base_url=self.handle().base_url,
-            api_key="local",
+            base_url=self.base_url,
+            api_key=self.api_key,
             http_client=httpx.AsyncClient(transport=llmcache.transport() if cached else None),
         )
 
@@ -385,8 +640,8 @@ async def down(recipe: Recipe) -> None:
 
 
 async def probe_all() -> list[tuple[Recipe, bool]]:
-    """Report the health of every configured recipe."""
-    return [(recipe, await ManagedServer(recipe).health()) for recipe in RECIPES if configured(recipe)]
+    """Report the health of every configured recipe, without waking a scale-to-zero endpoint."""
+    return [(recipe, await ManagedServer(recipe).probe()) for recipe in RECIPES if configured(recipe)]
 
 
 @click.group("serve")
@@ -419,8 +674,8 @@ async def down_command(recipe: str, as_json: bool) -> None:
 @json_option
 @coro
 async def status_command(recipe: str, as_json: bool) -> None:
-    """Print RECIPE's current health (default rapid-mlx)."""
-    emit({"recipe": recipe, "healthy": await ManagedServer(recipe).health()}, as_json=as_json)
+    """Print RECIPE's current health (default rapid-mlx), without waking a scale-to-zero endpoint."""
+    emit({"recipe": recipe, "healthy": await ManagedServer(recipe).probe()}, as_json=as_json)
 
 
 @cli.command("activator")

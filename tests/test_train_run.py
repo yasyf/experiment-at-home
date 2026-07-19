@@ -169,7 +169,7 @@ class FakeServer:
     async def ensure(self) -> serve.ServerHandle:
         FakeServer.ensured.append((self.model, self.port))
         return serve.ServerHandle(
-            recipe="rapid-mlx", port=self.port, pid=1, base_url=f"http://127.0.0.1:{self.port}/v1"
+            recipe="rapid-mlx", port=self.port, pid=1, base_url=f"http://127.0.0.1:{self.port}/v1", api_key="local"
         )
 
     async def stop(self) -> None:

@@ -7,7 +7,14 @@ from typing import TYPE_CHECKING
 import httpx
 
 from athome.ocr.types import Document
-from athome.serve import LlamaServerSettings, ManagedServer, MlxVlmSettings, RapidMlxSettings, settings_for
+from athome.serve import (
+    LlamaServerSettings,
+    ManagedServer,
+    MlxVlmSettings,
+    ModalVllmSettings,
+    RapidMlxSettings,
+    settings_for,
+)
 
 if TYPE_CHECKING:
     from athome.serve import Recipe
@@ -49,7 +56,7 @@ def vlm_model(recipe: Recipe) -> str:
     match settings_for(recipe):
         case MlxVlmSettings(model=model) | RapidMlxSettings(model=model):
             return model
-        case LlamaServerSettings():
+        case LlamaServerSettings() | ModalVllmSettings():
             raise OcrError(f"recipe {recipe!r} has no vision model")
 
 

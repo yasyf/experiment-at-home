@@ -159,10 +159,13 @@ async def local[T: BaseModel](prompt: str, *, schema: type[T] | None = None, rec
     from spawnllm import extract as run_extract
 
     from athome import llmcache
-    from athome.serve import ManagedServer, settings_for
+    from athome.serve import ManagedServer
 
-    handle = await ManagedServer(recipe).ensure()
-    backend = OpenAiEndpointBackend(handle.base_url, settings_for(recipe).model, transport=llmcache.transport())
+    server = ManagedServer(recipe)
+    handle = await server.ensure()
+    backend = OpenAiEndpointBackend(
+        handle.base_url, server.served_model, api_key=handle.api_key, transport=llmcache.transport()
+    )
     if schema is None:
         return await metered(
             TIER_PRICE_MODEL["small"], prompt, lambda: call(prompt, backend=backend), lambda result: result

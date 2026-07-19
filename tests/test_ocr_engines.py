@@ -217,7 +217,7 @@ def test_box_to_wire_none() -> None:
 
 
 async def fake_ensure(self: object, *, persistent: bool = False) -> ServerHandle:
-    return ServerHandle(recipe="mlx-vlm", port=8401, pid=None, base_url="http://127.0.0.1:8401/v1")
+    return ServerHandle(recipe="mlx-vlm", port=8401, pid=None, base_url="http://127.0.0.1:8401/v1", api_key="local")
 
 
 async def test_vlm_read_posts_image_and_parses_markdown(monkeypatch: pytest.MonkeyPatch) -> None:

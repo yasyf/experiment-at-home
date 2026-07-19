@@ -13,7 +13,19 @@ from athome import serve
 from athome.config import load
 from athome.detach import DetachedRun
 from athome.launchd import KeepAlive, LaunchdError
-from athome.serve import HealthTimeout, ManagedServer, ServeError, ServerHandle, command_for, down, probe_all, up
+from athome.serve import (
+    HealthTimeout,
+    LocalServeBackend,
+    ManagedServer,
+    ModalServeBackend,
+    ServeBackend,
+    ServeError,
+    ServerHandle,
+    command_for,
+    down,
+    probe_all,
+    up,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -102,8 +114,18 @@ def test_handle_base_url() -> None:
     assert ManagedServer("mlx-vlm").handle().base_url == "http://127.0.0.1:8401/v1"
 
 
+def test_a_local_handle_carries_the_local_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    configure_rapid_mlx(monkeypatch)
+    assert ManagedServer("rapid-mlx").handle().api_key == "local"
+
+
+def test_both_backends_satisfy_the_serve_backend_protocol() -> None:
+    assert isinstance(LocalServeBackend(), ServeBackend)
+    assert isinstance(ModalServeBackend(), ServeBackend)
+
+
 def test_server_handle_is_frozen() -> None:
-    handle = ServerHandle(recipe="mlx-vlm", port=8401, pid=None, base_url="http://127.0.0.1:8401/v1")
+    handle = ServerHandle(recipe="mlx-vlm", port=8401, pid=None, base_url="http://127.0.0.1:8401/v1", api_key="local")
     with pytest.raises(AttributeError):
         handle.port = 9999  # type: ignore[misc]
 
