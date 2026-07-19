@@ -147,6 +147,15 @@ BASE_MODELS: dict[str, BaseModelSpec] = {
         num_layers=32,
         serves_locally=False,
     ),
+    "qwen3.6-35b-a3b": BaseModelSpec(
+        mlx=MlxModelId("mlx-community/Qwen3.6-35B-A3B-4bit"),
+        hf=HfRepoId("Qwen/Qwen3.6-35B-A3B"),
+        hf_revision="995ad96eacd98c81ed38be0c5b274b04031597b0",
+        mlx_revision="38740b847e4cb78f352aba30aa41c76e08e6eb46",
+        tinker=TinkerModelId("Qwen/Qwen3.6-35B-A3B"),
+        num_layers=40,
+        serves_locally=False,
+    ),
 }
 
 
