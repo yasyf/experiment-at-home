@@ -256,12 +256,15 @@ class SttStream:
 
         Raises:
             SttError: The chunk is invalid (raised before any native call; the stream stays
-                open), or the native feed failed (the stream is closed).
+                open), the stream is already closed, or the native feed failed (the stream
+                is closed).
         """
         from transcribe_cpp.errors import TranscribeError
 
         require_pcm(pcm)
         async with self.lock:
+            if self.closed:
+                raise SttError("stream closed")
             try:
                 update, text = await to_thread.run_sync(functools.partial(self._feed_native, pcm))
             except TranscribeError as failure:
@@ -275,11 +278,14 @@ class SttStream:
         """Flush the final hypothesis, close the stream, and return the full transcript.
 
         Raises:
-            SttError: The native finalize failed; the stream is closed either way.
+            SttError: The stream is already closed, or the native finalize failed; the stream
+                is closed either way.
         """
         from transcribe_cpp.errors import TranscribeError
 
         async with self.lock:
+            if self.closed:
+                raise SttError("stream closed")
             try:
                 update, text = await to_thread.run_sync(self._finalize_native)
             except TranscribeError as failure:
