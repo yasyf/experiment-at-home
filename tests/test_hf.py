@@ -48,12 +48,23 @@ def fake_hub(monkeypatch: pytest.MonkeyPatch) -> Iterator[ModuleType]:
 
 async def test_snapshot_uses_pinned_revision(fake_hub: ModuleType) -> None:
     assert await snapshot(PINNED_REPO) == Path(SNAPSHOT_PATH)
-    fake_hub.snapshot_download.assert_called_once_with(PINNED_REPO, revision=PINNED_SHA, token="tok_write")
+    fake_hub.snapshot_download.assert_called_once_with(
+        PINNED_REPO, revision=PINNED_SHA, token="tok_write", allow_patterns=None
+    )
 
 
 async def test_snapshot_explicit_revision_overrides_pin(fake_hub: ModuleType) -> None:
     await snapshot("unpinned/repo", revision="deadbeef")
-    fake_hub.snapshot_download.assert_called_once_with("unpinned/repo", revision="deadbeef", token="tok_write")
+    fake_hub.snapshot_download.assert_called_once_with(
+        "unpinned/repo", revision="deadbeef", token="tok_write", allow_patterns=None
+    )
+
+
+async def test_snapshot_patterns_become_allow_patterns(fake_hub: ModuleType) -> None:
+    await snapshot(PINNED_REPO, patterns=("*Q8_0*.gguf",))
+    fake_hub.snapshot_download.assert_called_once_with(
+        PINNED_REPO, revision=PINNED_SHA, token="tok_write", allow_patterns=["*Q8_0*.gguf"]
+    )
 
 
 async def test_snapshot_unpinned_repo_raises(fake_hub: ModuleType) -> None:
@@ -112,7 +123,9 @@ def test_cli_pull_prints_snapshot_path(fake_hub: ModuleType) -> None:
     result = CliRunner().invoke(hf.cli, ["pull", PINNED_REPO])
     assert result.exit_code == 0
     assert SNAPSHOT_PATH in result.output
-    fake_hub.snapshot_download.assert_called_once_with(PINNED_REPO, revision=PINNED_SHA, token="tok_write")
+    fake_hub.snapshot_download.assert_called_once_with(
+        PINNED_REPO, revision=PINNED_SHA, token="tok_write", allow_patterns=None
+    )
 
 
 @pytest.mark.live
