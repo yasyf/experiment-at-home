@@ -178,12 +178,14 @@ class FakeModel:
         self.closed.append(True)
 
 
-def wire(monkeypatch: pytest.MonkeyPatch, model: FakeModel) -> None:
+def wire(monkeypatch: pytest.MonkeyPatch, *models: FakeModel) -> None:
+    remaining = iter(models)
+
     async def fake_gguf_path(variant: str, quant: str = DEFAULT_QUANT) -> Path:
         return Path("/fake/model.gguf")
 
     async def fake_load_model(path: str, backend: str) -> FakeModel:
-        return model
+        return next(remaining)
 
     monkeypatch.setattr("athome.stt.engine.gguf_path", fake_gguf_path)
     monkeypatch.setattr("athome.stt.engine.load_model", fake_load_model)
@@ -319,6 +321,37 @@ def test_warmup_recovers_load_ms_from_a_truncated_silent_run() -> None:
             return TruncatingSession()
 
     assert Transcriber("x")._warmup(TruncatingModel()) == 17.0
+
+
+class ExplodingWarmupSession:
+    def __enter__(self) -> ExplodingWarmupSession:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        pass
+
+    def run(self, _pcm: object, *, timestamps: str = "auto") -> Result:
+        raise RuntimeError("metal kernel compile failed")
+
+
+class ExplodingWarmupModel(FakeModel):
+    def session(self) -> ExplodingWarmupSession:  # type: ignore[override]
+        return ExplodingWarmupSession()
+
+
+async def test_warmup_failure_closes_the_model_and_leaves_the_next_load_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad, good = ExplodingWarmupModel(), FakeModel(text="recovered")
+    wire(monkeypatch, bad, good)
+    stt = Transcriber("x")
+
+    with pytest.raises(RuntimeError, match="kernel compile"):
+        await stt.transcribe(pcm())
+    assert bad.closed == [True]  # the natively loaded model was not orphaned
+    assert stt.model is None
+
+    assert (await stt.transcribe(pcm())).text == "recovered"
 
 
 # --- compute serialization -------------------------------------------------

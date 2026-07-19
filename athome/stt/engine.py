@@ -100,8 +100,13 @@ class Transcriber:
 
     async def _load(self) -> Model:
         model = await load_model(str(await gguf_path(self.variant, self.quant)), self.backend)
+        try:
+            load_ms = await to_thread.run_sync(functools.partial(self._warmup, model))
+        except Exception:
+            await to_thread.run_sync(model.close)
+            raise
         self.model = model
-        self.load_ms = await to_thread.run_sync(functools.partial(self._warmup, model))
+        self.load_ms = load_ms
         return model
 
     def _warmup(self, model: Model) -> float:
