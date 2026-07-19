@@ -82,6 +82,7 @@ def test_main_list_commands_sorted() -> None:
         "run",
         "serve",
         "status",
+        "stt",
         "sync",
         "train",
     ]

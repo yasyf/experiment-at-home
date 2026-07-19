@@ -9,6 +9,8 @@ from pathlib import Path
 import anyio
 import pytest
 
+pytest.importorskip("transcribe_cpp")
+
 # The binding's value dataclasses are pure data — use them REAL and fake only the compute boundary.
 from transcribe_cpp import ParakeetBufferedStreamOptions, Result, StreamText, StreamUpdate, Timings
 from transcribe_cpp import Segment as NativeSegment
