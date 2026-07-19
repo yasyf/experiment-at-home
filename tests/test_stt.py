@@ -104,6 +104,8 @@ class FakeStream:
         return StreamText(full=self.committed, committed=self.committed, tentative="")
 
     def reset(self) -> None:
+        if (error := self.model.reset_error) is not None:
+            raise error
         self.reset_called = True
 
 
@@ -165,6 +167,7 @@ class FakeModel:
         closed: list | None = None,
         feed_error: Exception | None = None,
         finalize_error: Exception | None = None,
+        reset_error: Exception | None = None,
     ) -> None:
         self.text = text
         self.segments = segments
@@ -178,6 +181,7 @@ class FakeModel:
         self.closed = closed if closed is not None else []
         self.feed_error = feed_error
         self.finalize_error = finalize_error
+        self.reset_error = reset_error
         self.batch_sizes: list[int] = []
         self.session_closes = 0
 
@@ -650,6 +654,22 @@ async def test_native_finalize_failure_closes_the_stream_and_frees_the_lane(
     with anyio.fail_after(2), pytest.raises(SttError, match="finalize failed"):
         await stream.finalize()
     assert stream.closed is True
+    with anyio.fail_after(2):
+        assert (await stt.transcribe(pcm())).text == "after"
+
+
+async def test_failed_native_reset_still_releases_the_lane(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A reset/session-close failure must not strand stack.aclose(): the compute lane and the
+    # IdleResource use-ref release even when the native teardown raises.
+    error = RuntimeError("native reset blew up")
+    wire(monkeypatch, FakeModel(text="after", script=[("", 0)], final=("done", 1000), reset_error=error))
+    stt = Transcriber("x")
+    stream = await stt.stream(lookahead_ms=1000)
+
+    with pytest.raises(RuntimeError, match="reset blew up"):
+        await stream.aclose()
+    assert stream.closed is True
+    assert stt.resource.inflight == 0
     with anyio.fail_after(2):
         assert (await stt.transcribe(pcm())).text == "after"
 

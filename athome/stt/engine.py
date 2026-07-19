@@ -302,8 +302,10 @@ class SttStream:
         if self.closed:
             return
         self.closed = True
-        await to_thread.run_sync(self._reset_native)
-        await self.stack.aclose()
+        try:
+            await to_thread.run_sync(self._reset_native)
+        finally:
+            await self.stack.aclose()
 
     def _reset_native(self) -> None:
         self.native.reset()
