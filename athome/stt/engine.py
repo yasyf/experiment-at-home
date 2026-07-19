@@ -82,10 +82,13 @@ def transcript_from_result(result: Result) -> Transcript:
 class Transcriber:
     """A lazily-loaded transcribe.cpp model with a single serialized compute lane.
 
-    One ``anyio.Lock`` serializes every run, batch, and stream feed: the 0.x binding allows at most
-    one in-flight compute per loaded model, and overlapping runs corrupt each other. The model loads
+    One ``anyio.Semaphore(1)`` serializes every run, batch, and stream feed: the 0.x binding allows
+    at most one in-flight compute per loaded model, and overlapping runs corrupt each other. A
+    semaphore rather than a lock because a stream may be opened in one task and finalized or closed
+    in another — lock release is task-affine, semaphore release is not, and ``max_value=1`` makes an
+    over-release raise instead of silently widening the lane. The model loads
     on first use and unloads after ``idle_s`` idle via :class:`~athome.idle.IdleResource`; an open
-    stream holds both a use-reference and the compute lock for its whole lifetime, so the reaper
+    stream holds both a use-reference and the compute lane for its whole lifetime, so the reaper
     cannot unload mid-stream and a stuck stream starves batch (bounded upstream by the activator).
 
     Example:
@@ -101,7 +104,7 @@ class Transcriber:
         self.quant = quant
         self.backend = backend
         self.resource: IdleResource[Model] = IdleResource(self._load, self._unload, ttl_s=idle_s)
-        self.lock = anyio.Lock()
+        self.lock = anyio.Semaphore(1, max_value=1)
         self.model: Model | None = None
         self.load_ms = 0.0
 
@@ -216,6 +219,7 @@ class SttStream:
         self.native = native
         self.stack = stack
         self.load_ms = load_ms
+        self.lock = anyio.Semaphore(1, max_value=1)
         self.committed = ""
         self.committed_ms = 0
         self.segments: list[Segment] = []
@@ -237,24 +241,30 @@ class SttStream:
     async def feed(self, pcm: Pcm) -> tuple[Segment, ...]:
         """Feed a float32 16 kHz mono chunk; return only the newly committed segment deltas."""
         require_pcm(pcm)
-        update, text = await to_thread.run_sync(functools.partial(self._feed_native, pcm))
-        if text is None:
-            return ()
-        return self._commit(text.committed, update.audio_committed_ms)
+        async with self.lock:
+            update, text = await to_thread.run_sync(functools.partial(self._feed_native, pcm))
+            if text is None:
+                return ()
+            return self._commit(text.committed, update.audio_committed_ms)
 
     async def finalize(self) -> Transcript:
         """Flush the final hypothesis, close the stream, and return the full transcript."""
-        update, text = await to_thread.run_sync(self._finalize_native)
-        self._commit(text.committed, update.audio_committed_ms)
-        await self.aclose()
-        return Transcript(text=text.committed, segments=tuple(self.segments), words=(), load_ms=self.load_ms)
+        async with self.lock:
+            update, text = await to_thread.run_sync(self._finalize_native)
+            self._commit(text.committed, update.audio_committed_ms)
+            await self._close()
+            return Transcript(text=text.committed, segments=tuple(self.segments), words=(), load_ms=self.load_ms)
 
     def _finalize_native(self) -> tuple[StreamUpdate, StreamText]:
         update = self.native.finalize()
         return update, self.native.text()
 
     async def aclose(self) -> None:
-        """Reset the native stream and release the compute lock and use-reference. Idempotent."""
+        """Reset the native stream and release the compute lane and use-reference. Idempotent."""
+        async with self.lock:
+            await self._close()
+
+    async def _close(self) -> None:
         if self.closed:
             return
         self.closed = True
