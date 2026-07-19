@@ -4,6 +4,7 @@ import hashlib
 import os
 import shlex
 import signal
+import sys
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
@@ -18,13 +19,14 @@ from athome.config import SectionSettings, load
 from athome.errors import AthomeError
 from athome.idle import IdleResource
 from athome.launchd import AgentSpec, KeepAlive, LaunchdError
+from athome.stt.server import SttServeSettings
 
 if TYPE_CHECKING:
     from openai import AsyncOpenAI
 
-type Recipe = Literal["rapid-mlx", "mlx-vlm", "llama-server", "modal-vllm"]
+type Recipe = Literal["rapid-mlx", "mlx-vlm", "llama-server", "modal-vllm", "stt"]
 
-RECIPES: tuple[Recipe, ...] = ("rapid-mlx", "mlx-vlm", "llama-server", "modal-vllm")
+RECIPES: tuple[Recipe, ...] = ("rapid-mlx", "mlx-vlm", "llama-server", "modal-vllm", "stt")
 DEFAULT_RECIPE: Recipe = "rapid-mlx"
 HEALTH_TIMEOUT_S = 1.0
 MODAL_PROBE_TIMEOUT_S = 10.0
@@ -139,7 +141,7 @@ class ModalVllmSettings(SectionSettings):
     request_timeout: int = 3600
 
 
-type RecipeSettings = RapidMlxSettings | MlxVlmSettings | LlamaServerSettings | ModalVllmSettings
+type RecipeSettings = RapidMlxSettings | MlxVlmSettings | LlamaServerSettings | ModalVllmSettings | SttServeSettings
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +175,8 @@ def settings_for(recipe: Recipe) -> RecipeSettings:
             return load(LlamaServerSettings)
         case "modal-vllm":
             return load(ModalVllmSettings)
+        case "stt":
+            return load(SttServeSettings)
 
 
 def command_for(recipe: Recipe, *, model: str | None = None, port: int | None = None) -> tuple[str, ...]:
@@ -208,12 +212,18 @@ def command_for(recipe: Recipe, *, model: str | None = None, port: int | None = 
             return tuple(shlex.split(load(LlamaServerSettings).command))
         case "modal-vllm":
             raise ServeError("modal-vllm is a hosted Modal recipe; it has no local command vector")
+        case "stt":
+            if model is not None or port is not None:
+                raise ServeError("stt is config-driven via [serve.stt]; it takes no model or port override")
+            return (sys.executable, "-m", "athome", "serve", "stt")
 
 
 def configured_model(recipe: Recipe) -> str | None:
     match settings_for(recipe):
         case RapidMlxSettings(model=model) | MlxVlmSettings(model=model):
             return model
+        case SttServeSettings(variant=variant):
+            return variant
         case LlamaServerSettings():
             return None
         case ModalVllmSettings(served_model_name=model):
@@ -389,7 +399,7 @@ class ModalServeBackend:
 
 def backend_for(recipe: Recipe) -> ServeBackend:
     match recipe:
-        case "rapid-mlx" | "mlx-vlm" | "llama-server":
+        case "rapid-mlx" | "mlx-vlm" | "llama-server" | "stt":
             return LocalServeBackend()
         case "modal-vllm":
             return ModalServeBackend()
@@ -685,6 +695,20 @@ def activator_command(host: str | None) -> None:
     from athome.activator import serve_activator
 
     serve_activator(host=host)
+
+
+@cli.command("stt")
+@click.option(
+    "--fd",
+    type=int,
+    default=None,
+    help="Serve on this inherited listener fd (the activator's {LISTEN_FD}) instead of the configured host/port.",
+)
+def stt_command(fd: int | None) -> None:
+    """Run the OpenAI-compatible STT transcription server (needs the ``stt`` extra)."""
+    from athome.stt.server import serve_stt
+
+    serve_stt(fd=fd)
 
 
 @click.command("status")
