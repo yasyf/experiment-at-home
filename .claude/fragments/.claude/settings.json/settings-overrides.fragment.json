@@ -1,1 +1,14 @@
-{}
+{
+  "extraKnownMarketplaces": {
+    "cc-present": {
+      "source": {
+        "source": "github",
+        "repo": "yasyf/cc-present"
+      },
+      "autoUpdate": true
+    }
+  },
+  "enabledPlugins": {
+    "cc-present@cc-present": true
+  }
+}
