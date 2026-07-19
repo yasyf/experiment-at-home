@@ -465,6 +465,38 @@ async def test_all_invalid_batch_never_touches_the_native_layer(monkeypatch: pyt
     assert model.batch_sizes == []  # and run_batch never ran
 
 
+# --- public-boundary error mapping -----------------------------------------
+
+
+class TruncatingRunSession:
+    def __init__(self, model: FakeModel) -> None:
+        self.model = model
+
+    def __enter__(self) -> TruncatingRunSession:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        pass
+
+    def run(self, _pcm: object, *, timestamps: str = "auto") -> Result:
+        truncated = OutputTruncated("output truncated: decode hit the token cap")
+        truncated.partial_result = canned_result("partial")
+        raise truncated
+
+
+class TruncatingRunModel(FakeModel):
+    def session(self) -> TruncatingRunSession:  # type: ignore[override]
+        return TruncatingRunSession(self)
+
+
+async def test_transcribe_maps_a_native_error_to_stt_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The silent warmup tolerates the truncation (partial_result carries load_ms); the user-facing
+    # run must surface it as SttError, matching transcribe_batch's mapping, not leak the binding type.
+    wire(monkeypatch, TruncatingRunModel())
+    with pytest.raises(SttError, match="token cap"):
+        await Transcriber("x").transcribe(pcm())
+
+
 # --- streaming committed-delta semantics -----------------------------------
 
 
