@@ -105,6 +105,7 @@ main = click.version_option(package_name="experiment-at-home")(
             "status": ("athome.serve:status_cli", "Show launchd agents and configured-server health."),
             "batch": ("athome.llm.batch:cli", "Submit, poll, and collect 50%-off provider batch jobs."),
             "ocr": ("athome.ocr.profiles:cli", "Read an image or PDF into Markdown."),
+            "stt": ("athome.stt.cli:cli", "Transcribe audio and manage transcribe.cpp GGUF weights."),
             "bakeoff": ("athome.bakeoff:cli", "Run an A/B/N endpoint bake-off from a spec module."),
             "hf": ("athome.hf:cli", "Pull and push pinned Hugging Face snapshots."),
             "research": ("athome.research.cli:cli", "Run and inspect overnight autoresearch loops."),
