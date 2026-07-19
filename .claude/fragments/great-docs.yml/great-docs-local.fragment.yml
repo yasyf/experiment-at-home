@@ -157,6 +157,22 @@ reference:
       - activator.Activator
       - activator.serve_activator
       - activator.ActivatorError
+  - title: STT
+    desc: Speech-to-text over transcribe.cpp — a lazily-loaded model behind one serialized compute lane, committed-delta streaming, and an OpenAI-compatible transcription server.
+    contents:
+      - stt.Transcriber
+      - stt.SttStream
+      - stt.Transcript
+      - stt.Segment
+      - stt.Word
+      - stt.VARIANTS
+      - stt.gguf_path
+      - stt.decode
+      - stt.f32_from_s16
+      - stt.SttServeSettings
+      - stt.SttServer
+      - stt.serve_stt
+      - stt.SttError
   - title: Embed
     desc: Batch text-embedding backends and a digest-keyed incremental index with MMR rerank.
     contents:

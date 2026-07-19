@@ -11,6 +11,7 @@ experiment-at-home/
 │   │                  #   serve, launchd, detach, cli, store, sync, hf, embed,
 │   │                  #   bakeoff, modal
 │   ├── ocr/           # OCR protocol types, engines, ensemble, profiles
+│   ├── stt/           # Speech-to-text: transcribe.cpp engine, GGUF catalog, OpenAI-shim server
 │   ├── llm/           # Lane functions (small/extract/local) + batch adapters
 │   └── research/      # Autoresearch harness: spec, loop, journal, gates, judges
 ├── engines/           # Sidecar dists (athome-ocr-paddle: >=3.13,<3.14, own pyproject)

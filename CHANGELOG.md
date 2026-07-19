@@ -4,6 +4,23 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-07-19
+
+### Added
+- **`athome.stt`** — speech-to-text over [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp) (ggml/GGUF, Metal-native, pure-ctypes binding that imports on 3.14t — no sidecar), behind the new `stt` extra with both binding dists exact-pinned (pre-1.0 ABI). `Transcriber(variant, *, quant, backend, idle_s)` wraps a lazily-loaded model in a single serialized compute lane — the 0.x binding allows one in-flight compute per loaded model, so every run, batch, and stream feed passes through one `anyio.Semaphore(1, max_value=1)` (a semaphore, not a lock: a stream may open in one task and close in another, and lock release is task-affine). `transcribe` returns a seconds-based frozen `Transcript`; `transcribe_batch` isolates failures per slot (an invalid buffer or native error becomes an `SttError` value in position, and an all-invalid batch never touches the native layer); `stream(*, lookahead_ms)` yields an `SttStream` whose `feed` emits only newly-committed `Segment` deltas in stream-absolute seconds (derived from the binding's `audio_committed_ms` watermarks — streams expose no native timestamps), with `finalize` completing the tail exactly once. Models load on first use, warm up on a 0.5 s silent run (capturing `load_ms` and hoisting the one-time Metal shader compile off the first real request), and unload after `idle_s` idle via `IdleResource`; an open stream pins both the use-count and the compute lane, so the reaper can never unload mid-stream.
+- **`athome stt` CLI + OpenAI-compatible server.** `athome stt transcribe|models|download` (download is the idempotent weights pre-fetch deploy scripts call), and a Starlette shim under `[serve.stt]` (default `parakeet-tdt-0.6b-v2` Q8_0 on `127.0.0.1:8403`): `POST /v1/audio/transcriptions` (multipart; the `model` field is accepted and ignored; `json`/`verbose_json`/`text`; `srt`/`vtt` and malformed uploads return 400), with `GET /v1/models` and `GET /health` answering from settings so the activator's probe never wakes a cold model. `serve_stt(--fd)` serves the activator's pre-bound `{LISTEN_FD}`, and an `"stt"` recipe joins `serve.py`, so `ManagedServer("stt")` gets up/down/status/idle/launchd for free. Weights come from the `handy-computer` GGUF repos, pinned by commit SHA in `athome.hf.REVISIONS` (the repos carry no tags); `athome.stt.catalog` enrolls seven variants and `hf.snapshot` gains a keyword-only `patterns` so a fetch pulls one quant, not the repo.
+- **`ActivatorSettings.wake_paths`** — the activator's wake-path allowlist is now a settings field (default byte-identical to the old hardcoded constant), so an STT deployment wakes on `'["/v1/audio/transcriptions"]'` via `ATHOME_SERVE_ACTIVATOR_WAKE_PATHS` with no code change.
+
+## [0.9.2] - 2026-07-18
+
+### Added
+- **`athome serve activator`** — a wake-on-use HTTP front (the yclaw model-activator, ported onto `IdleResource`) behind the new `activator` extra: probes answer locally while the child is down, a wake spawns it under a single-flight load onto a pre-bound `{LISTEN_FD}`, and idle children reap after a TTL.
+
+## [0.9.1] - 2026-07-18
+
+### Added
+- **`IdleResource`** — the generic idle-unload lifecycle (single-flight load, reference-counted use, TTL reaper) plus `ManagedServer.idle`.
+
 ## [0.9.0] - 2026-07-18
 
 ### Added
