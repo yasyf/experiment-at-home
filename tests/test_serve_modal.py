@@ -56,7 +56,11 @@ def mock_models(monkeypatch: pytest.MonkeyPatch, *ids: str) -> None:
 
 
 def forbid_http(monkeypatch: pytest.MonkeyPatch, message: str) -> None:
+    # Loopback probes (the always-configured stt recipe) see a down server; only the
+    # hosted web endpoint is forbidden outright.
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host in ("127.0.0.1", "localhost"):
+            raise httpx.ConnectError("local server down", request=request)
         raise AssertionError(message)
 
     monkeypatch.setattr(serve, "health_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)))
