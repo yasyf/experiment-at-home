@@ -199,19 +199,25 @@ class Transcriber:
 
     def _begin_stream(self, model: Model, lookahead_ms: int) -> tuple[Session, Stream]:
         session = model.session()
-        native = session.stream(commit_policy="auto", family=stream_family_for(model, lookahead_ms))
+        try:
+            native = session.stream(commit_policy="auto", family=stream_family_for(model, lookahead_ms))
+        except BaseException:
+            session.close()
+            raise
         return session, native
 
 
 class SttStream:
-    """A live streaming transcription.
+    """A live streaming transcription; use it as an async context manager to guarantee close.
 
     Feed PCM chunks; each :meth:`feed` returns only the newly committed segment deltas (stream-absolute
     seconds, monotone starts). :meth:`finalize` flushes the tail and returns the whole
     :class:`Transcript` without duplicating or dropping any fed segment. Streamed segment timing is
     derived from the binding's ``audio_committed_ms`` watermark — the stream path exposes committed
     text, not native per-segment timestamps — so each committed delta spans from the previous
-    watermark to the current one.
+    watermark to the current one. A native failure inside :meth:`feed` or :meth:`finalize` closes
+    the stream and raises :class:`SttError`; an invalid chunk rejected before any native call
+    leaves the stream open.
     """
 
     def __init__(self, session: Session, native: Stream, stack: AsyncExitStack, load_ms: float) -> None:
@@ -224,6 +230,12 @@ class SttStream:
         self.committed_ms = 0
         self.segments: list[Segment] = []
         self.closed = False
+
+    async def __aenter__(self) -> SttStream:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        await self.aclose()
 
     def _feed_native(self, pcm: Pcm) -> tuple[StreamUpdate, StreamText | None]:
         update = self.native.feed(pcm)
@@ -239,18 +251,39 @@ class SttStream:
         return (segment,)
 
     async def feed(self, pcm: Pcm) -> tuple[Segment, ...]:
-        """Feed a float32 16 kHz mono chunk; return only the newly committed segment deltas."""
+        """Feed a float32 16 kHz mono chunk; return only the newly committed segment deltas.
+
+        Raises:
+            SttError: The chunk is invalid (raised before any native call; the stream stays
+                open), or the native feed failed (the stream is closed).
+        """
+        from transcribe_cpp.errors import TranscribeError
+
         require_pcm(pcm)
         async with self.lock:
-            update, text = await to_thread.run_sync(functools.partial(self._feed_native, pcm))
+            try:
+                update, text = await to_thread.run_sync(functools.partial(self._feed_native, pcm))
+            except TranscribeError as failure:
+                await self._close()
+                raise SttError(str(failure)) from failure
             if text is None:
                 return ()
             return self._commit(text.committed, update.audio_committed_ms)
 
     async def finalize(self) -> Transcript:
-        """Flush the final hypothesis, close the stream, and return the full transcript."""
+        """Flush the final hypothesis, close the stream, and return the full transcript.
+
+        Raises:
+            SttError: The native finalize failed; the stream is closed either way.
+        """
+        from transcribe_cpp.errors import TranscribeError
+
         async with self.lock:
-            update, text = await to_thread.run_sync(self._finalize_native)
+            try:
+                update, text = await to_thread.run_sync(self._finalize_native)
+            except TranscribeError as failure:
+                await self._close()
+                raise SttError(str(failure)) from failure
             self._commit(text.committed, update.audio_committed_ms)
             await self._close()
             return Transcript(text=text.committed, segments=tuple(self.segments), words=(), load_ms=self.load_ms)

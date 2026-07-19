@@ -15,7 +15,7 @@ pytest.importorskip("transcribe_cpp")
 from transcribe_cpp import ParakeetBufferedStreamOptions, Result, StreamText, StreamUpdate, Timings
 from transcribe_cpp import Segment as NativeSegment
 from transcribe_cpp import Word as NativeWord
-from transcribe_cpp.errors import InvalidArgument, OutputTruncated
+from transcribe_cpp.errors import InvalidArgument, NotImplementedByModel, OutputTruncated
 
 from athome.stt import catalog
 from athome.stt.catalog import DEFAULT_QUANT, VARIANTS, gguf_path, repo_for
@@ -66,6 +66,8 @@ class FakeStream:
     def feed(self, _pcm: object) -> StreamUpdate:
         with self.model.tracker:
             time.sleep(self.model.delay)
+            if (error := self.model.feed_error) is not None:
+                raise error
             self.index += 1
             committed, watermark = self.script[self.index]
             changed = committed != self.committed
@@ -83,6 +85,8 @@ class FakeStream:
 
     def finalize(self) -> StreamUpdate:
         with self.model.tracker:
+            if (error := self.model.finalize_error) is not None:
+                raise error
             self.committed, watermark = self.final
             return StreamUpdate(
                 result_changed=True,
@@ -141,7 +145,7 @@ class FakeSession:
         return FakeStream(self.model)
 
     def close(self) -> None:
-        pass
+        self.model.session_closes += 1
 
 
 class FakeModel:
@@ -158,6 +162,8 @@ class FakeModel:
         delay: float = 0.0,
         load_ms: float = 42.0,
         closed: list | None = None,
+        feed_error: Exception | None = None,
+        finalize_error: Exception | None = None,
     ) -> None:
         self.text = text
         self.segments = segments
@@ -169,7 +175,10 @@ class FakeModel:
         self.delay = delay
         self.load_ms = load_ms
         self.closed = closed if closed is not None else []
+        self.feed_error = feed_error
+        self.finalize_error = finalize_error
         self.batch_sizes: list[int] = []
+        self.session_closes = 0
 
     def session(self) -> FakeSession:
         return FakeSession(self)
@@ -552,6 +561,80 @@ async def test_feed_returns_only_committed_deltas_with_monotone_absolute_starts(
     assert [s.text for s in transcript.segments] == ["hello", "world", "foo"]
     assert [s.start for s in transcript.segments] == sorted(s.start for s in transcript.segments)
     assert " ".join(s.text for s in transcript.segments) == transcript.text
+
+
+# --- stream lifecycle -------------------------------------------------------
+
+
+class StreamRefusingSession(FakeSession):
+    def stream(self, **_kwargs: object) -> FakeStream:
+        raise NotImplementedByModel("model has no streaming family")
+
+
+class StreamRefusingModel(FakeModel):
+    def session(self) -> FakeSession:
+        return StreamRefusingSession(self)
+
+
+async def test_stream_is_an_async_context_manager(monkeypatch: pytest.MonkeyPatch) -> None:
+    wire(monkeypatch, FakeModel(text="after", script=[("hi", 500)], final=("hi", 500)))
+    stt = Transcriber("x")
+    async with await stt.stream(lookahead_ms=1000) as stream:
+        assert [s.text for s in await stream.feed(pcm())] == ["hi"]
+    assert stream.closed is True
+    with anyio.fail_after(2):
+        assert (await stt.transcribe(pcm())).text == "after"
+
+
+async def test_stream_setup_failure_closes_the_orphaned_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = StreamRefusingModel()
+    wire(monkeypatch, model)
+    stt = Transcriber("x")
+    with pytest.raises(NotImplementedByModel):
+        await stt.stream(lookahead_ms=1000)
+    assert model.session_closes == 2  # the warmup session, then the orphaned stream session
+    with anyio.fail_after(2):
+        await stt.transcribe(pcm())  # the compute lane was released by the setup cleanup
+
+
+async def test_native_feed_failure_closes_the_stream_and_frees_the_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = InvalidArgument("native feed rejected the buffer")
+    wire(monkeypatch, FakeModel(text="after", script=[("", 0)], final=("", 0), feed_error=error))
+    stt = Transcriber("x")
+    stream = await stt.stream(lookahead_ms=1000)
+    with anyio.fail_after(2), pytest.raises(SttError, match="rejected the buffer"):
+        await stream.feed(pcm())
+    assert stream.closed is True
+    with anyio.fail_after(2):
+        assert (await stt.transcribe(pcm())).text == "after"
+
+
+async def test_native_finalize_failure_closes_the_stream_and_frees_the_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = InvalidArgument("native finalize failed")
+    wire(monkeypatch, FakeModel(text="after", script=[("", 0)], final=("", 0), finalize_error=error))
+    stt = Transcriber("x")
+    stream = await stt.stream(lookahead_ms=1000)
+    with anyio.fail_after(2), pytest.raises(SttError, match="finalize failed"):
+        await stream.finalize()
+    assert stream.closed is True
+    with anyio.fail_after(2):
+        assert (await stt.transcribe(pcm())).text == "after"
+
+
+async def test_invalid_chunk_leaves_the_stream_open_and_usable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Validation failure is fail-loud input rejection, not stream death: no native call happened.
+    wire(monkeypatch, FakeModel(script=[("hello", 1000)], final=("hello", 1000)))
+    stt = Transcriber("x")
+    stream = await stt.stream(lookahead_ms=1000)
+    with pytest.raises(SttError, match="float32"):
+        await stream.feed(array.array("h", [1, 2]))
+    assert stream.closed is False
+    assert [s.text for s in await stream.feed(pcm())] == ["hello"]
+    await stream.finalize()
 
 
 # --- real models (dev-only; --run-live) ------------------------------------
