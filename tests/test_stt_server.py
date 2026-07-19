@@ -208,6 +208,65 @@ async def test_undecodable_audio_surfaces_as_400_not_500(monkeypatch: pytest.Mon
     assert "ffmpeg decode failed" in response.json()["error"]["message"]
 
 
+async def test_native_truncation_surfaces_as_400_not_500(monkeypatch: pytest.MonkeyPatch) -> None:
+    # End-to-end through a REAL Transcriber: a short-cap model raising OutputTruncated on the run
+    # must map to SttError at the engine boundary and land as a 400, not escape as a 500.
+    errors = pytest.importorskip("transcribe_cpp.errors")
+    from pathlib import Path
+
+    from transcribe_cpp import Result, Timings
+
+    from athome.stt import server as server_mod
+
+    partial = Result(
+        text="partial",
+        language="en",
+        timestamp_kind="segment",
+        segments=(),
+        words=(),
+        tokens=(),
+        timings=Timings(load_ms=1.0, mel_ms=0, encode_ms=0, decode_ms=0),
+    )
+
+    class TruncatingSession:
+        def __enter__(self) -> TruncatingSession:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            pass
+
+        def run(self, _pcm: object, *, timestamps: str = "auto") -> Result:
+            truncated = errors.OutputTruncated("output truncated: decode hit the token cap")
+            truncated.partial_result = partial
+            raise truncated
+
+    class TruncatingModel:
+        def session(self) -> TruncatingSession:
+            return TruncatingSession()
+
+        def close(self) -> None:
+            pass
+
+    async def fake_gguf_path(variant: str, quant: str = "Q8_0") -> Path:
+        return Path("/fake/model.gguf")
+
+    async def fake_load_model(path: str, backend: str) -> TruncatingModel:
+        return TruncatingModel()
+
+    monkeypatch.setattr("athome.stt.engine.gguf_path", fake_gguf_path)
+    monkeypatch.setattr("athome.stt.engine.load_model", fake_load_model)
+
+    async def fake_decode(data: bytes) -> array.array:
+        return array.array("f", [0.0, 0.0, 0.0])
+
+    monkeypatch.setattr(server_mod, "decode", fake_decode)
+    server = SttServer(SttServeSettings())
+    async with asgi_client(server) as client:
+        response = await client.post("/v1/audio/transcriptions", files=audio_files())
+    assert response.status_code == 400
+    assert "token cap" in response.json()["error"]["message"]
+
+
 # --- probe routes never wake the model -------------------------------------
 
 

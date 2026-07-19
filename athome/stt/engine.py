@@ -146,10 +146,21 @@ class Transcriber:
             return session.run_batch(pcms, timestamps="auto", return_exceptions=True)
 
     async def transcribe(self, pcm: Pcm) -> Transcript:
-        """Transcribe one float32 16 kHz mono PCM buffer into a :class:`Transcript`."""
+        """Transcribe one float32 16 kHz mono PCM buffer into a :class:`Transcript`.
+
+        Raises:
+            SttError: The buffer is invalid, or the native run failed (binding errors are mapped
+                here so callers — the server's 400 path included — never see a binding type).
+        """
+        from transcribe_cpp.errors import TranscribeError
+
         require_pcm(pcm)
         async with self.resource.use() as model:
-            return transcript_from_result(await self._compute(functools.partial(self._run, model, pcm)))
+            try:
+                result = await self._compute(functools.partial(self._run, model, pcm))
+            except TranscribeError as failure:
+                raise SttError(str(failure)) from failure
+        return transcript_from_result(result)
 
     async def transcribe_batch(self, pcms: Sequence[Pcm]) -> list[Transcript | SttError]:
         """Transcribe several buffers in one dispatch; each slot is a Transcript or its own error.
