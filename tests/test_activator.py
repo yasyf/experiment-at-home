@@ -10,6 +10,9 @@ import httpx
 import pytest
 from click.testing import CliRunner
 
+# starlette is the `activator` extra; skip this module cleanly on CI jobs that sync without extras.
+pytest.importorskip("starlette")
+
 from athome import serve
 from athome.activator import (
     CHILD_HOST,
