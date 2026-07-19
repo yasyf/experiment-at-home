@@ -234,7 +234,7 @@ async def test_decode_stages_its_temp_file_off_the_event_loop(monkeypatch: pytes
 
     def recording_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
         staging_threads.append(threading.current_thread())
-        return real_mkstemp(*args, **kwargs)  # type: ignore[arg-type]
+        return real_mkstemp(*args, **kwargs)
 
     class FakeCompleted:
         returncode = 0
@@ -376,7 +376,7 @@ class ExplodingWarmupSession:
 
 
 class ExplodingWarmupModel(FakeModel):
-    def session(self) -> ExplodingWarmupSession:  # type: ignore[override]
+    def session(self) -> ExplodingWarmupSession:
         return ExplodingWarmupSession()
 
 
@@ -553,7 +553,7 @@ class TruncatingRunSession:
 
 
 class TruncatingRunModel(FakeModel):
-    def session(self) -> TruncatingRunSession:  # type: ignore[override]
+    def session(self) -> TruncatingRunSession:
         return TruncatingRunSession(self)
 
 
