@@ -8,12 +8,16 @@ repo: https://github.com/yasyf/experiment-at-home
 site_url: "https://yasyf.github.io/experiment-at-home/"
 pypi: true
 
-# Conservative defaults: a solid navbar and a single accent, no gradient
-# presets or hero starfield. The gradient/starfield extras read as busy and the
-# starfield canvas intercepts homepage clicks; keep them off unless asked.
-# Palette from the mascot: near-black banner background, roof-orange accent.
+# Conservative defaults: solid navbar, single accent, no gradients — the
+# starfield canvas also eats homepage clicks. Accent splits per mode for WCAG AA.
 navbar_color: "#171a21"
-accent_color: "#e85d2c"
+accent_color:
+  light: "#bc4312"
+  dark: "#f4713f"
+
+# Open Graph / social-card image for link unfurls (path relative to repo root).
+social_cards:
+  image: docs/assets/social-preview.jpg
 
 # Navbar logo + favicon are auto-detected from docs/assets/logo.png (the
 # generated mascot); no logo key is needed here.
