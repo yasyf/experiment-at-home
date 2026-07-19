@@ -330,19 +330,20 @@ def test_cost_bills_each_token_class_at_its_own_rate() -> None:
     backend = TinkerBackend.from_settings()
     model = TinkerModelId("Qwen/Qwen3-8B")
 
-    assert backend.cost(model=model, prefill=2_000_000) == pytest.approx(0.26)
-    assert backend.cost(model=model, sample=500_000) == pytest.approx(0.20)
-    assert backend.cost(model=model, train=250_000) == pytest.approx(0.10)
-    assert backend.cost(model=model, prefill=2_000_000, sample=500_000, train=250_000) == pytest.approx(0.56)
+    assert backend.cost(model=model, prefill=2_000_000) == pytest.approx(0.39)
+    assert backend.cost(model=model, sample=500_000) == pytest.approx(0.30)
+    assert backend.cost(model=model, train=250_000) == pytest.approx(0.11)
+    assert backend.cost(model=model, prefill=2_000_000, sample=500_000, train=250_000) == pytest.approx(0.80)
 
 
 def test_cost_prices_each_base_model_off_its_own_sheet() -> None:
     backend = TinkerBackend.from_settings()
 
-    assert backend.cost(model=TinkerModelId("Qwen/Qwen3.5-4B"), prefill=1_000_000) == pytest.approx(0.22)
-    assert backend.cost(model=TinkerModelId("Qwen/Qwen3.5-4B"), train=1_000_000) == pytest.approx(0.67)
-    assert backend.cost(model=TinkerModelId("Qwen/Qwen3.5-9B"), prefill=1_000_000) == pytest.approx(0.44)
-    assert backend.cost(model=TinkerModelId("Qwen/Qwen3.5-9B"), train=1_000_000) == pytest.approx(1.33)
+    assert backend.cost(model=TinkerModelId("Qwen/Qwen3.5-4B"), prefill=1_000_000) == pytest.approx(0.33)
+    assert backend.cost(model=TinkerModelId("Qwen/Qwen3.5-4B"), train=1_000_000) == pytest.approx(0.737)
+    assert backend.cost(model=TinkerModelId("Qwen/Qwen3.5-9B"), prefill=1_000_000) == pytest.approx(0.66)
+    assert backend.cost(model=TinkerModelId("Qwen/Qwen3.5-9B"), train=1_000_000) == pytest.approx(1.463)
+    assert backend.cost(model=TinkerModelId("Qwen/Qwen3.6-35B-A3B"), train=1_000_000) == pytest.approx(1.177)
 
 
 async def test_sft_runs_cross_entropy_and_one_optim_step_per_step(
@@ -377,8 +378,8 @@ async def test_sft_journals_loss_tokens_and_running_spend(
     assert [record["step"] for record in records] == [1, 2, 3]
     assert [record["loss"] for record in records] == [-LOGPROB] * 3
     assert [record["tokens"] for record in records] == tokens
-    assert records[-1]["cost_usd"] == pytest.approx(sum(tokens) / 1e6 * 0.40)
-    assert checkpoint.train_cost_usd == pytest.approx(sum(tokens) / 1e6 * 0.40)
+    assert records[-1]["cost_usd"] == pytest.approx(sum(tokens) / 1e6 * 0.44)
+    assert checkpoint.train_cost_usd == pytest.approx(sum(tokens) / 1e6 * 0.44)
 
 
 async def test_over_long_examples_never_reach_a_batch(
@@ -602,7 +603,7 @@ async def test_the_report_orders_checkpoints_and_totals_the_spend(service: FakeS
     assert report.final is report.checkpoints[-1]
     assert report.checkpoints[-1].final
     assert not any(checkpoint.final for checkpoint in report.checkpoints[:-1])
-    assert report.train_cost_usd == pytest.approx(sum(record.tokens for record in report.steps) / 1e6 * 0.40)
+    assert report.train_cost_usd == pytest.approx(sum(record.tokens for record in report.steps) / 1e6 * 0.44)
     assert (report.method, report.dropped, len(report.steps)) == ("sft", 0, 4)
 
 
@@ -618,7 +619,7 @@ async def test_eval_prefill_is_billed_into_the_run_cost(service: FakeService, tm
 
     train_tokens = sum(record.tokens for record in report.steps)
     eval_tokens = 4 * len(report.checkpoints)
-    assert report.train_cost_usd == pytest.approx((train_tokens * 0.40 + eval_tokens * 0.13) / 1e6)
+    assert report.train_cost_usd == pytest.approx((train_tokens * 0.44 + eval_tokens * 0.195) / 1e6)
 
 
 async def test_a_mid_stream_failure_leaves_the_sink_with_only_the_drained_steps(
@@ -639,7 +640,7 @@ async def test_a_mid_stream_failure_leaves_the_sink_with_only_the_drained_steps(
     assert [record["step"] for record in drained] == [1, 2]
     assert checkpoint_events(run.path) == []
     assert envelope.reserved == pytest.approx(0.0)
-    assert envelope.spent == pytest.approx(sum(record["tokens"] for record in drained) / 1e6 * 0.40)
+    assert envelope.spent == pytest.approx(sum(record["tokens"] for record in drained) / 1e6 * 0.44)
     await envelope.check(envelope.max_usd - envelope.spent)
 
 
@@ -706,7 +707,7 @@ async def test_dpo_charges_the_reference_pass_and_both_custom_passes(
     reference, policy = service.clients
     prefilled = tinker.token_count(reference.forward[0])
     trained = 2 * sum(tinker.token_count(call.datums) for call in policy.custom)
-    assert checkpoint.train_cost_usd == pytest.approx((prefilled * 0.13 + trained * 0.40) / 1e6)
+    assert checkpoint.train_cost_usd == pytest.approx((prefilled * 0.195 + trained * 0.44) / 1e6)
 
 
 async def test_dpo_without_torch_names_the_extra_that_installs_it(

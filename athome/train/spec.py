@@ -553,9 +553,10 @@ class TinkerSettings(SectionSettings):
     spend_cap_usd: float = 60.0
     price_per_mtok: dict[TinkerModelId, TinkerPrice] = Field(
         default_factory=lambda: {
-            TinkerModelId("Qwen/Qwen3-8B"): TinkerPrice(prefill=0.13, sample=0.40, train=0.40),
-            TinkerModelId("Qwen/Qwen3.5-4B"): TinkerPrice(prefill=0.22, sample=0.67, train=0.67),
-            TinkerModelId("Qwen/Qwen3.5-9B"): TinkerPrice(prefill=0.44, sample=1.33, train=1.33),
+            TinkerModelId("Qwen/Qwen3-8B"): TinkerPrice(prefill=0.195, sample=0.60, train=0.44),
+            TinkerModelId("Qwen/Qwen3.5-4B"): TinkerPrice(prefill=0.33, sample=1.005, train=0.737),
+            TinkerModelId("Qwen/Qwen3.5-9B"): TinkerPrice(prefill=0.66, sample=1.995, train=1.463),
+            TinkerModelId("Qwen/Qwen3.6-35B-A3B"): TinkerPrice(prefill=0.54, sample=1.335, train=1.177),
         }
     )
 

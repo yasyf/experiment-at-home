@@ -219,8 +219,9 @@ def test_tinker_settings_source_the_secret_from_the_canonical_env_var() -> None:
     assert settings.api_key.get_secret_value() == "sk-tinker-test"
     assert "sk-tinker-test" not in repr(settings)
     assert settings.spend_cap_usd == 60.0
-    assert settings.price_per_mtok["Qwen/Qwen3-8B"] == TinkerPrice(prefill=0.13, sample=0.40, train=0.40)
-    assert settings.price_per_mtok["Qwen/Qwen3.5-9B"] == TinkerPrice(prefill=0.44, sample=1.33, train=1.33)
+    assert settings.price_per_mtok["Qwen/Qwen3-8B"] == TinkerPrice(prefill=0.195, sample=0.60, train=0.44)
+    assert settings.price_per_mtok["Qwen/Qwen3.5-9B"] == TinkerPrice(prefill=0.66, sample=1.995, train=1.463)
+    assert settings.price_per_mtok["Qwen/Qwen3.6-35B-A3B"] == TinkerPrice(prefill=0.54, sample=1.335, train=1.177)
 
 
 def test_tinker_settings_require_the_key(monkeypatch: pytest.MonkeyPatch) -> None:
