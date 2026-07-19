@@ -50,24 +50,37 @@ class RetroRecordSchema(BaseModel):
     verdict: RetroVerdict
 
 
-class _MetricSummary(NamedTuple):
+class NegativeRetroSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    experiment: str
+    kept: Literal[False]
+    verdict: RetroVerdict
+
+
+class KeptMetrics(NamedTuple):
     baseline: float
     best_metric: float
     uplift: float
 
 
-def _metric_summary(rows: Sequence[JournalRow], report: MorningReport) -> _MetricSummary:
+class NoKeptMetrics(NamedTuple):
+    """The experiment kept no unit; only per-unit discard and crash evidence remains."""
+
+
+def _metric_summary(rows: Sequence[JournalRow], report: MorningReport) -> KeptMetrics | NoKeptMetrics:
+    if not rows:
+        raise RetroError(
+            f"experiment {report.experiment} has an empty journal: a retrospective requires at least one unit"
+        )
     kept_metrics = tuple(row.metric for row in rows if row.verdict is Verdict.KEEP and row.metric is not None)
     match kept_metrics, report.best.metric if report.best is not None else None:
         case (), _:
-            raise RetroError(
-                f"experiment {report.experiment} completed with zero kept units: a retrospective requires "
-                "at least one kept metric"
-            )
+            return NoKeptMetrics()
         case _, None:
-            raise RetroError(f"experiment {report.experiment} has no best kept metric to compare")
+            raise RetroError(f"experiment {report.experiment} kept a unit but reported no best metric to compare")
         case (baseline, *_), best_metric:
-            return _MetricSummary(baseline, best_metric, abs(best_metric - baseline))
+            return KeptMetrics(baseline, best_metric, abs(best_metric - baseline))
 
 
 def build_prompt(rows: Sequence[JournalRow], report: MorningReport, *, baseline: float, uplift: float) -> str:
@@ -100,6 +113,34 @@ def build_prompt(rows: Sequence[JournalRow], report: MorningReport, *, baseline:
     )
 
 
+def build_negative_prompt(rows: Sequence[JournalRow], report: MorningReport) -> str:
+    """Build a retrospective prompt for a zero-kept experiment from its discard and crash evidence.
+
+    Args:
+        rows: Ordered journal rows. Only unit, metric, and verdict are projected.
+        report: Morning report. Only aggregate numeric counts are projected.
+    """
+    evidence = json.dumps(
+        {
+            "report": {"units": report.units, "kept": report.kept, "crashes": report.crashes},
+            "rows": [{"unit": row.unit, "metric": row.metric, "verdict": row.verdict.value} for row in rows],
+        },
+        allow_nan=False,
+        sort_keys=True,
+    )
+    return "\n\n".join(
+        [
+            "# Post-experiment retrospective",
+            "Use only the structured evidence below. No candidate was kept: every unit was discarded or crashed, "
+            "so the incumbent baseline stands and there is no uplift to report. Describe the observable metric and "
+            "verdict pattern; do not invent an improvement or uplift, quote logs, or make unsupported causal claims.",
+            f"## Structured evidence\n{evidence}",
+            'Return an outcome (never "improved", since no candidate beat the incumbent), a concise summary, '
+            "supporting evidence, and concrete next experiments.",
+        ]
+    )
+
+
 async def generate(
     rows: Sequence[JournalRow],
     report: MorningReport,
@@ -120,15 +161,18 @@ async def generate(
         label: Retry label used by the shared backoff wrapper.
 
     Raises:
-        RetroError: The evidence contains no kept metric to compare.
+        RetroError: The journal is empty, so there is no evidence to summarize.
         JudgeError: The backend call exhausts its retries.
     """
     from spawnllm import extract
     from spawnllm.backends.registry import BACKENDS_BY_NAME
 
-    metrics = _metric_summary(rows, report)
     bound = BACKENDS_BY_NAME[backend] if isinstance(backend, str) else backend
-    prompt = build_prompt(rows, report, baseline=metrics.baseline, uplift=metrics.uplift)
+    match _metric_summary(rows, report):
+        case KeptMetrics(baseline, _, uplift):
+            prompt = build_prompt(rows, report, baseline=baseline, uplift=uplift)
+        case NoKeptMetrics():
+            prompt = build_negative_prompt(rows, report)
     return await with_backoff(
         lambda: extract(prompt, RetroVerdict, backend=bound, model=tier, timeout=timeout),
         label=label,
@@ -147,9 +191,14 @@ class RetroRecord:
 
     @classmethod
     def from_report(cls, report: MorningReport, verdict: RetroVerdict) -> RetroRecord:
-        """Create a record from a morning report and extracted verdict."""
-        metrics = _metric_summary(report.rows, report)
-        return cls(report.experiment, metrics.baseline, metrics.best_metric, metrics.uplift, verdict)
+        """Create a record from a morning report with at least one kept unit and an extracted verdict."""
+        match _metric_summary(report.rows, report):
+            case KeptMetrics(baseline, best_metric, uplift):
+                return cls(report.experiment, baseline, best_metric, uplift, verdict)
+            case NoKeptMetrics():
+                raise RetroError(
+                    f"experiment {report.experiment} kept no unit; build a NegativeRetro instead of a RetroRecord"
+                )
 
     @classmethod
     def from_record(cls, record: Mapping[str, object]) -> RetroRecord:
@@ -174,13 +223,48 @@ class RetroRecord:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class NegativeRetro:
+    """A zero-kept experiment's retrospective: no candidate beat the incumbent, so the baseline stands."""
+
+    experiment: str
+    verdict: RetroVerdict
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, object]) -> NegativeRetro:
+        """Load one strict-schema persisted zero-kept record."""
+        validated = NegativeRetroSchema.model_validate(record, extra="forbid")
+        return cls(experiment=validated.experiment, verdict=validated.verdict)
+
+    def to_record(self) -> dict[str, object]:
+        """Return the JSON-serializable persistence record."""
+        return {"experiment": self.experiment, "kept": False, "verdict": self.verdict.model_dump(mode="json")}
+
+
+def load_retro(record: Mapping[str, object]) -> RetroRecord | NegativeRetro:
+    match record:
+        case {"kept": False}:
+            return NegativeRetro.from_record(record)
+        case _:
+            return RetroRecord.from_record(record)
+
+
+def build_retro(report: MorningReport, verdict: RetroVerdict) -> RetroRecord | NegativeRetro:
+    """Build the retrospective record matching the experiment's kept or zero-kept evidence."""
+    match _metric_summary(report.rows, report):
+        case KeptMetrics(baseline, best_metric, uplift):
+            return RetroRecord(report.experiment, baseline, best_metric, uplift, verdict)
+        case NoKeptMetrics():
+            return NegativeRetro(report.experiment, verdict)
+
+
 @dataclass(slots=True)
 class RetroJournal:
     """Crash-safe retrospective records with cc-notes mirroring enabled by default."""
 
     sink: RunSink
     mirror_cc_notes: bool
-    _records: list[RetroRecord]
+    _records: list[RetroRecord | NegativeRetro]
 
     @classmethod
     def open(cls, path: Path, *, mirror_cc_notes: bool = True) -> RetroJournal:
@@ -188,36 +272,44 @@ class RetroJournal:
         return cls(
             RunSink.open(path),
             mirror_cc_notes,
-            [RetroRecord.from_record(record) for record in load_journal(path)],
+            [load_retro(record) for record in load_journal(path)],
         )
 
-    async def append(self, record: RetroRecord) -> None:
+    async def append(self, record: RetroRecord | NegativeRetro) -> None:
         """Durably append a retrospective, then mirror it to cc-notes when enabled."""
         await self.sink.append(record.to_record())
         self._records.append(record)
         if self.mirror_cc_notes:
             await self._mirror(record)
 
-    def records(self) -> list[RetroRecord]:
+    def records(self) -> list[RetroRecord | NegativeRetro]:
         """Return a snapshot of the persisted retrospective records."""
         return list(self._records)
 
-    async def _mirror(self, record: RetroRecord) -> None:
+    async def _mirror(self, record: RetroRecord | NegativeRetro) -> None:
+        verdict = record.verdict
+        match record:
+            case RetroRecord():
+                lines = [
+                    f"baseline {record.baseline}",
+                    f"best metric {record.best_metric}",
+                    f"uplift {record.uplift}",
+                ]
+            case NegativeRetro():
+                lines = ["no candidate kept; incumbent baseline stands"]
         await anyio.run_process(
             [
                 str(CC_NOTES_BIN),
                 "note",
                 "add",
-                f"athome retro {record.experiment} [{record.verdict.outcome}]",
+                f"athome retro {record.experiment} [{verdict.outcome}]",
                 "--body",
                 "\n".join(
                     [
-                        f"baseline {record.baseline}",
-                        f"best metric {record.best_metric}",
-                        f"uplift {record.uplift}",
-                        f"summary {record.verdict.summary}",
-                        f"evidence {json.dumps(record.verdict.evidence)}",
-                        f"next steps {json.dumps(record.verdict.next_steps)}",
+                        *lines,
+                        f"summary {verdict.summary}",
+                        f"evidence {json.dumps(verdict.evidence)}",
+                        f"next steps {json.dumps(verdict.next_steps)}",
                     ]
                 ),
                 "--label",

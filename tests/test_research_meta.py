@@ -134,6 +134,12 @@ def make_verdict(summary: str) -> RetroVerdict:
     return RetroVerdict(outcome="improved", summary=summary, evidence=("the loss fell",), next_steps=("go lower",))
 
 
+def make_negative_verdict(summary: str) -> RetroVerdict:
+    return RetroVerdict(
+        outcome="flat", summary=summary, evidence=("every candidate was discarded",), next_steps=("try another rank",)
+    )
+
+
 def loss_proposal(loss: float) -> StubProposal:
     return StubProposal({"train.py": f"LOSS = {loss}\n"})
 
@@ -681,6 +687,65 @@ async def test_resume_generates_catch_up_retros_before_the_next_round(tmp_path: 
     assert result.completed == 2
     assert retro_names(root) == ["001-round1", "002-round2"]
     assert "caught up" in backend.calls[1].prompt  # the catch-up retro feeds the next proposal round
+
+
+async def test_zero_kept_experiment_completes_and_keeps_the_campaign_live(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path / "repo")  # baseline loss 1.0
+    root = tmp_path / "meta"
+    contracts: list[str] = []
+    backend = scripted_backend(
+        [
+            make_proposal(1),
+            make_negative_verdict("no candidate beat the baseline"),
+            make_proposal(2),
+            make_verdict("round two improved the loss"),
+        ]
+    )
+
+    result = await meta.run_campaign(
+        make_campaign_policy(max_experiments=2),
+        repo=repo,
+        root=root,
+        backend=backend,
+        driver_factory=paid_factory([1.5, 0.9], contracts),  # round one worse than baseline, round two better
+    )
+
+    assert result.completed == 2  # the zero-kept round completed instead of aborting the campaign
+    completed = [row for row in ledger_rows(root) if row.event is CampaignEvent.COMPLETED]
+    assert [row.extra["kept"] for row in completed] == [0, 1]
+    assert retro_names(root) == ["001-round1", "002-round2"]  # the zero-kept retro was recorded, not refused
+    assert '"kept": 0' in backend.calls[1].prompt  # the retro ran on the negative evidence
+    assert "no candidate beat the baseline" in backend.calls[2].prompt  # and feeds the next proposer round
+
+
+async def test_resume_generates_a_zero_kept_catch_up_retro_without_wedging(tmp_path: Path) -> None:
+    repo = toy_repo(tmp_path / "repo")
+    root = tmp_path / "meta"
+    contracts: list[str] = []
+    await meta.run_campaign(
+        make_campaign_policy(max_experiments=1),
+        repo=repo,
+        root=root,
+        backend=scripted_backend([make_proposal(1), make_negative_verdict("live negative retro")]),
+        driver_factory=paid_factory([1.5], contracts),
+    )
+    assert retro_names(root) == ["001-round1"]
+    (root / meta.RETROS_NAME).unlink()  # a crash between the completed ledger row and the durable retro
+
+    backend = scripted_backend(
+        [make_negative_verdict("caught up negative"), make_proposal(2), make_verdict("round two")]
+    )
+    result = await meta.run_campaign(
+        make_campaign_policy(max_experiments=2),
+        repo=repo,
+        root=root,
+        backend=backend,
+        driver_factory=paid_factory([0.9], contracts),
+    )
+
+    assert result.completed == 2
+    assert retro_names(root) == ["001-round1", "002-round2"]
+    assert "caught up negative" in backend.calls[1].prompt  # the zero-kept catch-up retro feeds the next round
 
 
 async def test_gated_mode_never_runs_an_unapproved_spec(tmp_path: Path) -> None:

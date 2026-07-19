@@ -63,7 +63,7 @@ from athome.research.loop import experiment_lock
 from athome.research.loop import run as run_experiment
 from athome.research.policy import ProposalPolicy
 from athome.research.propose import ProposalViolation, ProposerContext, propose
-from athome.research.retro import RetroJournal, RetroRecord
+from athome.research.retro import NegativeRetro, RetroJournal, RetroRecord, build_retro
 from athome.research.spec import BudgetExhausted, ExperimentSpec, finite_number
 
 if TYPE_CHECKING:
@@ -351,12 +351,19 @@ def spec_toml(spec: ExperimentSpec) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_retro(record: RetroRecord) -> str:
+def render_retro(record: RetroRecord | NegativeRetro) -> str:
     verdict = record.verdict
+    match record:
+        case RetroRecord(baseline=baseline, best_metric=best_metric, uplift=uplift):
+            header = (
+                f"{record.experiment}: {verdict.outcome} "
+                f"(baseline {baseline} -> best {best_metric}, uplift {uplift})"
+            )
+        case NegativeRetro():
+            header = f"{record.experiment}: {verdict.outcome} (no candidate kept; incumbent baseline stands)"
     return "\n".join(
         [
-            f"{record.experiment}: {verdict.outcome} "
-            f"(baseline {record.baseline} -> best {record.best_metric}, uplift {record.uplift})",
+            header,
             verdict.summary,
             *(f"- evidence: {line}" for line in verdict.evidence),
             *(f"- next: {line}" for line in verdict.next_steps),
@@ -691,7 +698,7 @@ class Campaign:
     async def write_retro(self, spec: ExperimentSpec) -> None:
         report = await nightly.report(spec, repo=self.repo)
         verdict = await retro.generate(report.rows, report, backend=self.backend, tier=self.tier)
-        await self.retros.append(RetroRecord.from_report(report, verdict))
+        await self.retros.append(build_retro(report, verdict))
 
 
 async def run_campaign(

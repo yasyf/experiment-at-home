@@ -9,7 +9,18 @@ from pydantic import ValidationError
 from athome.research import judge as judge_mod
 from athome.research.journal import CC_NOTES_BIN, CC_NOTES_LABEL, JournalRow, Verdict
 from athome.research.nightly import MorningReport
-from athome.research.retro import RetroJournal, RetroRecord, RetroVerdict, build_prompt, generate
+from athome.research.retro import (
+    NegativeRetro,
+    RetroError,
+    RetroJournal,
+    RetroRecord,
+    RetroVerdict,
+    build_negative_prompt,
+    build_prompt,
+    build_retro,
+    generate,
+    load_retro,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -56,6 +67,28 @@ def make_verdict() -> RetroVerdict:
         summary="The kept metric moved from 1.0 to 0.6.",
         evidence=("Two of three units were kept.",),
         next_steps=("Repeat the strongest configuration.",),
+    )
+
+
+def make_negative_verdict() -> RetroVerdict:
+    return RetroVerdict(
+        outcome="flat",
+        summary="No candidate beat the incumbent.",
+        evidence=("Every unit was discarded.",),
+        next_steps=("Try a different rank.",),
+    )
+
+
+def make_negative_report(rows: tuple[JournalRow, ...], *, experiment: str = "toy") -> MorningReport:
+    return MorningReport(
+        experiment=experiment,
+        units=len(rows),
+        kept=sum(row.verdict is Verdict.KEEP for row in rows),
+        crashes=sum(row.verdict is Verdict.CRASH for row in rows),
+        infra_retries=0,
+        accounting_aborts=0,
+        best=None,
+        rows=rows,
     )
 
 
@@ -280,3 +313,132 @@ async def test_retro_record_is_durable_before_cc_notes_mirror(tmp_path: Path, mo
         await RetroJournal.open(path).append(record)
 
     assert RetroJournal.open(path, mirror_cc_notes=False).records() == [record]
+
+
+def test_build_negative_prompt_states_the_negative_without_fabricated_metrics() -> None:
+    rows = (
+        make_row(0, 1.5, Verdict.DISCARD),
+        make_row(1, None, Verdict.CRASH),
+    )
+
+    prompt = build_negative_prompt(rows, make_negative_report(rows))
+
+    assert '"kept": 0' in prompt
+    assert '"crashes": 1' in prompt
+    assert '"metric": 1.5' in prompt
+    assert '"verdict": "discard"' in prompt
+    assert '"verdict": "crash"' in prompt
+    assert '"baseline"' not in prompt
+    assert '"uplift"' not in prompt
+    assert "no candidate was kept" in prompt.lower()
+    assert 'never "improved"' in prompt
+
+
+def test_build_negative_prompt_projects_only_allowlisted_fields() -> None:
+    marker = "<<<RAW-RUN-STDOUT>>>" + ("garbage" * 2_000)
+    rows = (make_row(0, 1.5, Verdict.DISCARD, commit=marker, description=marker, resources={marker: 1.0}),)
+
+    assert marker not in build_negative_prompt(rows, make_negative_report(rows, experiment=marker))
+
+
+async def test_generate_zero_kept_experiment_builds_the_negative_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    spawnllm = pytest.importorskip("spawnllm")
+    captured: dict[str, object] = {}
+    expected = make_negative_verdict()
+
+    async def fake_extract(
+        prompt: str,
+        verdict_model: type[RetroVerdict],
+        *,
+        backend: object,
+        model: str,
+        timeout: int,
+    ) -> RetroVerdict:
+        captured["prompt"] = prompt
+        return expected
+
+    monkeypatch.setattr(spawnllm, "extract", fake_extract)
+    rows = (make_row(0, 1.5, Verdict.DISCARD), make_row(1, 1.4, Verdict.DISCARD))
+
+    result = await generate(rows, make_negative_report(rows), backend=cast("LlmBackend", object()))
+
+    assert result is expected
+    assert '"kept": 0' in cast("str", captured["prompt"])
+    assert '"baseline"' not in cast("str", captured["prompt"])
+    assert '"uplift"' not in cast("str", captured["prompt"])
+
+
+def test_build_retro_returns_a_negative_record_for_zero_kept() -> None:
+    rows = (make_row(0, 1.5, Verdict.DISCARD), make_row(1, None, Verdict.CRASH))
+
+    record = build_retro(make_negative_report(rows), make_negative_verdict())
+
+    assert record == NegativeRetro("toy", make_negative_verdict())
+    assert load_retro(record.to_record()) == record
+
+
+def test_build_retro_returns_a_kept_record_when_a_unit_was_kept() -> None:
+    rows = (make_row(0, 1.0, Verdict.KEEP), make_row(1, 0.6, Verdict.KEEP))
+
+    record = build_retro(make_report(rows), make_verdict())
+
+    assert record == RetroRecord("toy", 1.0, 0.6, 0.4, make_verdict())
+
+
+async def test_negative_retro_mirrors_to_cc_notes_without_metric_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands: list[list[str]] = []
+
+    async def fake(command: list[str], *args: object, **kwargs: object) -> None:
+        commands.append(command)
+
+    monkeypatch.setattr(anyio, "run_process", fake)
+    record = NegativeRetro("toy", make_negative_verdict())
+    journal = RetroJournal.open(tmp_path / "retro.jsonl")
+
+    await journal.append(record)
+
+    assert commands == [
+        [
+            str(CC_NOTES_BIN),
+            "note",
+            "add",
+            "athome retro toy [flat]",
+            "--body",
+            "\n".join(
+                [
+                    "no candidate kept; incumbent baseline stands",
+                    "summary No candidate beat the incumbent.",
+                    'evidence ["Every unit was discarded."]',
+                    'next steps ["Try a different rank."]',
+                ]
+            ),
+            "--label",
+            CC_NOTES_LABEL,
+        ]
+    ]
+    assert RetroJournal.open(tmp_path / "retro.jsonl", mirror_cc_notes=False).records() == [record]
+
+
+def test_negative_retro_from_record_requires_kept_false_discriminator() -> None:
+    with pytest.raises(ValidationError, match="kept"):
+        NegativeRetro.from_record({"experiment": "toy", "verdict": make_negative_verdict().model_dump(mode="json")})
+
+
+def test_negative_retro_from_record_rejects_unknown_top_level_field() -> None:
+    record = NegativeRetro("toy", make_negative_verdict()).to_record()
+    record["unexpected"] = True
+
+    with pytest.raises(ValidationError, match="unexpected"):
+        NegativeRetro.from_record(record)
+
+
+def test_empty_journal_still_raises_retro_error() -> None:
+    with pytest.raises(RetroError, match="empty journal"):
+        build_retro(make_negative_report(()), make_negative_verdict())
+
+
+async def test_generate_raises_on_an_empty_journal() -> None:
+    with pytest.raises(RetroError, match="empty journal"):
+        await generate((), make_negative_report(()), backend=cast("LlmBackend", object()))
