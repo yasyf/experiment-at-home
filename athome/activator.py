@@ -107,6 +107,9 @@ class ActivatorSettings(SectionSettings):
     host: str = "127.0.0.1"
     port: int = 8000
     child_port: int = 18000
+    # POST paths that wake the child; override via ATHOME_SERVE_ACTIVATOR_WAKE_PATHS as a JSON array
+    # (e.g. an STT child's '["/v1/audio/transcriptions"]'). Probe routes are fixed and never wake.
+    wake_paths: tuple[str, ...] = WAKE_PATHS
     idle_s: float = 1800.0
     start_timeout_s: float = 150.0
     wake_concurrency: int = 8
@@ -171,7 +174,7 @@ class Activator:
             routes=[
                 Route("/health", self.probe, methods=["GET"]),
                 Route("/v1/models", self.probe, methods=["GET"]),
-                *(Route(path, self.wake, methods=["POST"]) for path in WAKE_PATHS),
+                *(Route(path, self.wake, methods=["POST"]) for path in self.settings.wake_paths),
             ],
             lifespan=self._lifespan,
         )
