@@ -65,6 +65,7 @@ class FakeStream:
 
     def feed(self, _pcm: object) -> StreamUpdate:
         with self.model.tracker:
+            time.sleep(self.model.delay)
             self.index += 1
             committed, watermark = self.script[self.index]
             changed = committed != self.committed
@@ -387,6 +388,35 @@ async def test_open_stream_blocks_concurrent_compute(monkeypatch: pytest.MonkeyP
         with anyio.fail_after(2):
             await done.wait()
     assert done.is_set()
+
+
+async def test_stream_closed_from_another_task_releases_the_compute_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # anyio.Lock release is task-affine; a stream opened here and closed from a sibling task must
+    # not poison the transcriber (semaphore release is legal cross-task).
+    wire(monkeypatch, FakeModel(text="after", script=[("", 0)], final=("done", 1000)))
+    stt = Transcriber("x")
+    stream = await stt.stream(lookahead_ms=1000)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(stream.aclose)
+    assert stream.closed is True
+    with anyio.fail_after(2):
+        assert (await stt.transcribe(pcm())).text == "after"
+
+
+async def test_concurrent_feeds_never_overlap_in_the_native_layer(monkeypatch: pytest.MonkeyPatch) -> None:
+    tracker = ComputeTracker()
+    wire(monkeypatch, FakeModel(script=[("a", 100), ("ab", 200)], final=("ab", 300), tracker=tracker, delay=0.02))
+    stt = Transcriber("x")
+    stream = await stt.stream(lookahead_ms=1000)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(stream.feed, pcm())
+        tg.start_soon(stream.feed, pcm())
+    assert tracker.peak == 1  # the per-stream semaphore serializes concurrent feeds
+    await stream.finalize()
 
 
 # --- idle unload vs. an open stream ----------------------------------------
