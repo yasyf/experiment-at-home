@@ -17,6 +17,14 @@ REVISIONS: dict[str, str] = {
     "StyleDistance/styledistance": "b7df5f0b0480773c097ba3121d83ca32b71015ca",
     "StyleDistance/mstyledistance": "d66ed25e48225a503b21a65bc804caf06c886f96",
     "sentence-transformers/all-MiniLM-L6-v2": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+    # transcribe.cpp GGUF weights (handy-computer): no upstream tags, so pin by commit SHA.
+    "handy-computer/moonshine-tiny-gguf": "f5c11906eba3f44cf305eed30feb9cbfb0b4b9d0",
+    "handy-computer/parakeet-unified-en-0.6b-gguf": "7e948f21b7bdbac698d3318db9d350f1096f3b6c",
+    "handy-computer/parakeet-tdt-0.6b-v2-gguf": "07cee0616125a08ef619729bb47f40ef747e4bc4",
+    "handy-computer/parakeet-tdt-0.6b-v3-gguf": "85ac09ea12fc4b1112fa76810059364bc6adc9de",
+    "handy-computer/granite-speech-4.1-2b-gguf": "58e7710fd7039ded5a185668eef5f71ca5d9d919",
+    "handy-computer/whisper-large-v3-turbo-gguf": "d222c9f621c1128299248f2ded4d8a1820519780",
+    "handy-computer/nemotron-speech-streaming-en-0.6b-gguf": "7d9b719206789e4068d87c6398262ab4dfd4e45d",
 }
 
 
@@ -41,12 +49,14 @@ def revision_for(repo: str) -> str:
     return revision
 
 
-async def snapshot(repo: str, *, revision: str | None = None) -> Path:
+async def snapshot(repo: str, *, revision: str | None = None, patterns: tuple[str, ...] | None = None) -> Path:
     """Download ``repo`` at its pinned revision into the HF cache and return the local path.
 
     Args:
         repo: The ``owner/name`` HF repo id.
         revision: An explicit commit SHA; defaults to the :data:`REVISIONS` pin for ``repo``.
+        patterns: Glob allow-list restricting the download to matching files (a multi-file GGUF
+            repo materializes only the one quant this call needs); ``None`` fetches the whole repo.
 
     Returns:
         The local filesystem path of the materialized snapshot.
@@ -63,6 +73,7 @@ async def snapshot(repo: str, *, revision: str | None = None) -> Path:
                 repo,
                 revision=revision or revision_for(repo),
                 token=load(HfSettings).token.get_secret_value(),
+                allow_patterns=list(patterns) if patterns else None,
             )
         )
     )
