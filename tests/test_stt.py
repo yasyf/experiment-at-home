@@ -1,0 +1,425 @@
+from __future__ import annotations
+
+import array
+import threading
+import time
+import wave
+from pathlib import Path
+
+import anyio
+import pytest
+
+# The binding's value dataclasses are pure data — use them REAL and fake only the compute boundary.
+from transcribe_cpp import ParakeetBufferedStreamOptions, Result, StreamText, StreamUpdate, Timings
+from transcribe_cpp import Segment as NativeSegment
+from transcribe_cpp import Word as NativeWord
+from transcribe_cpp.errors import InvalidArgument
+
+from athome.stt import catalog
+from athome.stt.catalog import DEFAULT_QUANT, VARIANTS, gguf_path, repo_for
+from athome.stt.engine import Transcriber, transcript_from_result
+from athome.stt.pcm import RATE_HZ, f32_from_s16, require_pcm
+from athome.stt.types import Segment, SttError, Transcript
+
+FIXTURE = Path(__file__).parent / "fixtures" / "stt" / "hello.wav"
+
+
+def load_fixture() -> array.array:
+    with wave.open(str(FIXTURE)) as w:
+        return f32_from_s16(w.readframes(w.getnframes()))
+
+
+def pcm(n: int = 200) -> array.array:
+    return array.array("f", [0.0] * n)
+
+
+class ComputeTracker:
+    """Counts concurrent in-flight compute across worker threads and records the peak."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.current = 0
+        self.peak = 0
+
+    def __enter__(self) -> ComputeTracker:
+        with self.lock:
+            self.current += 1
+            self.peak = max(self.peak, self.current)
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        with self.lock:
+            self.current -= 1
+
+
+class FakeStream:
+    def __init__(self, model: FakeModel) -> None:
+        self.model = model
+        self.script = list(model.script)
+        self.final = model.final
+        self.committed = ""
+        self.index = -1
+        self.reset_called = False
+
+    def feed(self, _pcm: object) -> StreamUpdate:
+        with self.model.tracker:
+            self.index += 1
+            committed, watermark = self.script[self.index]
+            changed = committed != self.committed
+            self.committed = committed
+            return StreamUpdate(
+                result_changed=changed,
+                is_final=False,
+                revision=self.index,
+                input_received_ms=watermark,
+                audio_committed_ms=watermark,
+                buffered_ms=0,
+                committed_changed=changed,
+                tentative_changed=False,
+            )
+
+    def finalize(self) -> StreamUpdate:
+        with self.model.tracker:
+            self.committed, watermark = self.final
+            return StreamUpdate(
+                result_changed=True,
+                is_final=True,
+                revision=self.index + 1,
+                input_received_ms=watermark,
+                audio_committed_ms=watermark,
+                buffered_ms=0,
+                committed_changed=True,
+                tentative_changed=False,
+            )
+
+    def text(self) -> StreamText:
+        return StreamText(full=self.committed, committed=self.committed, tentative="")
+
+    def reset(self) -> None:
+        self.reset_called = True
+
+
+class FakeSession:
+    def __init__(self, model: FakeModel) -> None:
+        self.model = model
+
+    def __enter__(self) -> FakeSession:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def _timings(self) -> Timings:
+        return Timings(load_ms=self.model.load_ms, mel_ms=0.0, encode_ms=0.0, decode_ms=0.0)
+
+    def _result(self) -> Result:
+        return Result(
+            text=self.model.text,
+            language="en",
+            timestamp_kind="word",
+            segments=self.model.segments,
+            words=self.model.words,
+            tokens=(),
+            timings=self._timings(),
+        )
+
+    def run(self, _pcm: object, *, timestamps: str = "auto") -> Result:
+        with self.model.tracker:
+            time.sleep(self.model.delay)
+            return self._result()
+
+    def run_batch(self, pcms: list, *, timestamps: str = "auto", return_exceptions: bool = False) -> list:
+        with self.model.tracker:
+            time.sleep(self.model.delay)
+            return list(self.model.batch)
+
+    def stream(self, **_kwargs: object) -> FakeStream:
+        return FakeStream(self.model)
+
+    def close(self) -> None:
+        pass
+
+
+class FakeModel:
+    def __init__(
+        self,
+        *,
+        text: str = "",
+        segments: tuple = (),
+        words: tuple = (),
+        batch: list | None = None,
+        script: list | None = None,
+        final: tuple = ("", 0),
+        tracker: ComputeTracker | None = None,
+        delay: float = 0.0,
+        load_ms: float = 42.0,
+        closed: list | None = None,
+    ) -> None:
+        self.text = text
+        self.segments = segments
+        self.words = words
+        self.batch = batch or []
+        self.script = script or []
+        self.final = final
+        self.tracker = tracker or ComputeTracker()
+        self.delay = delay
+        self.load_ms = load_ms
+        self.closed = closed if closed is not None else []
+
+    def session(self) -> FakeSession:
+        return FakeSession(self)
+
+    def accepts(self, family: object) -> bool:
+        return isinstance(family, ParakeetBufferedStreamOptions)
+
+    def close(self) -> None:
+        self.closed.append(True)
+
+
+def wire(monkeypatch: pytest.MonkeyPatch, model: FakeModel) -> None:
+    async def fake_gguf_path(variant: str, quant: str = DEFAULT_QUANT) -> Path:
+        return Path("/fake/model.gguf")
+
+    async def fake_load_model(path: str, backend: str) -> FakeModel:
+        return model
+
+    monkeypatch.setattr("athome.stt.engine.gguf_path", fake_gguf_path)
+    monkeypatch.setattr("athome.stt.engine.load_model", fake_load_model)
+
+
+# --- pcm primitives --------------------------------------------------------
+
+
+def test_f32_from_s16_scales_int16_to_unit_range() -> None:
+    data = array.array("h", [0, 16384, -32768, 32767]).tobytes()
+    out = f32_from_s16(data)
+    assert out[0] == 0.0
+    assert out[1] == 0.5
+    assert out[2] == -1.0
+    assert out[3] == pytest.approx(0.99997, abs=1e-4)
+
+
+def test_require_pcm_accepts_float_array_and_rejects_bad_buffers() -> None:
+    good = array.array("f", [0.1, 0.2])
+    assert require_pcm(good) is good
+    with pytest.raises(SttError, match="float32"):
+        require_pcm(array.array("h", [1, 2]))
+    with pytest.raises(SttError, match="whole number of float32"):
+        require_pcm(b"\x00\x00\x00")
+    with pytest.raises(SttError, match="empty"):
+        require_pcm(array.array("f", []))
+
+
+# --- catalog ---------------------------------------------------------------
+
+
+def test_repo_for_derives_the_handy_computer_repo() -> None:
+    assert repo_for("parakeet-tdt-0.6b-v2") == "handy-computer/parakeet-tdt-0.6b-v2-gguf"
+
+
+def test_repo_for_unknown_variant_raises() -> None:
+    with pytest.raises(SttError, match="unknown STT variant"):
+        repo_for("not-a-model")
+
+
+async def test_gguf_path_filters_by_quant_and_resolves_the_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "parakeet-tdt-0.6b-v2-Q8_0.gguf").write_bytes(b"gguf")
+    calls: dict[str, object] = {}
+
+    async def fake_snapshot(repo: str, *, patterns: tuple[str, ...] | None = None) -> Path:
+        calls["repo"], calls["patterns"] = repo, patterns
+        return tmp_path
+
+    monkeypatch.setattr(catalog.hf, "snapshot", fake_snapshot)
+    path = await gguf_path("parakeet-tdt-0.6b-v2", "Q8_0")
+    assert path == tmp_path / "parakeet-tdt-0.6b-v2-Q8_0.gguf"
+    assert calls == {"repo": "handy-computer/parakeet-tdt-0.6b-v2-gguf", "patterns": ("*Q8_0*.gguf",)}
+
+
+async def test_gguf_path_missing_file_raises(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    async def fake_snapshot(repo: str, *, patterns: tuple[str, ...] | None = None) -> Path:
+        return tmp_path
+
+    monkeypatch.setattr(catalog.hf, "snapshot", fake_snapshot)
+    with pytest.raises(SttError, match="no Q8_0 weights"):
+        await gguf_path("moonshine-tiny", "Q8_0")
+
+
+def test_catalog_variants_are_the_enrolled_set() -> None:
+    assert "moonshine-tiny" in VARIANTS
+    assert "parakeet-unified-en-0.6b" in VARIANTS
+
+
+# --- ms -> seconds exactness -----------------------------------------------
+
+
+def test_transcript_from_result_divides_ms_to_seconds_once() -> None:
+    seg = NativeSegment(text="hi", t0_ms=1234, t1_ms=5678, first_word=0, n_words=1, first_token=0, n_tokens=1)
+    word = NativeWord(text="hi", t0_ms=1234, t1_ms=5678, seg_index=0, first_token=0, n_tokens=1)
+    result = Result(
+        text="hi",
+        language="en",
+        timestamp_kind="word",
+        segments=(seg,),
+        words=(word,),
+        tokens=(),
+        timings=Timings(load_ms=9.0, mel_ms=0, encode_ms=0, decode_ms=0),
+    )
+    transcript = transcript_from_result(result)
+    assert transcript.segments[0].start == 1.234
+    assert transcript.segments[0].end == 5.678
+    assert transcript.segments[0].words[0].start == 1.234
+    assert transcript.words[0].end == 5.678
+    assert transcript.load_ms == 9.0
+
+
+async def test_transcribe_maps_seconds_and_carries_load_ms(monkeypatch: pytest.MonkeyPatch) -> None:
+    seg = NativeSegment(text="hi", t0_ms=500, t1_ms=1500, first_word=0, n_words=0, first_token=0, n_tokens=0)
+    wire(monkeypatch, FakeModel(text="hi", segments=(seg,), load_ms=123.0))
+    transcript = await Transcriber("x").transcribe(pcm())
+    assert transcript.text == "hi"
+    assert transcript.segments[0].start == 0.5
+    assert transcript.load_ms == 123.0
+
+
+# --- compute serialization -------------------------------------------------
+
+
+async def test_at_most_one_compute_in_flight_under_interleaving(monkeypatch: pytest.MonkeyPatch) -> None:
+    tracker = ComputeTracker()
+    wire(monkeypatch, FakeModel(tracker=tracker, delay=0.02))
+    stt = Transcriber("x")
+    async with anyio.create_task_group() as tg:
+        for _ in range(6):
+            tg.start_soon(stt.transcribe, pcm())
+    assert tracker.peak == 1
+
+
+async def test_open_stream_blocks_concurrent_compute(monkeypatch: pytest.MonkeyPatch) -> None:
+    wire(monkeypatch, FakeModel(script=[("", 0)], final=("done", 1000)))
+    stt = Transcriber("x")
+    stream = await stt.stream(lookahead_ms=1000)
+    done = anyio.Event()
+
+    async def transcribe_once() -> None:
+        await stt.transcribe(pcm())
+        done.set()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(transcribe_once)
+        await anyio.sleep(0.05)
+        assert not done.is_set()  # the open stream holds the compute lock
+        await stream.finalize()  # releases the lock
+        with anyio.fail_after(2):
+            await done.wait()
+    assert done.is_set()
+
+
+# --- idle unload vs. an open stream ----------------------------------------
+
+
+async def test_open_stream_blocks_idle_sweep_until_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    closed: list[bool] = []
+    wire(monkeypatch, FakeModel(script=[("", 0)], final=("done", 1000), closed=closed))
+    stt = Transcriber("x", idle_s=0.0)
+    stream = await stt.stream(lookahead_ms=1000)
+
+    await stt.resource.sweep(now=10**9)
+    assert stt.resource.loaded is True  # inflight use() from the open stream blocks the reaper
+    assert closed == []
+
+    await stream.finalize()
+    await stt.resource.sweep(now=10**9)
+    assert stt.resource.loaded is False
+    assert closed == [True]  # the model was closed on unload
+
+
+# --- batch per-slot isolation ----------------------------------------------
+
+
+async def test_batch_isolates_per_slot_errors_and_preserves_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    ok = Result(
+        text="ok",
+        language="en",
+        timestamp_kind="segment",
+        segments=(),
+        words=(),
+        tokens=(),
+        timings=Timings(load_ms=1.0, mel_ms=0, encode_ms=0, decode_ms=0),
+    )
+    failed = InvalidArgument("utterance 1 in batch: bad audio")
+    failed.utterance_index = 1
+    wire(monkeypatch, FakeModel(batch=[ok, failed, ok]))
+    out = await Transcriber("x").transcribe_batch([pcm(), pcm(), pcm()])
+    assert [type(item).__name__ for item in out] == ["Transcript", "SttError", "Transcript"]
+    assert out[0].text == "ok" and out[2].text == "ok"
+    assert isinstance(out[1], SttError) and "bad audio" in str(out[1])
+
+
+# --- streaming committed-delta semantics -----------------------------------
+
+
+async def test_feed_returns_only_committed_deltas_with_monotone_absolute_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = [("", 0), ("hello", 1000), ("hello", 1000), ("hello world", 2000)]
+    wire(monkeypatch, FakeModel(script=script, final=("hello world foo", 3000)))
+    stt = Transcriber("x")
+    stream = await stt.stream(lookahead_ms=1000)
+
+    emitted: list[Segment] = []
+    for _ in script:
+        emitted.extend(await stream.feed(pcm()))
+
+    assert [s.text for s in emitted] == ["hello", "world"]  # no-change feeds emit nothing
+    assert [s.start for s in emitted] == [0.0, 1.0]  # stream-absolute, monotone
+    assert [s.end for s in emitted] == [1.0, 2.0]
+
+    transcript = await stream.finalize()
+    assert transcript.text == "hello world foo"
+    # finalize adds only the tail, never duplicating or dropping a fed segment
+    assert [s.text for s in transcript.segments] == ["hello", "world", "foo"]
+    assert [s.start for s in transcript.segments] == sorted(s.start for s in transcript.segments)
+    assert " ".join(s.text for s in transcript.segments) == transcript.text
+
+
+# --- real models (dev-only; --run-live) ------------------------------------
+
+
+@pytest.mark.live
+async def test_live_moonshine_tiny_batch_transcribes_the_fixture() -> None:
+    stt = Transcriber("moonshine-tiny", quant="Q8_0", backend="cpu", idle_s=5)
+    out = await stt.transcribe_batch([load_fixture()])
+    assert len(out) == 1
+    assert isinstance(out[0], Transcript)
+    assert "fox" in out[0].text.lower()
+    assert out[0].load_ms > 0.0
+
+
+@pytest.mark.live
+async def test_live_parakeet_unified_streaming_is_monotone_and_absolute() -> None:
+    stt = Transcriber("parakeet-unified-en-0.6b", quant="Q8_0", idle_s=5)
+    audio = load_fixture()
+    stream = await stt.stream(lookahead_ms=1040)
+    starts: list[float] = []
+    chunk = RATE_HZ // 2
+    for i in range(0, len(audio), chunk):
+        for seg in await stream.feed(audio[i : i + chunk]):
+            starts.append(seg.start)
+    transcript = await stream.finalize()
+    assert starts == sorted(starts)  # monotone stream-absolute starts
+    assert all(start >= 0.0 for start in starts)
+    assert "fox" in transcript.text.lower()
+    joined = " ".join(seg.text for seg in transcript.segments)
+    assert " ".join(joined.split()) == " ".join(transcript.text.split())  # no drop / no duplication
+
+
+@pytest.mark.live
+async def test_live_parakeet_unified_metal_batch_transcribes() -> None:
+    stt = Transcriber("parakeet-unified-en-0.6b", quant="Q8_0", idle_s=5)
+    transcript = await stt.transcribe(load_fixture())
+    assert "fox" in transcript.text.lower()
+    assert transcript.words[0].start >= 0.0
+    assert transcript.load_ms > 0.0
