@@ -60,8 +60,10 @@ def build(
     body: Callable[[], AsyncIterator[bytes]] | None = None,
     seen_requests: list[httpx.Request] | None = None,
     healthy: bool = True,
+    wake_paths: tuple[str, ...] | None = None,
 ) -> Activator:
-    settings = ActivatorSettings(command="child {LISTEN_FD}", child_port=18999)
+    overrides = {"wake_paths": wake_paths} if wake_paths is not None else {}
+    settings = ActivatorSettings(command="child {LISTEN_FD}", child_port=18999, **overrides)
     activator = Activator(settings)
 
     async def fake_launch() -> FakeChild:
@@ -154,6 +156,30 @@ async def test_a_non_allowlisted_path_404s_and_never_spawns(monkeypatch: pytest.
     assert wrong_method.status_code == 405
     assert spawned == []
     assert activator.resource.loaded is False
+
+
+def test_wake_paths_defaults_to_the_chat_completion_surface(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ATHOME_SERVE_ACTIVATOR_COMMAND", "child {LISTEN_FD}")
+    load.cache_clear()
+    assert load(ActivatorSettings).wake_paths == ("/v1/chat/completions", "/v1/completions", "/v1/messages")
+
+
+def test_wake_paths_env_override_parses_a_json_array(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ATHOME_SERVE_ACTIVATOR_COMMAND", "child {LISTEN_FD}")
+    monkeypatch.setenv("ATHOME_SERVE_ACTIVATOR_WAKE_PATHS", '["/v1/audio/transcriptions"]')
+    load.cache_clear()
+    assert load(ActivatorSettings).wake_paths == ("/v1/audio/transcriptions",)
+
+
+async def test_a_custom_wake_path_wakes_while_the_old_default_404s(monkeypatch: pytest.MonkeyPatch) -> None:
+    spawned: list[FakeChild] = []
+    activator = build(monkeypatch, spawned=spawned, wake_paths=("/v1/audio/transcriptions",))
+    async with asgi_client(activator) as client:
+        woke = await client.post("/v1/audio/transcriptions", content=b"{}")
+        stale = await client.post("/v1/chat/completions", content=b"{}")
+    assert woke.status_code == 200
+    assert len(spawned) == 1
+    assert stale.status_code == 404
 
 
 async def test_two_concurrent_wakes_trigger_exactly_one_spawn(monkeypatch: pytest.MonkeyPatch) -> None:
