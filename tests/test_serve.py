@@ -368,8 +368,10 @@ async def test_stop_kills_detached_process_group(monkeypatch: pytest.MonkeyPatch
 
 
 async def test_probe_all_skips_unconfigured_recipes(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ManagedServer, "health", health_sequence(True))
-    assert await probe_all() == [("mlx-vlm", True)]
+    # rapid-mlx/llama-server need config; mlx-vlm is set by the autouse fixture and stt is always
+    # configured (all-default [serve.stt]), so both surface.
+    monkeypatch.setattr(ManagedServer, "health", health_sequence(True, True))
+    assert await probe_all() == [("mlx-vlm", True), ("stt", True)]
 
 
 async def test_probe_all_includes_configured_recipes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -380,7 +382,7 @@ async def test_probe_all_includes_configured_recipes(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(ManagedServer, "health", always_healthy)
     result = dict(await probe_all())
-    assert result == {"rapid-mlx": True, "mlx-vlm": True}
+    assert result == {"rapid-mlx": True, "mlx-vlm": True, "stt": True}
 
 
 async def test_client_targets_recipe_endpoint() -> None:
