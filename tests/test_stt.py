@@ -13,7 +13,7 @@ import pytest
 from transcribe_cpp import ParakeetBufferedStreamOptions, Result, StreamText, StreamUpdate, Timings
 from transcribe_cpp import Segment as NativeSegment
 from transcribe_cpp import Word as NativeWord
-from transcribe_cpp.errors import InvalidArgument
+from transcribe_cpp.errors import InvalidArgument, OutputTruncated
 
 from athome.stt import catalog
 from athome.stt.catalog import DEFAULT_QUANT, VARIANTS, gguf_path, repo_for
@@ -284,6 +284,41 @@ async def test_transcribe_maps_seconds_and_carries_load_ms(monkeypatch: pytest.M
     assert transcript.load_ms == 123.0
 
 
+# --- warmup tolerates a truncated silent run -------------------------------
+
+
+def test_warmup_recovers_load_ms_from_a_truncated_silent_run() -> None:
+    # A short-utterance model loops on the silent warmup and raises OutputTruncated (on Metal); the
+    # partial result still carries load_ms, so the load must not fail.
+    partial = Result(
+        text="♪",
+        language="en",
+        timestamp_kind="segment",
+        segments=(),
+        words=(),
+        tokens=(),
+        timings=Timings(load_ms=17.0, mel_ms=0, encode_ms=0, decode_ms=0),
+    )
+
+    class TruncatingSession:
+        def __enter__(self) -> TruncatingSession:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            pass
+
+        def run(self, _pcm: object, *, timestamps: str = "auto") -> Result:
+            truncated = OutputTruncated("output truncated: decode hit the cap")
+            truncated.partial_result = partial
+            raise truncated
+
+    class TruncatingModel:
+        def session(self) -> TruncatingSession:
+            return TruncatingSession()
+
+    assert Transcriber("x")._warmup(TruncatingModel()) == 17.0
+
+
 # --- compute serialization -------------------------------------------------
 
 
@@ -396,6 +431,16 @@ async def test_live_moonshine_tiny_batch_transcribes_the_fixture() -> None:
     assert isinstance(out[0], Transcript)
     assert "fox" in out[0].text.lower()
     assert out[0].load_ms > 0.0
+
+
+@pytest.mark.live
+async def test_live_moonshine_tiny_metal_batch_survives_the_silent_warmup() -> None:
+    # Regression: on the default auto (Metal) backend moonshine truncates the silent warmup; the
+    # first request must transcribe rather than 500 on the load.
+    stt = Transcriber("moonshine-tiny", quant="Q8_0", idle_s=5)
+    transcript = await stt.transcribe(load_fixture())
+    assert "fox" in transcript.text.lower()
+    assert transcript.load_ms > 0.0
 
 
 @pytest.mark.live

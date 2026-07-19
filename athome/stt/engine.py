@@ -105,8 +105,15 @@ class Transcriber:
         return model
 
     def _warmup(self, model: Model) -> float:
+        from transcribe_cpp.errors import OutputTruncated
+
         with model.session() as session:
-            return session.run(array.array("f", bytes(WARMUP_SAMPLES * 4))).timings.load_ms
+            try:
+                return session.run(array.array("f", bytes(WARMUP_SAMPLES * 4))).timings.load_ms
+            except OutputTruncated as truncated:
+                # A short-utterance model (moonshine) loops on the silent warmup to its token cap;
+                # the run still compiled the kernels, and the binding keeps timings on the partial.
+                return truncated.partial_result.timings.load_ms
 
     async def _unload(self) -> None:
         if (model := self.model) is not None:
