@@ -470,7 +470,12 @@ class ManagedServer:
         match settings_for(self.recipe):
             case ModalVllmSettings():
                 return None
-            case RapidMlxSettings(port=port) | MlxVlmSettings(port=port) | LlamaServerSettings(port=port):
+            case (
+                RapidMlxSettings(port=port)
+                | MlxVlmSettings(port=port)
+                | LlamaServerSettings(port=port)
+                | SttServeSettings(port=port)
+            ):
                 return port
 
     @property
