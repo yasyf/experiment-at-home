@@ -440,5 +440,6 @@ def test_empty_journal_still_raises_retro_error() -> None:
 
 
 async def test_generate_raises_on_an_empty_journal() -> None:
+    pytest.importorskip("spawnllm")
     with pytest.raises(RetroError, match="empty journal"):
         await generate((), make_negative_report(()), backend=cast("LlmBackend", object()))
