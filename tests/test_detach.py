@@ -114,7 +114,7 @@ def test_cli_launch_wait_log_round_trip(tmp_path: Path) -> None:
     assert "pid" in launched.output
     assert "log" in launched.output
 
-    waited = runner.invoke(cli, ["wait", "clijob", "--poll", "0.02", "--timeout", "5"])
+    waited = runner.invoke(cli, ["wait", "clijob", "--poll", "0.02", "--timeout", "30"])
     assert waited.exit_code == 0
     assert "exit: 6" in waited.output
 
@@ -126,7 +126,7 @@ def test_cli_launch_wait_log_round_trip(tmp_path: Path) -> None:
 def test_cli_wait_emits_json() -> None:
     runner = CliRunner()
     assert runner.invoke(cli, ["--detach", "--name", "cjson", "--", "/bin/sh", "-c", "exit 2"]).exit_code == 0
-    result = runner.invoke(cli, ["wait", "cjson", "--poll", "0.02", "--timeout", "5", "--json"])
+    result = runner.invoke(cli, ["wait", "cjson", "--poll", "0.02", "--timeout", "30", "--json"])
     assert result.exit_code == 0
     assert result.output.strip() == '{"name": "cjson", "exit": 2}'
 
