@@ -45,6 +45,7 @@ from athome.train.spec import (
     UnservableBase,
     UnsupportedLoraShape,
 )
+from athome.train.state import BackendMismatch, LocalState, ModalState, Resume
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -291,9 +292,11 @@ def records(tmp_path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in (tmp_path / "run.jsonl").read_text().splitlines()]
 
 
-async def train(tmp_path: Path, spec: TrainSpec, settings: ModalTrainSettings | None = None) -> object:
+async def train(
+    tmp_path: Path, spec: TrainSpec, settings: ModalTrainSettings | None = None, *, resume: Resume | None = None
+) -> object:
     return await ModalTrainBackend(settings or ModalTrainSettings()).train(
-        spec, sink=sink(tmp_path), work_dir=tmp_path / "run"
+        spec, sink=sink(tmp_path), work_dir=tmp_path / "run", resume=resume
     )
 
 
@@ -470,6 +473,7 @@ async def test_the_gpu_loads_the_base_at_its_pinned_revision(tmp_path: Path, mon
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setitem(sys.modules, "peft", ModuleType("peft"))
     sys.modules["peft"].LoraConfig = FakeLoraConfig
+    sys.modules["peft"].PeftModel = SimpleNamespace(from_pretrained=lambda *args, **kwargs: "peft-model")
     monkeypatch.setenv("HF_TOKEN", "hf_write_token")
 
     result = train_remote(
@@ -671,6 +675,7 @@ async def test_the_checkpoint_is_the_fused_mlx_model_the_sidecar_produced(
     assert checkpoint.base == BASE
     assert checkpoint.step == 4
     assert checkpoint.train_cost_usd == pytest.approx(TRAINED_USD)
+    assert checkpoint.state == ModalState(repo="athome-train/pilot", revision="c0ffee")
     work_dir = tmp_path / "run"
     assert converge.order == [
         "preflight",
@@ -678,6 +683,31 @@ async def test_the_checkpoint_is_the_fused_mlx_model_the_sidecar_produced(
         f"convert:{converge.peft_dir}->{work_dir / 'adapter'}",
         f"fuse:{converge.adapter_dir}->{work_dir / 'mlx'}",
     ]
+
+
+async def test_a_modal_resume_threads_the_prior_adapter_into_the_remote_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, converge: Converge
+) -> None:
+    remote = install_fake_modal(monkeypatch, Remote(MATCHING_FINGERPRINT, TRAINED))
+    prior = ModalState(repo="athome-train/pilot", revision="deadbeef")
+
+    await train(tmp_path, train_spec(tmp_path), resume=Resume(handle=prior, from_step=0))
+
+    ((config, _),) = remote.called("train_remote")
+    assert config.resume == prior
+
+
+async def test_a_foreign_resume_handle_is_refused_before_the_gpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, converge: Converge
+) -> None:
+    remote = install_fake_modal(monkeypatch, Remote(MATCHING_FINGERPRINT, TRAINED))
+    foreign = LocalState(adapter_dir=tmp_path / "prior")
+
+    with pytest.raises(BackendMismatch, match="modal cannot resume from a LocalState"):
+        await train(tmp_path, train_spec(tmp_path), resume=Resume(handle=foreign, from_step=0))
+
+    assert remote.app is None
+    assert remote.calls == []
 
 
 async def test_the_run_is_journaled_from_launch_to_the_fused_artifact(

@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 SIDECAR: Path = Path(__file__).resolve()
 PEFT_KEY = re.compile(r"base_model\.model\.(model\.layers\.\d+\.(.+?))\.lora_([AB])\.weight")
 PEFT_CONFIG = "adapter_config.json"
+GENERATION_FENCE = "=" * 10
 
 
 def uvx(*args: str) -> tuple[str, ...]:
@@ -38,6 +39,26 @@ async def run_process(command: Sequence[str]) -> None:
     import anyio
 
     await anyio.run_process(command)
+
+
+async def run_output(command: Sequence[str]) -> str:
+    """Run ``command`` in the sidecar and return its captured stdout, decoded."""
+    import anyio
+
+    return (await anyio.run_process(command)).stdout.decode()
+
+
+def strip_generation(stdout: str) -> str:
+    """The generated completion carried between mlx-lm's two ``==========`` fences.
+
+    ``mlx_lm generate`` brackets the streamed completion with a line of ten ``=`` before and
+    after it, then prints token-rate and peak-memory stats below the second fence. The text
+    between the fences is exactly the completion; everything else is furniture.
+    """
+    lines = stdout.splitlines()
+    fences = [index for index, line in enumerate(lines) if line == GENERATION_FENCE]
+    opening, closing = fences[0], fences[1]
+    return "\n".join(lines[opening + 1 : closing])
 
 
 async def convert_peft_to_mlx(peft_dir: Path, out_dir: Path, *, base: BaseModelSpec) -> Path:
@@ -97,6 +118,44 @@ async def fuse(adapter_dir: Path, out_dir: Path, *, base: BaseModelSpec) -> Path
         mlx_lm_command("fuse", "--model", base.mlx, "--adapter-path", str(adapter_dir), "--save-path", str(out_dir))
     )
     return out_dir
+
+
+async def generate(model: str, prompt: str, *, max_tokens: int, temperature: float, seed: int | None = None) -> str:
+    """Sample a completion from ``model`` for ``prompt`` in the pinned mlx-lm sidecar.
+
+    Runs ``mlx_lm generate`` out of process in the pinned environment and returns only the
+    generated text, stripped of the ``==========`` fences and the token-rate and peak-memory
+    lines mlx-lm prints around it. The prompt is fed verbatim (``--ignore-chat-template``), so
+    the completion depends on ``(model, prompt, max_tokens, temperature, seed)`` alone and never
+    on a model's embedded chat template — the caller owns any templating.
+
+    Args:
+        model: The mlx-lm model directory or Hugging Face repo to sample from.
+        prompt: The prompt text, tokenized as-is with no chat-template wrapping.
+        max_tokens: The generation cap.
+        temperature: The sampling temperature; 0.0 is greedy.
+        seed: The PRNG seed, or None to leave mlx-lm's generator unseeded.
+
+    Returns:
+        The generated completion text, furniture stripped.
+    """
+    return strip_generation(
+        await run_output(
+            mlx_lm_command(
+                "generate",
+                "--model",
+                model,
+                "--prompt",
+                prompt,
+                "--max-tokens",
+                str(max_tokens),
+                "--temp",
+                str(temperature),
+                "--ignore-chat-template",
+                *(("--seed", str(seed)) if seed is not None else ()),
+            )
+        )
+    )
 
 
 def run_convert(peft_dir: Path, out_dir: Path, *, num_layers: int) -> dict[str, object]:

@@ -21,6 +21,10 @@ class Boom(RuntimeError):
     """An op's failure — raised at submission time or surfaced when its result is drained."""
 
 
+class StateNameCollision(RuntimeError):
+    """A ``save_state`` at a name already saved, with ``overwrite=False`` — the real SDK refuses this."""
+
+
 @dataclass(frozen=True, slots=True)
 class FakeTensor:
     data: list[float] | list[int]
@@ -73,6 +77,38 @@ class FakeSaved:
 @dataclass(frozen=True, slots=True)
 class FakeUrl:
     url: str
+
+
+@dataclass(frozen=True, slots=True)
+class FakeWeightsInfo:
+    """A saved checkpoint's LoRA shape, as the ``weights_info`` endpoint reports it back."""
+
+    base_model: str
+    is_lora: bool
+    lora_rank: int
+    train_mlp: bool
+    train_attn: bool
+    train_unembed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FakeFuture:
+    """A resolved ``APIFuture`` — the rest client hands weights-info back through one of these."""
+
+    value: object
+
+    async def result_async(self, timeout: float | None = None) -> object:
+        return self.value
+
+
+@dataclass(slots=True)
+class FakeRestClient:
+    """The rest client ``create_rest_client`` returns; answers ``weights_info`` from the saved shapes."""
+
+    weights_info: dict[str, FakeWeightsInfo]
+
+    def get_weights_info_by_tinker_path(self, tinker_path: str) -> FakeFuture:
+        return FakeFuture(self.weights_info[tinker_path])
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,6 +221,9 @@ class FakeTraining:
     forward: list[list[FakeDatum]] = field(default_factory=list)
     optim: list[FakeAdamParams] = field(default_factory=list)
     saves: list[tuple[str, int | None]] = field(default_factory=list)
+    state_saves: list[tuple[str, int | None]] = field(default_factory=list)
+    weights_info: dict[str, FakeWeightsInfo] = field(default_factory=dict)
+    seeded_from: str | None = None
 
     def _fb_value(self, datums: Sequence[FakeDatum], metrics: dict[str, float]) -> object:
         if self.clock.fb_count == self.fail_fb:
@@ -217,12 +256,35 @@ class FakeTraining:
         self.saves.append((name, ttl_seconds))
         return self.clock.submit("save", self.clock.fb_count, FakeSaved(f"tinker://run/{name}"))
 
+    async def save_state_async(self, name: str, ttl_seconds: int | None = None, overwrite: bool = False) -> ClockFuture:
+        """Save the training state (weights+optimizer) to a distinct ``state/`` namespace and register its shape.
+
+        ``weights_info`` is the service's own registry, shared across every client it mints, so it
+        is the cross-run record of which state names already exist. A second ``save_state`` at a
+        name already saved refuses under ``overwrite=False``, exactly as the real SDK does — the
+        collision a fresh re-run of a completed spec would otherwise hit at its immortal final save.
+        """
+        path = f"tinker://run/state/{name}"
+        if path in self.weights_info and not overwrite:
+            raise StateNameCollision(name)
+        self.state_saves.append((name, ttl_seconds))
+        self.weights_info[path] = FakeWeightsInfo(
+            base_model=self.base_model,
+            is_lora=True,
+            lora_rank=self.rank,
+            train_mlp=self.toggles[0],
+            train_attn=self.toggles[1],
+            train_unembed=self.toggles[2],
+        )
+        return self.clock.submit("state", self.clock.fb_count, FakeSaved(path))
+
 
 @dataclass(slots=True)
 class FakeService:
     api_key: str
     fail_fb: int | None = None
     clients: list[FakeTraining] = field(default_factory=list)
+    weights_info: dict[str, FakeWeightsInfo] = field(default_factory=dict)
 
     async def create_lora_training_client_async(
         self, base_model: str, rank: int, seed: int, train_mlp: bool, train_attn: bool, train_unembed: bool
@@ -235,9 +297,31 @@ class FakeService:
                 seed=seed,
                 toggles=(train_mlp, train_attn, train_unembed),
                 fail_fb=self.fail_fb,
+                weights_info=self.weights_info,
             )
         )
         return self.clients[-1]
+
+    async def create_training_client_from_state_with_optimizer_async(
+        self, path: str, user_metadata: dict[str, str] | None = None, weights_access_token: str | None = None
+    ) -> FakeTraining:
+        """Recreate a client from a saved state: its shape is the checkpoint's own, tagged with the seed path."""
+        info = self.weights_info[path]
+        self.clients.append(
+            FakeTraining(
+                base_model=info.base_model,
+                rank=info.lora_rank,
+                seed=0,
+                toggles=(info.train_mlp, info.train_attn, info.train_unembed),
+                fail_fb=self.fail_fb,
+                weights_info=self.weights_info,
+                seeded_from=path,
+            )
+        )
+        return self.clients[-1]
+
+    def create_rest_client(self) -> FakeRestClient:
+        return FakeRestClient(self.weights_info)
 
 
 class FakeTokenizer:

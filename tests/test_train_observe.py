@@ -66,6 +66,7 @@ class EmptyReportBackend:
         budget: SpendGuard,
         checkpoints: CheckpointPolicy,
         eval_rows: Sequence[EvalRow] | None,
+        run_tag: str = "",
     ) -> TrainReport:
         return TrainReport(method="sft", steps=(), checkpoints=(), dropped=0, wall_s=0.0, train_cost_usd=0.0)
 
@@ -143,7 +144,7 @@ async def test_one_envelope_spans_fit_and_score_so_fit_actuals_reduce_score_head
     rows = (EvalRow(tokens=(1, 2, 3), weights=(0.0, 0.0, 1.0)),)
 
     fit_probe = SpendGuard(max_usd=None)
-    await backend.fit(request, sink=sink(tmp_path), budget=fit_probe)
+    await backend.fit(request, sink=sink(tmp_path), budget=fit_probe, run_tag="probe")
     fit_spent = fit_probe.spent
     score_projection = backend.cost(model=tinker_model(request.base), prefill=3, sample=1)
     assert fit_spent > 0.0
@@ -178,7 +179,7 @@ async def test_best_is_the_argmax_of_select_over_the_report_checkpoints(
     assert outcome.best is min(outcome.report.checkpoints, key=by_step)
     assert outcome.best is not outcome.report.final
     assert outcome.best.step < outcome.report.final.step
-    assert sampling_service.sampling.paths == [outcome.best.path]
+    assert sampling_service.sampling.paths == [outcome.best.sampler_path]
     assert len(outcome.scored) == 1
 
 
@@ -192,8 +193,8 @@ async def test_a_hosted_only_base_is_accepted_end_to_end(sampling_service: Sampl
     outcome = await observe(backend, request, rows, budget=budget(), select=by_step, sink=sink(tmp_path))
 
     assert outcome.best is outcome.report.final
-    assert outcome.best.path.startswith("tinker://")
-    assert sampling_service.sampling.paths == [outcome.best.path]
+    assert outcome.best.sampler_path.startswith("tinker://")
+    assert sampling_service.sampling.paths == [outcome.best.sampler_path]
     assert len(outcome.scored) == 1
 
 
@@ -220,3 +221,16 @@ async def test_an_empty_report_checkpoints_crashes_on_max(tmp_path: Path) -> Non
         await observe(backend, request, rows, budget=budget(), select=by_step, sink=sink(tmp_path))
 
     assert backend.scored == []
+
+
+async def test_two_observes_of_one_spec_save_disjoint_state_names(
+    sampling_service: SamplingService, tmp_path: Path
+) -> None:
+    backend = TinkerBackend.from_settings()
+    request = spec(corpus(tmp_path))
+    rows = (EvalRow(tokens=(1, 2, 3), weights=(0.0, 0.0, 1.0)),)
+
+    first = await observe(backend, request, rows, budget=budget(), select=by_step, sink=sink(tmp_path / "a"))
+    second = await observe(backend, request, rows, budget=budget(), select=by_step, sink=sink(tmp_path / "b"))
+
+    assert first.best.state != second.best.state

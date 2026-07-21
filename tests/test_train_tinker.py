@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 import tarfile
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import anyio
@@ -17,6 +18,7 @@ from athome.config import load
 from athome.llm.spend import SpendExceeded, SpendGuard
 from athome.progress import RunSink, load_journal
 from athome.train import data, sidecar, tinker
+from athome.train.runstate import RunState, RunStateStore, run_key, spec_fingerprint
 from athome.train.spec import (
     BASE_MODELS,
     STD_MODULES,
@@ -32,9 +34,12 @@ from athome.train.spec import (
     TinkerModelId,
     TrainSpec,
 )
+from athome.train.state import Resume, TinkerState
 from athome.train.tinker import (
     BETA,
     TORCH_HINT,
+    ExpiredStateHandle,
+    LoraShapeDrift,
     TinkerBackend,
     TorchRequired,
     UnservableBase,
@@ -56,6 +61,8 @@ from tests.tinker_fakes import (
     FakeService,
     FakeTokenizer,
     FakeUrl,
+    FakeWeightsInfo,
+    StateNameCollision,
     install_sdk,
     make_datum,
 )
@@ -359,7 +366,8 @@ async def test_sft_runs_cross_entropy_and_one_optim_step_per_step(
     assert [loss_fn for _, loss_fn in training.forward_backward] == ["cross_entropy"] * 3
     assert [len(batch) for batch, _ in training.forward_backward] == [2, 2, 2]
     assert training.optim == [FakeAdamParams(learning_rate=2e-4)] * 3
-    assert training.saves == [("watcher-sft-3", None)]
+    assert training.saves == [("watcher-run-sft-3", None)]
+    assert training.state_saves == [("watcher-run-sft-3", None)]
     assert [completion_of(datum) for batch, _ in training.forward_backward for datum in batch] == ["yes"] * 6
     assert (checkpoint.method, checkpoint.step, checkpoint.backend) == ("sft", 3, "tinker")
 
@@ -564,8 +572,13 @@ async def test_fit_snapshots_at_the_cadence_with_names_ttls_and_eval_scores(
     )
 
     assert service.clients[0].saves == [("watcher-step00002", 604_800), ("watcher-sft-4", None)]
+    assert service.clients[0].state_saves == [("watcher-step00002", 604_800), ("watcher-sft-4", None)]
     assert [(checkpoint.step, checkpoint.final) for checkpoint in report.checkpoints] == [(2, False), (4, True)]
     assert report.final.step == 4
+    assert all(isinstance(checkpoint.state, TinkerState) for checkpoint in report.checkpoints)
+    assert all(checkpoint.state.state_path != checkpoint.sampler_path for checkpoint in report.checkpoints)
+    assert report.final.state == TinkerState("tinker://run/state/watcher-sft-4")
+    assert report.final.sampler_path == "tinker://run/watcher-sft-4"
     assert all(checkpoint.scores is not None and len(checkpoint.scores) == 1 for checkpoint in report.checkpoints)
     assert report.final.scores[0].logprob == pytest.approx(LOGPROB)
     assert report.final.scores[0].weight == 1.0
@@ -786,7 +799,13 @@ async def test_materialize_converts_any_saved_checkpoint_without_fusing(
     service: FakeService, converged: dict[str, object], tmp_path: Path
 ) -> None:
     request = spec(corpus(tmp_path, method="sft"))
-    saved = SavedCheckpoint(step=2, path="tinker://run/watcher-step00002", final=False, scores=None)
+    saved = SavedCheckpoint(
+        step=2,
+        sampler_path="tinker://run/watcher-step00002",
+        state=TinkerState("tinker://run/state/watcher-step00002"),
+        final=False,
+        scores=None,
+    )
 
     adapter = await TinkerBackend.from_settings().materialize(saved, request, work_dir=tmp_path / "run", cost=1.25)
 
@@ -795,8 +814,9 @@ async def test_materialize_converts_any_saved_checkpoint_without_fusing(
         adapter_dir=tmp_path / "run" / "adapter",
         train_cost_usd=1.25,
         sampler_path="tinker://run/watcher-step00002",
+        state=TinkerState("tinker://run/state/watcher-step00002"),
     )
-    assert converged["tinker_path"] == saved.path
+    assert converged["tinker_path"] == saved.sampler_path
     assert converged["peft"] == tmp_path / "run" / "peft"
     assert converged["convert_from"] == tmp_path / "run" / "peft"
     assert "fuse_from" not in converged
@@ -805,7 +825,11 @@ async def test_materialize_converts_any_saved_checkpoint_without_fusing(
 async def test_fuse_preserves_the_materialized_adapter_step(converged: dict[str, object], tmp_path: Path) -> None:
     request = spec(corpus(tmp_path, method="sft"))
     adapter = Adapter(
-        step=2, adapter_dir=tmp_path / "adapter", train_cost_usd=1.25, sampler_path="tinker://run/watcher-step2"
+        step=2,
+        adapter_dir=tmp_path / "adapter",
+        train_cost_usd=1.25,
+        sampler_path="tinker://run/watcher-step2",
+        state=TinkerState("tinker://run/state/watcher-step2"),
     )
 
     checkpoint = await TinkerBackend.from_settings().fuse(adapter, request, work_dir=tmp_path / "run")
@@ -815,6 +839,7 @@ async def test_fuse_preserves_the_materialized_adapter_step(converged: dict[str,
     assert checkpoint.mlx_path == tmp_path / "run" / "mlx"
     assert checkpoint.train_cost_usd == adapter.train_cost_usd
     assert checkpoint.sampler_path == adapter.sampler_path
+    assert checkpoint.state == adapter.state
     assert converged["fuse_from"] == adapter.adapter_dir
 
 
@@ -826,13 +851,13 @@ async def test_the_checkpoint_fuses_the_downloaded_adapter_into_mlx(
     )
 
     run = tmp_path / "run"
-    assert converged["tinker_path"] == "tinker://run/watcher-sft-3"
+    assert converged["tinker_path"] == "tinker://run/watcher-run-sft-3"
     assert converged["peft"] == run / "peft"
     assert converged["convert_from"] == run / "peft"
     assert converged["fuse_from"] == run / "adapter"
     assert checkpoint.mlx_path == run / "mlx"
     assert checkpoint.adapter_dir == run / "adapter"
-    assert checkpoint.sampler_path == "tinker://run/watcher-sft-3"
+    assert checkpoint.sampler_path == "tinker://run/watcher-run-sft-3"
     assert checkpoint.base == BASE_MODELS["qwen3-8b"]
 
 
@@ -888,7 +913,7 @@ async def test_fit_and_post_hoc_score_have_identical_weighted_reductions(
     request = spec(corpus(tmp_path, method="sft"))
 
     report = await backend.fit(request, sink=sink(tmp_path), budget=budget(), eval_rows=(row,))
-    scores = await backend.score(report.final.path, (row,), base=request.base, budget=budget())
+    scores = await backend.score(report.final.sampler_path, (row,), base=request.base, budget=budget())
 
     assert report.final.scores is not None
     assert scores == report.final.scores
@@ -904,18 +929,18 @@ async def test_a_shared_envelope_draws_fit_actuals_down_against_a_later_score(
     rows = (EvalRow(tokens=(1, 2, 3), weights=(0.0, 0.0, 1.0)),)
 
     probe = SpendGuard(max_usd=None)
-    report = await backend.fit(request, sink=sink(tmp_path), budget=probe)
+    report = await backend.fit(request, sink=sink(tmp_path), budget=probe, run_tag="e1")
     fit_spent = probe.spent
     score_projection = backend.cost(model=tinker_model(request.base), prefill=3, sample=1)
     assert fit_spent > 0.0
 
     shared = SpendGuard(max_usd=fit_spent + score_projection / 2)
-    await backend.fit(request, sink=sink(tmp_path), budget=shared)
+    await backend.fit(request, sink=sink(tmp_path), budget=shared, run_tag="e2")
     with pytest.raises(SpendExceeded):
-        await backend.score(report.final.path, rows, base=request.base, budget=shared)
+        await backend.score(report.final.sampler_path, rows, base=request.base, budget=shared)
 
     fresh = SpendGuard(max_usd=fit_spent + score_projection / 2)
-    assert len(await backend.score(report.final.path, rows, base=request.base, budget=fresh)) == 1
+    assert len(await backend.score(report.final.sampler_path, rows, base=request.base, budget=fresh)) == 1
 
 
 async def test_a_transient_score_failure_on_a_shared_envelope_releases_its_reservation(
@@ -942,12 +967,12 @@ async def test_a_transient_score_failure_on_a_shared_envelope_releases_its_reser
     monkeypatch.setattr(FakeSamplingService, "create_sampling_client_async", flaky_client)
 
     with pytest.raises(Boom):
-        await backend.score(report.final.path, rows, base=request.base, budget=shared)
+        await backend.score(report.final.sampler_path, rows, base=request.base, budget=shared)
     assert shared.reserved == pytest.approx(0.0)
     assert shared.spent == pytest.approx(fit_spent)
 
     fail["on"] = False
-    retry = await backend.score(report.final.path, rows, base=request.base, budget=shared)
+    retry = await backend.score(report.final.sampler_path, rows, base=request.base, budget=shared)
     assert len(retry) == 1
     assert shared.reserved == pytest.approx(0.0)
     assert shared.spent == pytest.approx(
@@ -981,7 +1006,7 @@ async def test_a_transient_sample_failure_on_a_shared_envelope_releases_its_rese
 
     with pytest.raises(BaseExceptionGroup) as raised:
         await backend.sample(
-            report.final.path, prompts, base=request.base, budget=shared, max_tokens=8, temperature=0.7
+            report.final.sampler_path, prompts, base=request.base, budget=shared, max_tokens=8, temperature=0.7
         )
     assert raised.group_contains(Boom)
     assert shared.reserved == pytest.approx(0.0)
@@ -989,7 +1014,7 @@ async def test_a_transient_sample_failure_on_a_shared_envelope_releases_its_rese
 
     fail["on"] = False
     retry = await backend.sample(
-        report.final.path, prompts, base=request.base, budget=shared, max_tokens=8, temperature=0.7
+        report.final.sampler_path, prompts, base=request.base, budget=shared, max_tokens=8, temperature=0.7
     )
     assert len(retry) == 1
     assert shared.reserved == pytest.approx(0.0)
@@ -1260,3 +1285,204 @@ async def test_download_adapter_unpacks_the_signed_archive(monkeypatch: pytest.M
     out = await download_adapter(RestService(), "tinker://run/step3", tmp_path / "peft")
 
     assert (out / "adapter_model.safetensors").read_bytes() == b"weights"
+
+
+def matching_shape() -> FakeWeightsInfo:
+    """The saved LoRA shape a default-``spec`` resume expects to restore into, so the guard passes."""
+    return FakeWeightsInfo(
+        base_model="Qwen/Qwen3-8B", is_lora=True, lora_rank=16, train_mlp=True, train_attn=True, train_unembed=False
+    )
+
+
+async def test_snapshot_saves_both_sampler_and_state_as_distinct_artifacts(
+    service: FakeService, tmp_path: Path
+) -> None:
+    request = spec(
+        corpus(tmp_path, method="sft", rows=8), hyperparams=Hyperparams(steps=4, batch_size=2, max_seq_len=64)
+    )
+
+    report = await TinkerBackend.from_settings().fit(
+        request, sink=sink(tmp_path), budget=budget(), checkpoints=CheckpointPolicy(at=(0.5,))
+    )
+
+    assert service.clients[0].saves == [("watcher-step00002", 604_800), ("watcher-sft-4", None)]
+    assert service.clients[0].state_saves == [("watcher-step00002", 604_800), ("watcher-sft-4", None)]
+    for checkpoint in report.checkpoints:
+        assert isinstance(checkpoint.state, TinkerState)
+        assert checkpoint.sampler_path.startswith("tinker://run/")
+        assert checkpoint.state.state_path.startswith("tinker://run/state/")
+        assert checkpoint.state.state_path != checkpoint.sampler_path
+
+
+async def test_resume_seeds_from_state_with_optimizer_not_base(service: FakeService, tmp_path: Path) -> None:
+    request = spec(corpus(tmp_path, method="sft"))
+    state_path = "tinker://run/state/watcher-prior"
+    service.weights_info[state_path] = matching_shape()
+    resume = Resume(handle=TinkerState(state_path), from_step=0)
+
+    await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path), budget=budget(), resume=resume)
+
+    assert len(service.clients) == 1
+    assert service.clients[0].seeded_from == state_path
+
+
+async def test_same_run_resume_slices_the_plan_and_continues_step_numbering(
+    service: FakeService, tmp_path: Path
+) -> None:
+    request = spec(
+        corpus(tmp_path, method="sft", rows=8), hyperparams=Hyperparams(steps=5, batch_size=2, max_seq_len=64)
+    )
+    state_path = "tinker://run/state/watcher-step00002"
+    service.weights_info[state_path] = matching_shape()
+    resume = Resume(handle=TinkerState(state_path), from_step=2)
+
+    report = await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path), budget=budget(), resume=resume)
+
+    training = service.clients[0]
+    assert training.seeded_from == state_path
+    assert len(training.forward_backward) == 3
+    assert [record.step for record in report.steps] == [3, 4, 5]
+    assert report.final.step == 5
+    assert training.saves == [("watcher-r00002-sft-5", None)]
+    assert training.state_saves == [("watcher-r00002-sft-5", None)]
+
+
+async def test_a_resume_whose_saved_lora_shape_drifts_is_refused(service: FakeService, tmp_path: Path) -> None:
+    request = spec(corpus(tmp_path, method="sft"), lora=LoraSpec(rank=16))
+    state_path = "tinker://run/state/rank8"
+    service.weights_info[state_path] = dataclasses.replace(matching_shape(), lora_rank=8)
+    resume = Resume(handle=TinkerState(state_path), from_step=0)
+
+    with pytest.raises(LoraShapeDrift, match="rank=8"):
+        await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path), budget=budget(), resume=resume)
+
+
+async def test_a_missing_resume_state_is_refused_not_silently_restarted_from_base(
+    service: FakeService, tmp_path: Path
+) -> None:
+    request = spec(corpus(tmp_path, method="sft"))
+    resume = Resume(handle=TinkerState("tinker://run/state/gone"), from_step=0)
+
+    with pytest.raises(ExpiredStateHandle, match="expired or missing"):
+        await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path), budget=budget(), resume=resume)
+
+    assert service.clients == []
+
+
+async def test_a_resume_carries_prior_cost_so_the_cap_binds_per_run(
+    service: FakeService, converged: dict[str, object], tmp_path: Path
+) -> None:
+    """#1 — a crash-looping run must never bill N×cap: prior spend seeds the guard."""
+    request = spec(
+        corpus(tmp_path, method="sft", rows=8), hyperparams=Hyperparams(steps=5, batch_size=2, max_seq_len=64)
+    )
+    state_path = "tinker://run/state/watcher-step00002"
+    service.weights_info[state_path] = matching_shape()
+    resume = Resume(handle=TinkerState(state_path), from_step=2, cost_usd=5.0)
+
+    checkpoint = await TinkerBackend.from_settings().train(
+        request, sink=sink(tmp_path), work_dir=tmp_path / "run", resume=resume
+    )
+
+    resumed_tokens = sum(tinker.token_count(batch) for batch, _ in service.clients[0].forward_backward)
+    assert checkpoint.train_cost_usd == pytest.approx(5.0 + resumed_tokens / 1e6 * 0.44)
+
+
+async def test_a_dpo_continuation_re_anchors_the_reference_and_policy_to_the_prior_state(
+    service: FakeService, torch_present: None, tmp_path: Path
+) -> None:
+    """#2 — a cross-run DPO continuation seeds BOTH the frozen reference and the policy from i-1's state."""
+    request = spec(corpus(tmp_path, method="dpo"), method="dpo")
+    state_path = "tinker://run/state/i0-final"
+    service.weights_info[state_path] = matching_shape()
+    resume = Resume(handle=TinkerState(state_path), from_step=0, reference=TinkerState(state_path))
+
+    await TinkerBackend.from_settings().fit(request, sink=sink(tmp_path), budget=budget(), resume=resume)
+
+    reference, policy = service.clients
+    assert reference.seeded_from == state_path
+    assert policy.seeded_from == state_path
+
+
+async def test_the_fake_service_refuses_a_duplicate_state_name_under_overwrite_false(
+    service: FakeService,
+) -> None:
+    """The fake mirrors the SDK: re-saving a state name refuses under overwrite=False, allows overwrite=True."""
+    client = await service.create_lora_training_client_async("Qwen/Qwen3-8B", 16, 0, True, True, False)
+    await client.save_state_async("watcher-sft-3")
+
+    with pytest.raises(StateNameCollision, match="watcher-sft-3"):
+        await client.save_state_async("watcher-sft-3")
+
+    await client.save_state_async("watcher-sft-3", overwrite=True)
+
+
+async def test_a_fresh_re_run_of_a_completed_spec_saves_a_distinct_immortal_state_name(
+    service: FakeService, converged: dict[str, object], tmp_path: Path
+) -> None:
+    """A completed prior re-runs fresh (resume=None); its immortal final save must not collide with run 1's."""
+    request = spec(corpus(tmp_path, method="sft"))
+    backend = TinkerBackend.from_settings()
+
+    first = await backend.train(request, sink=sink(tmp_path), work_dir=tmp_path / "run-1")
+    second = await backend.train(request, sink=sink(tmp_path), work_dir=tmp_path / "run-2")
+
+    assert service.clients[0].state_saves == [("watcher-run-1-sft-3", None)]
+    assert service.clients[1].state_saves == [("watcher-run-2-sft-3", None)]
+    assert first.state == TinkerState("tinker://run/state/watcher-run-1-sft-3")
+    assert second.state == TinkerState("tinker://run/state/watcher-run-2-sft-3")
+
+
+async def test_a_dataset_changed_re_run_saves_a_distinct_immortal_state_name(
+    service: FakeService, converged: dict[str, object], tmp_path: Path
+) -> None:
+    """A changed dataset mints a new run_key; the immortal name ignores it, so the run tag keeps names distinct."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    first_data = corpus(tmp_path / "a", method="sft")
+    second_data = corpus(tmp_path / "b", method="sft")
+    assert run_key(spec(first_data)) != run_key(spec(second_data))
+    backend = TinkerBackend.from_settings()
+
+    first = await backend.train(spec(first_data), sink=sink(tmp_path), work_dir=tmp_path / "run-1")
+    second = await backend.train(spec(second_data), sink=sink(tmp_path), work_dir=tmp_path / "run-2")
+
+    assert first.state == TinkerState("tinker://run/state/watcher-run-1-sft-3")
+    assert second.state == TinkerState("tinker://run/state/watcher-run-2-sft-3")
+
+
+async def test_run_state_store_round_trips_a_running_record(tmp_path: Path) -> None:
+    key = run_key(spec(corpus(tmp_path, method="sft")))
+    record = RunState(
+        run_key=key,
+        spec_fingerprint="fingerprint",
+        step=2,
+        handle=TinkerState("tinker://run/state/watcher-step00002"),
+        reference=None,
+        cost_usd=1.5,
+        status="running",
+        updated_at=datetime(2026, 7, 20, tzinfo=UTC),
+    )
+
+    async with RunStateStore.open(tmp_path / "runstate.db") as store:
+        assert await store.get(key) is None
+        await store.put(record)
+        assert await store.get(key) == record
+        await store.mark_complete(key)
+        completed = await store.get(key)
+
+    assert completed is not None
+    assert completed.status == "complete"
+    assert completed.handle == record.handle
+
+
+def test_run_key_is_deterministic_and_excludes_the_resume_seeds(tmp_path: Path) -> None:
+    base = spec(corpus(tmp_path, method="sft"))
+
+    assert run_key(base) == run_key(dataclasses.replace(base))
+    seeded = dataclasses.replace(
+        base, resume_from=TinkerState("tinker://seed"), resume_reference=TinkerState("tinker://ref")
+    )
+    assert run_key(seeded) == run_key(base)
+    assert spec_fingerprint(seeded) == spec_fingerprint(base)
+    assert run_key(dataclasses.replace(base, name="other")) != run_key(base)

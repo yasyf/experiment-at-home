@@ -20,6 +20,7 @@ from athome.train.spec import (
     TrainSpec,
     UnservableBase,
 )
+from athome.train.state import TinkerState
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -28,10 +29,18 @@ TRAIN_COST_USD = 1.25
 BUDGET_CAP_USD = 100.0
 FIT_PROJECTED_USD = 3.0
 CHECKPOINTS: tuple[SavedCheckpoint, ...] = (
-    SavedCheckpoint(step=3, path="tinker://run/3", final=False, scores=None),
-    SavedCheckpoint(step=6, path="tinker://run/6", final=False, scores=None),
-    SavedCheckpoint(step=9, path="tinker://run/9", final=False, scores=None),
-    SavedCheckpoint(step=12, path="tinker://run/12", final=True, scores=None),
+    SavedCheckpoint(
+        step=3, sampler_path="tinker://run/3", state=TinkerState("tinker://run/state/3"), final=False, scores=None
+    ),
+    SavedCheckpoint(
+        step=6, sampler_path="tinker://run/6", state=TinkerState("tinker://run/state/6"), final=False, scores=None
+    ),
+    SavedCheckpoint(
+        step=9, sampler_path="tinker://run/9", state=TinkerState("tinker://run/state/9"), final=False, scores=None
+    ),
+    SavedCheckpoint(
+        step=12, sampler_path="tinker://run/12", state=TinkerState("tinker://run/state/12"), final=True, scores=None
+    ),
 )
 # The argmax is a middle checkpoint, never the final — proving retrain materializes what select
 # picks, not the last-saved snapshot.
@@ -57,6 +66,7 @@ class FitCall:
     budget: SpendGuard
     checkpoints: CheckpointPolicy
     eval_rows: object
+    run_tag: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,9 +99,10 @@ class ScriptedBackend:
         budget: SpendGuard,
         checkpoints: CheckpointPolicy,
         eval_rows: Sequence[EvalRow] | None,
+        run_tag: str = "",
     ) -> TrainReport:
         self.calls.append("fit")
-        self.fit_calls.append(FitCall(spec, sink, budget, checkpoints, eval_rows))
+        self.fit_calls.append(FitCall(spec, sink, budget, checkpoints, eval_rows, run_tag))
         await budget.check(FIT_PROJECTED_USD)
         await budget.record(FIT_PROJECTED_USD, self.report.train_cost_usd)
         return self.report
@@ -196,6 +207,7 @@ async def test_fit_receives_spec_sink_budget_checkpoints_and_eval_rows_verbatim(
     assert call.budget is envelope
     assert call.checkpoints is CHECKPOINT_POLICY
     assert call.eval_rows is EVAL_ROWS
+    assert call.run_tag == tmp_path.name
 
 
 async def test_select_runs_on_every_checkpoint_and_its_argmax_is_materialized(tmp_path: Path) -> None:

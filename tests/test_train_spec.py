@@ -31,6 +31,7 @@ from athome.train.spec import (
     spend_cap,
     std_lora_keys,
 )
+from athome.train.state import TinkerState
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -165,6 +166,8 @@ def test_spec_defaults() -> None:
     assert spec().method == "sft"
     assert spec().backend is None
     assert spec().max_usd is None
+    assert spec().resume_from is None
+    assert spec().resume_reference is None
     assert spec().lora == LoraSpec(rank=16, alpha=32, target_modules=STD_MODULES)
     assert spec().hyperparams == Hyperparams(steps=100, batch_size=4, learning_rate=1e-4, max_seq_len=4096, seed=1729)
 
@@ -184,10 +187,44 @@ def test_checkpoint_carries_the_fused_artifact_and_its_provenance() -> None:
         adapter_dir=Path("/runs/watcher/adapter"),
         train_cost_usd=1.25,
         sampler_path="tinker://run/watcher-sampler",
+        state=TinkerState("tinker://run/state/watcher-state"),
     )
     assert checkpoint.mlx_path == Path("/runs/watcher/fused")
     assert checkpoint.adapter_dir == Path("/runs/watcher/adapter")
     assert checkpoint.sampler_path == "tinker://run/watcher-sampler"
+    assert checkpoint.state == TinkerState("tinker://run/state/watcher-state")
+
+
+def test_from_checkpoint_seeds_the_policy_and_the_dpo_reference_from_the_prior_state() -> None:
+    prior = Checkpoint(
+        base=BASE_MODELS["qwen3-8b"],
+        backend="tinker",
+        method="dpo",
+        step=100,
+        mlx_path=Path("/runs/watcher-i0/fused"),
+        adapter_dir=Path("/runs/watcher-i0/adapter"),
+        train_cost_usd=1.25,
+        sampler_path="tinker://run/watcher-i0-sampler",
+        state=TinkerState("tinker://run/state/watcher-i0-final"),
+    )
+
+    continuation = TrainSpec.from_checkpoint(
+        prior,
+        dataset=LocalJsonlRef(path=Path("negatives-i1.jsonl")),
+        name="watcher-i1",
+        hyperparams=Hyperparams(steps=50),
+        method="dpo",
+    )
+
+    assert continuation.base is prior.base
+    assert continuation.resume_from == prior.state
+    assert continuation.resume_reference == prior.state
+    assert (continuation.name, continuation.method) == ("watcher-i1", "dpo")
+
+
+def test_from_checkpoint_cannot_thread_a_sampler_path_as_a_training_seed() -> None:
+    """A ``sampler_path`` is a plain ``str``; a resume seed is a ``StateHandle`` — a type error, not a convention."""
+    assert not isinstance("tinker://run/watcher-sampler", TinkerState)
 
 
 def test_train_settings_defaults_expand_user_paths() -> None:
@@ -197,6 +234,7 @@ def test_train_settings_defaults_expand_user_paths() -> None:
     assert settings.registry_root == Path.home() / ".athome/train/registry"
     assert settings.baseline_root == Path.home() / ".athome/train/baselines.db"
     assert settings.work_root == Path.home() / ".athome/train/runs"
+    assert settings.run_state_db == Path.home() / ".athome/train/runstate.db"
 
 
 def test_train_settings_read_the_train_section_env(monkeypatch: pytest.MonkeyPatch) -> None:

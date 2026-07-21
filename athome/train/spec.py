@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from athome.bakeoff import Leaderboard
     from athome.registry import VersionInfo
     from athome.train.data import SftExample
+    from athome.train.state import StateHandle
 
 MlxModelId = NewType("MlxModelId", str)
 TinkerModelId = NewType("TinkerModelId", str)
@@ -332,6 +333,11 @@ class TrainSpec:
         backend: An explicit backend override; None selects by availability.
         max_usd: A per-run spend cap for the metered backends (tinker, modal);
             None falls back to that backend's configured ``spend_cap_usd``.
+        resume_from: The cross-run continuation seed — a prior checkpoint's training state the run
+            warm-starts its policy from. Set by :meth:`from_checkpoint`; excluded from the run key so
+            a continued run still recovers itself by identity.
+        resume_reference: The DPO reference anchor a continuation freezes its reference client at,
+            also set by :meth:`from_checkpoint` and excluded from the run key.
     """
 
     name: str
@@ -342,6 +348,36 @@ class TrainSpec:
     lora: LoraSpec = field(default_factory=LoraSpec)
     backend: BackendName | None = None
     max_usd: float | None = None
+    resume_from: StateHandle | None = None
+    resume_reference: StateHandle | None = None
+
+    @classmethod
+    def from_checkpoint(cls, prior: Checkpoint, *, dataset: DatasetSource, name: str, **overrides: object) -> TrainSpec:
+        """A fresh continuation of ``prior``: its training state warm-starts and anchors the new run.
+
+        The seed is ``prior.state`` — a :data:`~athome.train.state.StateHandle`, so a ``sampler_path``
+        *cannot* be threaded as a training seed: the distinct-artifact rule is a type error here, not
+        a convention. The DPO reference anchor is that same prior state, so a continued preference run
+        freezes its reference at the model it is moving away from. ``base`` is inherited from ``prior``;
+        everything else (``hyperparams``, ``method``, ``lora``, ``max_usd``) arrives through ``overrides``.
+
+        Args:
+            prior: The checkpoint to continue from; its ``base`` and ``state`` seed the new spec.
+            dataset: The new run's corpus — fresh negatives for the next DITTO iteration.
+            name: The registry family the continuation registers under.
+            overrides: Any other :class:`TrainSpec` field (``hyperparams`` is required).
+
+        Returns:
+            A spec whose policy and DPO reference both seed from ``prior.state``.
+        """
+        return cls(
+            name=name,
+            base=prior.base,
+            dataset=dataset,
+            resume_from=prior.state,
+            resume_reference=prior.state,
+            **overrides,
+        )
 
 
 def spend_cap(spec: TrainSpec, default: float) -> float:
@@ -362,12 +398,15 @@ class Adapter:
         adapter_dir: The mlx-lm adapter directory.
         train_cost_usd: What the training run spent to produce the saved weights.
         sampler_path: The opaque ``tinker://`` sampler checkpoint the adapter was materialized from.
+        state: The training-state handle (weights+optimizer) the snapshot also saved, distinct from
+            the sampler path — what a continuation re-seeds its optimizer from.
     """
 
     step: int
     adapter_dir: Path
     train_cost_usd: float
     sampler_path: str
+    state: StateHandle
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,6 +429,8 @@ class Checkpoint:
         train_cost_usd: What the run spent; 0.0 on the unmetered local backend.
         sampler_path: The opaque ``tinker://`` sampler checkpoint the fused adapter came from, or
             None for a backend that produces no hosted sampler checkpoint (local, modal).
+        state: The training-state handle this checkpoint can be continued from, at its backend's
+            declared fidelity (Tinker weights+optimizer; local/modal weights-only).
     """
 
     base: BaseModelSpec
@@ -400,6 +441,7 @@ class Checkpoint:
     adapter_dir: Path | None
     train_cost_usd: float
     sampler_path: str | None
+    state: StateHandle
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,14 +480,18 @@ class SavedCheckpoint:
 
     Attributes:
         step: The training step whose weights this snapshot captured.
-        path: The opaque ``tinker://`` address the weights were saved to.
+        sampler_path: The opaque ``tinker://`` address the *sampler* weights were saved to.
+        state: The training state (weights+optimizer) saved atomically alongside the sampler weights,
+            a distinct artifact — a snapshot that saved sampler weights without a training state has
+            no representation.
         final: True for the run's last checkpoint, which is kept forever.
         scores: The eval rows scored against these weights, order-preserving, or None when
             the run carried no eval rows.
     """
 
     step: int
-    path: str
+    sampler_path: str
+    state: StateHandle
     final: bool
     scores: tuple[ScoredSequence, ...] | None
 
@@ -522,6 +568,7 @@ class TrainSettings(SectionSettings):
     registry_root: Path = Path("~/.athome/train/registry")
     baseline_root: Path = Path("~/.athome/train/baselines.db")
     work_root: Path = Path("~/.athome/train/runs")
+    run_state_db: Path = Path("~/.athome/train/runstate.db")
 
 
 @dataclass(frozen=True, slots=True)

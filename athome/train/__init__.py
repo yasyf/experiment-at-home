@@ -218,6 +218,8 @@ async def run(spec: TrainSpec, *, evaluation: BakeoffSpec) -> TrainResult:
     """
     from athome.progress import RunSink
     from athome.research.baseline import BaselineStore, uplift
+    from athome.train.runstate import RunStateStore, run_key
+    from athome.train.state import Resume, handle_to_json
 
     settings = load(TrainSettings)
     await preflight(spec, evaluation=evaluation, settings=settings)
@@ -226,7 +228,18 @@ async def run(spec: TrainSpec, *, evaluation: BakeoffSpec) -> TrainResult:
     sink = RunSink.open(work_dir / JOURNAL_FILE)
     await sink.append({"event": "selected", "backend": backend.name, "method": spec.method, "work_dir": str(work_dir)})
 
-    checkpoint = await backend.train(spec, sink=sink, work_dir=work_dir)
+    key = run_key(spec)
+    async with RunStateStore.open(settings.run_state_db) as store:
+        prior = await store.get(key)
+        resume = (
+            Resume(prior.handle, prior.step, prior.cost_usd, prior.reference)
+            if prior is not None and prior.status == "running"
+            else Resume(spec.resume_from, 0, 0.0, spec.resume_reference)
+            if spec.resume_from is not None
+            else None
+        )
+        checkpoint = await backend.train(spec, sink=sink, work_dir=work_dir, resume=resume, store=store)
+        await store.mark_complete(key)
     await sink.append({"event": "trained", "mlx_path": str(checkpoint.mlx_path), "usd": checkpoint.train_cost_usd})
 
     leaderboard = await evaluate(checkpoint, evaluation, port=free_port())
@@ -246,6 +259,7 @@ async def run(spec: TrainSpec, *, evaluation: BakeoffSpec) -> TrainResult:
         "step": checkpoint.step,
         "adapter_dir": checkpoint.adapter_dir,
         "sampler_path": checkpoint.sampler_path,
+        "state": handle_to_json(checkpoint.state),
         "train_cost_usd": checkpoint.train_cost_usd,
         METRIC_KEY: metric,
         "primary_metric": evaluation.primary_metric,

@@ -12,11 +12,13 @@ from athome.train.spec import BASE_MODELS, Hyperparams, LocalJsonlRef, TrainSett
 if TYPE_CHECKING:
     from athome.progress import RunSink
     from athome.train.spec import BackendName, Checkpoint, Method
+    from athome.train.state import StateFidelity
 
 
 def fake_backend(backend_name: BackendName, *, present: bool, methods: frozenset[Method]) -> type[TrainBackend]:
     class Fake:
         name: ClassVar[BackendName] = backend_name
+        state_fidelity: ClassVar[StateFidelity] = "weights"
 
         @staticmethod
         def available() -> bool:

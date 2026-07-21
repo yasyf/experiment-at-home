@@ -5,6 +5,7 @@ import os
 import random
 import tarfile
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import partial
 from time import perf_counter
 from typing import TYPE_CHECKING, ClassVar
@@ -30,6 +31,7 @@ from athome.train.engine import (
     projection,
     token_count,
 )
+from athome.train.runstate import RunState, run_key, spec_fingerprint
 from athome.train.spec import (
     Adapter,
     Checkpoint,
@@ -50,6 +52,7 @@ from athome.train.spec import (
     spend_cap,
     std_lora_keys,
 )
+from athome.train.state import BackendMismatch, TinkerState
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -61,6 +64,7 @@ if TYPE_CHECKING:
     from athome.progress import RunSink
     from athome.train.data import Message, TinkerPreference
     from athome.train.engine import Loss, Op
+    from athome.train.runstate import RunStateStore
     from athome.train.spec import (
         BackendName,
         BaseModelSpec,
@@ -70,6 +74,7 @@ if TYPE_CHECKING:
         TinkerPrice,
         TrainSpec,
     )
+    from athome.train.state import Resume, StateFidelity, StateHandle
 
 BETA = 0.1
 DOWNLOAD_TIMEOUT = httpx.Timeout(30.0, read=600.0)
@@ -81,6 +86,24 @@ TORCH_HINT = (
 
 class TorchRequired(AthomeError):
     """Raised when Tinker's DPO path runs without torch, which its custom loss backprops in."""
+
+
+class LoraShapeDrift(AthomeError):
+    """Raised when a resume seed's saved LoRA shape disagrees with the spec's requested shape.
+
+    The SDK derives the LoRA rank and module toggles from the checkpoint's ``weights_info`` and
+    ignores the caller's spec on from-state creation, so a silent disagreement would train a
+    different adapter than the spec asked for. The mismatch is refused loudly instead.
+    """
+
+
+class ExpiredStateHandle(AthomeError):
+    """Raised when a resume seed's saved training state is expired or missing at restore.
+
+    A vanished checkpoint never silently falls back to a fresh-from-base run — that would bill a
+    full run while quietly discarding the continuation the caller asked for. It is refused loudly,
+    naming the handle and the explicit re-run-from-base option.
+    """
 
 
 def require_torch() -> None:
@@ -262,22 +285,36 @@ def assemble(
     *,
     checkpoints: CheckpointPolicy,
     eval_datums: tuple[tinker.Datum, ...],
+    base_step: int = 0,
+    run_tag: str,
 ) -> tuple[tuple[Op, ...], list[tuple[int, bool]]]:
     """The schedule for ``steps``: a train op per step, snapshots at the policy's cadence and the end.
 
     Returns the ops in submission order and the ``(step, final)`` metadata for each snapshot in
     that same order, so the fold can label each :class:`SavedCheckpoint` as its result drains.
+
+    ``run_tag`` namespaces every snapshot name by this attempt's own run identity, so a fresh
+    re-run of the same spec — a completed or re-proposed family, whose ``base_step`` is 0 — never
+    re-emits a prior run's immortal final state name under the SDK's ``overwrite=False``.
+
+    ``base_step`` offsets both the step labels and the snapshot names for a same-run resume: the
+    remaining ``steps`` are labeled ``base_step + 1 …`` (absolute, so cadence intermediates land at
+    the numbers an uninterrupted run would use) and every snapshot name carries an ``-r{base_step}``
+    tag on top of ``run_tag``, so a resumed attempt never collides with the prior attempt's
+    already-saved names under the SDK's ``overwrite=False``.
     """
     total = spec.hyperparams.steps
     intermediate = set(checkpoints.steps_for(total))
+    run_prefix = f"-{run_tag}" if run_tag else ""
+    tag = run_prefix if base_step == 0 else f"{run_prefix}-r{base_step:05d}"
     ops: list[Op] = []
     meta: list[tuple[int, bool]] = []
-    for step, (datums, loss) in enumerate(steps, start=1):
+    for step, (datums, loss) in enumerate(steps, start=base_step + 1):
         ops.append(TrainOp(datums, loss, spec.hyperparams.learning_rate))
         if step in intermediate:
-            ops.append(SnapshotOp(f"{spec.name}-step{step:05d}", checkpoints.ttl_seconds, eval_datums))
+            ops.append(SnapshotOp(f"{spec.name}{tag}-step{step:05d}", checkpoints.ttl_seconds, eval_datums))
             meta.append((step, False))
-    ops.append(SnapshotOp(f"{spec.name}-{spec.method}-{total}", None, eval_datums))
+    ops.append(SnapshotOp(f"{spec.name}{tag}-{spec.method}-{total}", None, eval_datums))
     meta.append((total, True))
     return tuple(ops), meta
 
@@ -326,15 +363,27 @@ async def run_schedule(
     price: TinkerPrice,
     sink: RunSink,
     eval_datums: Sequence[tinker.Datum],
+    base_step: int = 0,
+    store: RunStateStore | None = None,
+    reference: StateHandle | None = None,
 ) -> TrainReport:
     """Fold the executor's result stream into a :class:`TrainReport`, recording spend and journaling.
 
-    Every side effect — spend reconciliation, the journal line — lands at a drain point, so the
-    journal stays step-ordered and the executor tops the queue up before each yield.
+    Every side effect — spend reconciliation, the journal line, and the run-state upsert — lands at
+    a drain point, so the journal and the persisted resume record stay step-ordered and the executor
+    tops the queue up before each yield. Each snapshot binds its sampler and training-state paths
+    into one :class:`SavedCheckpoint`, and, when a ``store`` is threaded, persists the run's most
+    progressed :class:`RunState` there — the one place run state is written.
+
+    The step counter starts at ``base_step`` so a resumed fold labels its steps and its cumulative
+    records from where the prior attempt left off.
     """
     records: list[StepRecord] = []
     saved: list[SavedCheckpoint] = []
     snapshots = iter(meta)
+    key = run_key(spec)
+    fingerprint = spec_fingerprint(spec)
+    completed = base_step
     start = perf_counter()
     async for result in execute(client, schedule):
         match result:
@@ -343,20 +392,36 @@ async def run_schedule(
                 cost = price.train * tokens * op.loss.passes / 1e6
                 await reservation.reconcile(cost)
                 metrics = step_metrics(op.loss, output, op.datums)
-                step = len(records) + 1
+                completed += 1
                 await sink.append(
-                    {"step": step, "method": spec.method, "tokens": tokens, "cost_usd": reservation.guard.spent}
+                    {"step": completed, "method": spec.method, "tokens": tokens, "cost_usd": reservation.guard.spent}
                     | metrics
                 )
-                records.append(StepRecord(step, tokens, cost, metrics))
-            case SnapshotDone(op=op, path=path, outputs=outputs):
+                records.append(StepRecord(completed, tokens, cost, metrics))
+            case SnapshotDone(op=op, sampler_path=sampler_path, state_path=state_path, outputs=outputs):
                 step, final = next(snapshots)
                 if outputs is not None:
                     eval_cost = price.prefill * token_count(op.eval) / 1e6
                     await reservation.reconcile(eval_cost)
                 scores = reduce_eval(outputs, eval_datums) if outputs is not None else None
-                saved.append(SavedCheckpoint(step=step, path=path, final=final, scores=scores))
-                await sink.append({"event": "checkpoint", "step": step, "path": path, "final": final})
+                handle = TinkerState(state_path=state_path)
+                saved.append(
+                    SavedCheckpoint(step=step, sampler_path=sampler_path, state=handle, final=final, scores=scores)
+                )
+                if store is not None:
+                    await store.put(
+                        RunState(
+                            run_key=key,
+                            spec_fingerprint=fingerprint,
+                            step=step,
+                            handle=handle,
+                            reference=reference,
+                            cost_usd=reservation.guard.spent,
+                            status="running",
+                            updated_at=datetime.now(UTC),
+                        )
+                    )
+                await sink.append({"event": "checkpoint", "step": step, "path": sampler_path, "final": final})
     return TrainReport(
         method=spec.method,
         steps=tuple(records),
@@ -411,6 +476,7 @@ class TinkerBackend:
 
     settings: TinkerSettings
     name: ClassVar[BackendName] = "tinker"
+    state_fidelity: ClassVar[StateFidelity] = "weights+optimizer"
 
     @staticmethod
     def available() -> bool:
@@ -459,16 +525,68 @@ class TinkerBackend:
         return (prefill * price.prefill + sample * price.sample + train * price.train) / 1e6
 
     async def lora_client(
-        self, service: tinker.ServiceClient, spec: TrainSpec, *, model: TinkerModelId
+        self,
+        service: tinker.ServiceClient,
+        spec: TrainSpec,
+        *,
+        model: TinkerModelId,
+        seed: StateHandle | None = None,
     ) -> tinker.TrainingClient:
-        return await service.create_lora_training_client_async(
-            base_model=model,
-            rank=spec.lora.rank,
-            seed=spec.hyperparams.seed,
-            train_mlp=spec.lora.train_mlp,
-            train_attn=spec.lora.train_attn,
-            train_unembed=spec.lora.train_unembed,
+        """A training client for ``spec``: fresh from ``model``, or seeded from a prior Tinker state.
+
+        With no ``seed`` the client is a fresh LoRA over the base. A :class:`TinkerState` seed restores
+        the weights *and* optimizer via ``create_training_client_from_state_with_optimizer_async`` — after
+        :meth:`require_matches` refuses a saved shape that disagrees with ``spec.lora``. A foreign handle
+        (``LocalState``/``ModalState``) cannot seed a Tinker client and is refused loudly.
+        """
+        match seed:
+            case None:
+                return await service.create_lora_training_client_async(
+                    base_model=model,
+                    rank=spec.lora.rank,
+                    seed=spec.hyperparams.seed,
+                    train_mlp=spec.lora.train_mlp,
+                    train_attn=spec.lora.train_attn,
+                    train_unembed=spec.lora.train_unembed,
+                )
+            case TinkerState(state_path=state_path):
+                await self.require_matches(service, state_path, spec)
+                return await service.create_training_client_from_state_with_optimizer_async(state_path)
+            case _:
+                raise BackendMismatch(f"tinker cannot seed a training client from a {type(seed).__name__}: {seed}")
+
+    async def require_matches(self, service: tinker.ServiceClient, state_path: str, spec: TrainSpec) -> None:
+        """Refuse a resume whose saved LoRA shape disagrees with what ``spec.lora`` restores to.
+
+        The SDK reads the rank and module toggles off the checkpoint's ``weights_info`` and ignores
+        ``spec.lora`` on a from-state creation, so a silent disagreement would train a different
+        adapter than the spec asked for. This reads that saved shape and fails loudly on a mismatch —
+        or, when the saved state has expired or vanished, refuses just as loudly rather than falling
+        back to a fresh run.
+        """
+        try:
+            info = await service.create_rest_client().get_weights_info_by_tinker_path(state_path).result_async()
+        except (KeyError, httpx.HTTPError) as missing:
+            raise ExpiredStateHandle(
+                f"resume state {state_path} is expired or missing ({missing}); re-run from base by dropping "
+                f"resume_from, or point the continuation at a live checkpoint."
+            ) from missing
+        fields = ("rank", "train_mlp", "train_attn", "train_unembed")
+        restored = (
+            info.lora_rank,
+            info.train_mlp if info.train_mlp is not None else True,
+            info.train_attn if info.train_attn is not None else True,
+            info.train_unembed if info.train_unembed is not None else True,
         )
+        requested = (spec.lora.rank, spec.lora.train_mlp, spec.lora.train_attn, spec.lora.train_unembed)
+        if restored != requested:
+            restored_shape = ", ".join(f"{name}={value}" for name, value in zip(fields, restored, strict=True))
+            requested_shape = ", ".join(f"{name}={value}" for name, value in zip(fields, requested, strict=True))
+            raise LoraShapeDrift(
+                f"resume checkpoint {state_path} restores LoRA shape ({restored_shape}), which the SDK derives "
+                f"and the spec cannot override, but spec.lora asks for ({requested_shape}); re-run from base or "
+                f"match the saved shape."
+            )
 
     def service(self) -> tinker.ServiceClient:
         import tinker
@@ -483,6 +601,9 @@ class TinkerBackend:
         budget: SpendGuard,
         checkpoints: CheckpointPolicy = CheckpointPolicy(),
         eval_rows: Sequence[EvalRow] | None = None,
+        resume: Resume | None = None,
+        store: RunStateStore | None = None,
+        run_tag: str = "",
     ) -> TrainReport:
         """Train ``spec`` on Tinker, journaling each step and saving checkpoints at the cadence.
 
@@ -499,6 +620,15 @@ class TinkerBackend:
             checkpoints: Which fractions of the run to snapshot as intermediates; the final step
                 is always snapshotted and kept forever.
             eval_rows: Pre-tokenized rows scored against every checkpoint's weights, or None.
+            resume: The restore input — seeds the training client, slices the plan to the steps a
+                same-run crash left unrun, and carries the DPO reference anchor — or None for a run
+                from base.
+            store: The run-state store the fold persists this run's most progressed
+                :class:`RunState` to at each snapshot, or None to train without a resume ledger
+                (an eval-only fit through observe/retrain).
+            run_tag: This run's identity namespace, folded into every snapshot name so a fresh
+                re-run of the same spec never re-emits a prior run's immortal final state name;
+                empty for a standalone fit outside the managed :func:`~athome.train.run` lifecycle.
 
         Returns:
             The report: per-step records, the saved checkpoints with their eval scores, the drop
@@ -533,6 +663,8 @@ class TinkerBackend:
                         eval_datums=eval_datums,
                         reservation=reservation,
                         price=price,
+                        resume=resume,
+                        run_tag=run_tag,
                     )
                 case "dpo":
                     schedule, meta, dropped, client = await self.prepare_dpo(
@@ -542,6 +674,8 @@ class TinkerBackend:
                         eval_datums=eval_datums,
                         reservation=reservation,
                         price=price,
+                        resume=resume,
+                        run_tag=run_tag,
                     )
             report = await run_schedule(
                 spec,
@@ -553,6 +687,9 @@ class TinkerBackend:
                 price=price,
                 sink=sink,
                 eval_datums=eval_datums,
+                base_step=resume.from_step if resume is not None else 0,
+                store=store,
+                reference=resume.reference if resume is not None else None,
             )
             settled = True
             return report
@@ -571,6 +708,8 @@ class TinkerBackend:
         eval_datums: tuple[tinker.Datum, ...],
         reservation: Reservation,
         price: TinkerPrice,
+        resume: Resume | None = None,
+        run_tag: str,
     ) -> tuple[tuple[Op, ...], list[tuple[int, bool]], int, tinker.TrainingClient]:
         examples = await data.normalize(spec.dataset, method="sft")
         pool = [
@@ -580,12 +719,22 @@ class TinkerBackend:
         ]
         if len(pool) < spec.hyperparams.batch_size:
             raise InsufficientData(len(pool), spec.hyperparams.batch_size)
-        plan = batches(pool, size=spec.hyperparams.batch_size, steps=spec.hyperparams.steps, seed=spec.hyperparams.seed)
+        base_step = resume.from_step if resume is not None else 0
+        plan = batches(
+            pool, size=spec.hyperparams.batch_size, steps=spec.hyperparams.steps, seed=spec.hyperparams.seed
+        )[base_step:]
         schedule, meta = assemble(
-            spec, [(batch, CrossEntropy()) for batch in plan], checkpoints=checkpoints, eval_datums=eval_datums
+            spec,
+            [(batch, CrossEntropy()) for batch in plan],
+            checkpoints=checkpoints,
+            eval_datums=eval_datums,
+            base_step=base_step,
+            run_tag=run_tag,
         )
         await reservation.reserve(projection(schedule, price))
-        client = await self.lora_client(self.service(), spec, model=model)
+        client = await self.lora_client(
+            self.service(), spec, model=model, seed=resume.handle if resume is not None else None
+        )
         return schedule, meta, len(examples) - len(pool), client
 
     async def prepare_dpo(
@@ -597,6 +746,8 @@ class TinkerBackend:
         eval_datums: tuple[tinker.Datum, ...],
         reservation: Reservation,
         price: TinkerPrice,
+        resume: Resume | None = None,
+        run_tag: str,
     ) -> tuple[tuple[Op, ...], list[tuple[int, bool]], int, tinker.TrainingClient]:
         examples = await data.normalize(spec.dataset, method="dpo")
         max_seq_len = spec.hyperparams.max_seq_len
@@ -608,23 +759,29 @@ class TinkerBackend:
         ]
         if len(pool) < spec.hyperparams.batch_size:
             raise InsufficientData(len(pool), spec.hyperparams.batch_size)
+        base_step = resume.from_step if resume is not None else 0
         plan = batches(
             range(len(pool)), size=spec.hyperparams.batch_size, steps=spec.hyperparams.steps, seed=spec.hyperparams.seed
-        )
+        )[base_step:]
         reference_datums = pair_datums(pool)
         shape, meta = assemble(
             spec,
             [(tuple(pair_datums([pool[i] for i in batch])), Custom(dpo_loss)) for batch in plan],
             checkpoints=checkpoints,
             eval_datums=eval_datums,
+            base_step=base_step,
+            run_tag=run_tag,
         )
         await reservation.reserve(projection(shape, price) + price.prefill * token_count(reference_datums) / 1e6)
 
         service = self.service()
         reference = await reference_pass(
-            await self.lora_client(service, spec, model=model), reference_datums, reservation=reservation, price=price
+            await self.lora_client(service, spec, model=model, seed=resume.reference if resume is not None else None),
+            reference_datums,
+            reservation=reservation,
+            price=price,
         )
-        client = await self.lora_client(service, spec, model=model)
+        client = await self.lora_client(service, spec, model=model, seed=resume.handle if resume is not None else None)
         schedule, _ = assemble(
             spec,
             [
@@ -636,16 +793,32 @@ class TinkerBackend:
             ],
             checkpoints=checkpoints,
             eval_datums=eval_datums,
+            base_step=base_step,
+            run_tag=run_tag,
         )
         return schedule, meta, len(examples) - len(pool), client
 
-    async def train(self, spec: TrainSpec, *, sink: RunSink, work_dir: Path) -> Checkpoint:
+    async def train(
+        self,
+        spec: TrainSpec,
+        *,
+        sink: RunSink,
+        work_dir: Path,
+        resume: Resume | None = None,
+        store: RunStateStore | None = None,
+    ) -> Checkpoint:
         """Train ``spec`` on Tinker and fuse the resulting final adapter into a servable MLX model.
+
+        The spend cap binds per run, not per attempt: a ``resume`` seeds the SpendGuard with the cost
+        already billed under this run's key, so a crash-looping run never bills N times the cap.
 
         Args:
             spec: The fine-tuning request: base, dataset, hyperparams, method, LoRA, spend cap.
             sink: The run journal; one record lands per step with its loss, tokens, and spend.
             work_dir: This run's own directory; the adapter and the fused model are written under it.
+            resume: The restore input for a same-run recovery or a cross-run continuation, or None to
+                train from base.
+            store: The run-state store the fit persists its progress to, or None for no resume ledger.
 
         Returns:
             The checkpoint, whose ``mlx_path`` is the fused standalone 4-bit MLX model.
@@ -653,13 +826,16 @@ class TinkerBackend:
         Raises:
             UnservableBase: The base has no Tinker id, or no mlx-lm counterpart to fuse into.
             UnsupportedLoraShape: The LoRA shape asks for something Tinker cannot train.
+            LoraShapeDrift: A resume seed's saved LoRA shape disagrees with ``spec.lora``.
             TorchRequired: The method is ``dpo`` and torch is not installed locally.
             InsufficientData: The surviving pool is smaller than one batch.
             SpendExceeded: The projected run cost crosses the spend cap.
         """
         require_servable(spec.base, kind="Tinker")
         budget = SpendGuard(max_usd=spend_cap(spec, self.settings.spend_cap_usd))
-        report = await self.fit(spec, sink=sink, budget=budget)
+        if resume is not None:
+            await budget.record(0.0, resume.cost_usd)
+        report = await self.fit(spec, sink=sink, budget=budget, resume=resume, store=store, run_tag=work_dir.name)
         adapter = await self.materialize(report.final, spec, work_dir=work_dir, cost=report.train_cost_usd)
         return await self.fuse(adapter, spec, work_dir=work_dir)
 
@@ -675,9 +851,15 @@ class TinkerBackend:
         Returns:
             The non-fused MLX adapter, ready for direct adapter serving or a later :meth:`fuse`.
         """
-        peft = await download_adapter(self.service(), saved.path, work_dir / "peft")
+        peft = await download_adapter(self.service(), saved.sampler_path, work_dir / "peft")
         adapter_dir = await sidecar.convert_peft_to_mlx(peft, work_dir / "adapter", base=spec.base)
-        return Adapter(step=saved.step, adapter_dir=adapter_dir, train_cost_usd=cost, sampler_path=saved.path)
+        return Adapter(
+            step=saved.step,
+            adapter_dir=adapter_dir,
+            train_cost_usd=cost,
+            sampler_path=saved.sampler_path,
+            state=saved.state,
+        )
 
     async def fuse(self, adapter: Adapter, spec: TrainSpec, *, work_dir: Path) -> Checkpoint:
         """Fuse a materialized adapter into a standalone servable MLX checkpoint.
@@ -699,6 +881,7 @@ class TinkerBackend:
             adapter_dir=adapter.adapter_dir,
             train_cost_usd=adapter.train_cost_usd,
             sampler_path=adapter.sampler_path,
+            state=adapter.state,
         )
 
     async def score(

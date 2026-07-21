@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from athome.train.spec import CheckpointPolicy
 
@@ -23,7 +24,7 @@ class ObserveOutcome:
     Attributes:
         report: Everything the ``fit`` produced — per-step records and every saved checkpoint.
         best: The checkpoint ``select`` ranked highest across ``report.checkpoints``; its
-            ``path`` is the ``tinker://`` sampler address that was scored.
+            ``sampler_path`` is the ``tinker://`` sampler address that was scored.
         scored: ``best``'s eval rows scored against its weights, order-preserving.
     """
 
@@ -68,6 +69,8 @@ async def observe(
         SpendExceeded: The envelope cannot cover the fit's projection, or the fit's actuals leave
             too little headroom for the score's.
     """
-    report = await backend.fit(spec, budget=budget, sink=sink, checkpoints=checkpoints, eval_rows=eval_rows)
+    report = await backend.fit(
+        spec, budget=budget, sink=sink, checkpoints=checkpoints, eval_rows=eval_rows, run_tag=f"obs-{uuid4().hex[:8]}"
+    )
     best = max(report.checkpoints, key=select)
-    return ObserveOutcome(report, best, await backend.score(best.path, rows, base=spec.base, budget=budget))
+    return ObserveOutcome(report, best, await backend.score(best.sampler_path, rows, base=spec.base, budget=budget))

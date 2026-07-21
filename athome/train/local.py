@@ -11,18 +11,22 @@ from athome.config import load
 from athome.train import sidecar
 from athome.train.data import normalize, render_mlx_jsonl
 from athome.train.spec import Checkpoint, LocalTrainSettings, lora_keys
+from athome.train.state import BackendMismatch, LocalState
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from athome.progress import RunSink
+    from athome.train.runstate import RunStateStore
     from athome.train.spec import BackendName, LoraSpec, Method, TrainSpec
+    from athome.train.state import Resume, StateFidelity
 
 DATA_DIR = "data"
 ADAPTER_DIR = "adapter"
 FUSED_DIR = "fused"
 LORA_CONFIG = "lora.yaml"
 OPTIMIZER = "adamw"
+ADAPTER_WEIGHTS = "adapters.safetensors"
 
 
 def lora_config(lora: LoraSpec, path: Path) -> Path:
@@ -52,8 +56,29 @@ def lora_config(lora: LoraSpec, path: Path) -> Path:
     return path
 
 
+def resume_adapter_file(resume: Resume | None) -> Path | None:
+    """The mlx-lm ``--resume-adapter-file`` a continuation loads, or None for a fresh run.
+
+    Local restores weights only, from a prior run's durable adapter directory. A foreign handle
+    (a Tinker or Modal state) cannot seed a local run and is refused loudly.
+    """
+    if resume is None:
+        return None
+    match resume.handle:
+        case LocalState(adapter_dir=adapter_dir):
+            return adapter_dir / ADAPTER_WEIGHTS
+        case other:
+            raise BackendMismatch(f"local cannot resume from a {type(other).__name__}: {other}")
+
+
 def lora_command(
-    spec: TrainSpec, *, data_dir: Path, adapter_dir: Path, config: Path, grad_checkpoint: bool
+    spec: TrainSpec,
+    *,
+    data_dir: Path,
+    adapter_dir: Path,
+    config: Path,
+    grad_checkpoint: bool,
+    resume_adapter: Path | None = None,
 ) -> tuple[str, ...]:
     """The ``mlx_lm.lora`` argv that trains ``spec``'s adapter in the pinned sidecar."""
     return sidecar.mlx_lm_command(
@@ -85,6 +110,7 @@ def lora_command(
         "--seed",
         str(spec.hyperparams.seed),
         *(("--grad-checkpoint",) if grad_checkpoint else ()),
+        *(("--resume-adapter-file", str(resume_adapter)) if resume_adapter is not None else ()),
     )
 
 
@@ -103,6 +129,7 @@ class LocalBackend:
 
     settings: LocalTrainSettings
     name: ClassVar[BackendName] = "local"
+    state_fidelity: ClassVar[StateFidelity] = "weights"
 
     @staticmethod
     def available() -> bool:
@@ -119,26 +146,45 @@ class LocalBackend:
         """Construct the backend from the ``[train.local]`` config section."""
         return cls(load(LocalTrainSettings))
 
-    async def train(self, spec: TrainSpec, *, sink: RunSink, work_dir: Path) -> Checkpoint:
+    async def train(
+        self,
+        spec: TrainSpec,
+        *,
+        sink: RunSink,
+        work_dir: Path,
+        resume: Resume | None = None,
+        store: RunStateStore | None = None,
+    ) -> Checkpoint:
         """Train ``spec``'s LoRA with mlx-lm and fuse it into a standalone MLX model.
 
         ``work_dir`` holds everything the sidecar reads and writes: the
         ``{train,valid}.jsonl`` split, the ``lora.yaml`` config, the trained adapter,
         and the fused model that becomes the checkpoint's serve path.
 
+        Local training is atomic — one sidecar run, no intermediate snapshots — so it keeps no
+        resume ledger (``store`` is unused). A ``resume`` seeds a warm start from a prior run's
+        durable adapter at ``weights`` fidelity: mlx-lm reloads the adapter and continues with a
+        fresh optimizer, the honest loss of momentum a weights-only restore carries.
+
         Args:
             spec: The fine-tuning request; its method must be ``sft``.
             sink: Journals the data split, the sidecar argv, and the fused artifact.
             work_dir: The run's private working directory, minted by :func:`athome.train.run`.
+            resume: A prior :class:`~athome.train.state.LocalState` to continue the adapter from, or
+                None to train from base; a foreign handle is refused.
+            store: Unused — local training persists no run state.
 
         Returns:
             A :class:`~athome.train.spec.Checkpoint` whose ``mlx_path`` is the fused
-            standalone MLX model directory and whose ``train_cost_usd`` is 0.0.
+            standalone MLX model directory, whose ``train_cost_usd`` is 0.0, and whose ``state`` is
+            the durable :class:`~athome.train.state.LocalState` adapter directory.
 
         Raises:
             UnsupportedLoraShape: The spec's :class:`~athome.train.spec.LoraSpec` asks
                 for an adapter mlx-lm cannot express.
+            BackendMismatch: ``resume`` carries a handle from another backend.
         """
+        resume_adapter = resume_adapter_file(resume)
         adapter_dir = work_dir / ADAPTER_DIR
         config = lora_config(spec.lora, work_dir / LORA_CONFIG)
         examples = await normalize(spec.dataset, method="sft")
@@ -152,6 +198,7 @@ class LocalBackend:
             adapter_dir=adapter_dir,
             config=config,
             grad_checkpoint=self.settings.grad_checkpoint,
+            resume_adapter=resume_adapter,
         )
         await sink.append({"stage": "train", "command": list(command)})
         await sidecar.run_process(command)
@@ -166,4 +213,5 @@ class LocalBackend:
             adapter_dir=adapter_dir,
             train_cost_usd=0.0,
             sampler_path=None,
+            state=LocalState(adapter_dir=adapter_dir),
         )

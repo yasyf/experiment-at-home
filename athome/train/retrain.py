@@ -93,7 +93,9 @@ async def retrain(
             would bill a full hosted fit only to refuse at ``materialize``; it aborts before ``fit``.
     """
     require_servable(spec.base, kind="Tinker")
-    report = await backend.fit(spec, sink=sink, budget=budget, checkpoints=checkpoints, eval_rows=eval_rows)
+    report = await backend.fit(
+        spec, sink=sink, budget=budget, checkpoints=checkpoints, eval_rows=eval_rows, run_tag=work_dir.name
+    )
     best = max(report.checkpoints, key=select)
     adapter = await backend.materialize(best, spec, work_dir=work_dir, cost=report.train_cost_usd)
     served = artifact_scorer(adapter)

@@ -7,7 +7,9 @@ from athome.errors import AthomeError
 
 if TYPE_CHECKING:
     from athome.progress import RunSink
+    from athome.train.runstate import RunStateStore
     from athome.train.spec import BackendName, Checkpoint, Method, TrainSettings, TrainSpec
+    from athome.train.state import Resume, StateFidelity
 
 TINKER_ENV: Path = Path("~/.athome/tinker.env").expanduser()
 
@@ -26,6 +28,7 @@ class TrainBackend(Protocol):
     """
 
     name: ClassVar[BackendName]
+    state_fidelity: ClassVar[StateFidelity]
 
     @staticmethod
     def available() -> bool:
@@ -42,13 +45,26 @@ class TrainBackend(Protocol):
         """Construct the backend from its configuration section."""
         ...
 
-    async def train(self, spec: TrainSpec, *, sink: RunSink, work_dir: Path) -> Checkpoint:
+    async def train(
+        self,
+        spec: TrainSpec,
+        *,
+        sink: RunSink,
+        work_dir: Path,
+        resume: Resume | None = None,
+        store: RunStateStore | None = None,
+    ) -> Checkpoint:
         """Train ``spec``, journaling progress to ``sink``, and converge on a servable artifact.
 
         Every file the run writes — data splits, adapters, the fused model — goes under
         ``work_dir``, which :func:`athome.train.run` mints fresh per run. A backend never
         derives its own output directory: two runs of one family would then overwrite each
         other's weights, including weights the registry has already registered.
+
+        ``resume`` seeds the run from a prior training state — a same-run crash recovery or a
+        cross-run continuation — and ``store`` is the run-state ledger progress persists to; both
+        are None for a fresh, unledgered run. The produced ``Checkpoint`` always carries a
+        ``state`` handle at this backend's declared :attr:`state_fidelity`.
         """
         ...
 

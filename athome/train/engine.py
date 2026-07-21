@@ -110,10 +110,20 @@ class ScoreDone:
 
 @dataclass(frozen=True, slots=True)
 class SnapshotDone:
-    """The result of a :class:`SnapshotOp`: the saved path and eval outputs, or None when bare."""
+    """The result of a :class:`SnapshotOp`: both saved paths and eval outputs, or None outputs when bare.
+
+    Both paths always land — a sampler save without its training-state twin has no representation.
+
+    Attributes:
+        op: The snapshot op that produced this result.
+        sampler_path: The ``tinker://`` address the sampler (inference) weights were saved to.
+        state_path: The ``tinker://`` address the training state (weights+optimizer) was saved to.
+        outputs: One logprob output per scored eval datum, or None for a bare snapshot.
+    """
 
     op: SnapshotOp
-    path: str
+    sampler_path: str
+    state_path: str
     outputs: Sequence[dict[str, tinker.TensorData]] | None
 
 
@@ -134,6 +144,7 @@ class ScoreFlight:
 class SnapshotFlight:
     op: SnapshotOp
     save: tinker.APIFuture[tinker.SaveWeightsForSamplerResponse]
+    state: tinker.APIFuture[tinker.SaveWeightsResponse]
     forward: tinker.APIFuture[tinker.ForwardBackwardOutput] | None
 
 
@@ -159,8 +170,9 @@ async def submit(client: tinker.TrainingClient, op: Op) -> InFlight:
             return ScoreFlight(op, await client.forward_async(list(datums), "cross_entropy"))
         case SnapshotOp(name=name, ttl_seconds=ttl, eval=eval_datums):
             save = await client.save_weights_for_sampler_async(name, ttl_seconds=ttl)
+            state = await client.save_state_async(name, ttl_seconds=ttl)
             forward = await client.forward_async(list(eval_datums), "cross_entropy") if eval_datums else None
-            return SnapshotFlight(op, save, forward)
+            return SnapshotFlight(op, save, state, forward)
 
 
 async def drain(flight: InFlight) -> OpResult:
@@ -171,9 +183,11 @@ async def drain(flight: InFlight) -> OpResult:
             return TrainDone(op, output)
         case ScoreFlight(op=op, forward=forward):
             return ScoreDone(op, (await forward.result_async()).loss_fn_outputs)
-        case SnapshotFlight(op=op, save=save, forward=forward):
-            path = (await save.result_async()).path
-            return SnapshotDone(op, path, (await forward.result_async()).loss_fn_outputs if forward else None)
+        case SnapshotFlight(op=op, save=save, state=state, forward=forward):
+            sampler_path = (await save.result_async()).path
+            state_path = (await state.result_async()).path
+            outputs = (await forward.result_async()).loss_fn_outputs if forward else None
+            return SnapshotDone(op, sampler_path, state_path, outputs)
 
 
 async def execute(client: tinker.TrainingClient, schedule: Sequence[Op]) -> AsyncIterator[OpResult]:

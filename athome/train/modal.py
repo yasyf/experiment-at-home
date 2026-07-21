@@ -27,12 +27,15 @@ from athome.train.spec import (
     require_servable,
     spend_cap,
 )
+from athome.train.state import BackendMismatch, ModalState
 
 if TYPE_CHECKING:
     from datasets import Dataset
     from peft import LoraConfig
 
     from athome.progress import RunSink
+    from athome.train.runstate import RunStateStore
+    from athome.train.state import Resume, StateFidelity
     from athome.wire import Wire
 
 PYTHON = "3.13"
@@ -101,13 +104,20 @@ def service_spec(settings: ModalTrainSettings, lora: LoraSpec, base: BaseModelSp
 
 @dataclass(frozen=True, slots=True)
 class RemoteConfig:
-    """Everything the GPU container needs to train one adapter and push it."""
+    """Everything the GPU container needs to train one adapter and push it.
+
+    Attributes:
+        resume: A prior adapter to continue from — the container loads it with
+            ``PeftModel.from_pretrained`` and trains on with a fresh optimizer — or None to train a
+            new adapter over the base.
+    """
 
     base: BaseModelSpec
     repo: str
     method: Method
     lora: LoraSpec
     hyperparams: Hyperparams
+    resume: ModalState | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +186,7 @@ def fingerprint_remote(config: RemoteConfig) -> dict[str, Wire]:
 
 def train_remote(config: RemoteConfig, dataset: Dataset) -> RemoteResult:
     from huggingface_hub import HfApi
+    from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from trl import DPOConfig, DPOTrainer, SFTConfig, SFTTrainer
 
@@ -191,14 +202,22 @@ def train_remote(config: RemoteConfig, dataset: Dataset) -> RemoteResult:
         "seed": hyper.seed,
         "report_to": [],
     }
+    model = AutoModelForCausalLM.from_pretrained(base, revision=revision, torch_dtype="bfloat16", device_map="cuda")
+    # A continuation loads the prior adapter and trains it on (fresh optimizer — weights-only fidelity);
+    # a new run attaches a fresh peft_config over the base.
+    seeded = (
+        {
+            "model": PeftModel.from_pretrained(
+                model, config.resume.repo, revision=config.resume.revision, is_trainable=True
+            )
+        }
+        if config.resume is not None
+        else {"model": model, "peft_config": lora_config(config.lora)}
+    )
     common = {
-        "model": AutoModelForCausalLM.from_pretrained(
-            base, revision=revision, torch_dtype="bfloat16", device_map="cuda"
-        ),
         "processing_class": AutoTokenizer.from_pretrained(base, revision=revision),
         "train_dataset": dataset,
-        "peft_config": lora_config(config.lora),
-    }
+    } | seeded
     match config.method:
         case "sft":
             trainer = SFTTrainer(args=SFTConfig(**args), **common)
@@ -283,6 +302,21 @@ async def train_dataset(spec: TrainSpec) -> Dataset:
             return render_trl(await normalize(spec.dataset, method="dpo"), method="dpo")
 
 
+def modal_resume(resume: Resume | None) -> ModalState | None:
+    """The prior adapter a continuation loads in the container, or None for a fresh run.
+
+    Modal restores weights only, from an HF adapter repo pinned to a commit. A foreign handle
+    (a Tinker or local state) cannot seed a modal run and is refused loudly.
+    """
+    if resume is None:
+        return None
+    match resume.handle:
+        case ModalState() as handle:
+            return handle
+        case other:
+            raise BackendMismatch(f"modal cannot resume from a {type(other).__name__}: {other}")
+
+
 @dataclass(frozen=True, slots=True)
 class ModalTrainBackend:
     """Trains a LoRA adapter with TRL on a Modal GPU, converging on a fused MLX artifact.
@@ -303,6 +337,7 @@ class ModalTrainBackend:
 
     settings: ModalTrainSettings
     name: ClassVar[BackendName] = "modal"
+    state_fidelity: ClassVar[StateFidelity] = "weights"
 
     @staticmethod
     def available() -> bool:
@@ -321,7 +356,15 @@ class ModalTrainBackend:
         """Bind the ``[train.modal]`` section."""
         return cls(load(ModalTrainSettings))
 
-    async def train(self, spec: TrainSpec, *, sink: RunSink, work_dir: Path) -> Checkpoint:
+    async def train(
+        self,
+        spec: TrainSpec,
+        *,
+        sink: RunSink,
+        work_dir: Path,
+        resume: Resume | None = None,
+        store: RunStateStore | None = None,
+    ) -> Checkpoint:
         """Train ``spec`` on a Modal GPU and return the fused MLX model it converged on.
 
         The adapter TRL trains is pushed to ``{hf_repo_prefix}/{spec.name}`` from the container,
@@ -329,21 +372,30 @@ class ModalTrainBackend:
         and fused into the base — the one artifact ``rapid-mlx serve`` can serve.
 
         Everything that can refuse the run refuses it before the first billable operation: a base
-        that cannot be fused locally, a LoRA shape mlx-lm cannot express, and a cap the projection
-        already crosses.
+        that cannot be fused locally, a LoRA shape mlx-lm cannot express, a resume seed from another
+        backend, and a cap the projection already crosses.
+
+        A modal run is atomic — no intermediate snapshots — so it keeps no resume ledger (``store``
+        is unused). A ``resume`` continues from a prior :class:`~athome.train.state.ModalState` adapter
+        at ``weights`` fidelity: the container reloads the adapter and trains on with a fresh optimizer.
 
         Args:
             spec: The fine-tuning request: base, dataset, method, LoRA shape, and spend cap.
             sink: The run journal; the launch, the trained adapter, and the fused artifact land here.
             work_dir: This run's own directory; the adapter and the fused model are written under it.
+            resume: A prior :class:`~athome.train.state.ModalState` to continue from, or None to train
+                from base; a foreign handle is refused.
+            store: Unused — modal training persists no run state.
 
         Returns:
             The :class:`~athome.train.spec.Checkpoint` naming the fused MLX directory, the mlx-lm
-            adapter it was fused from, and what the GPU actually billed.
+            adapter it was fused from, what the GPU actually billed, and the pushed adapter as its
+            ``state`` handle.
 
         Raises:
             UnservableBase: The base has no mlx-lm counterpart to fuse into; nothing is launched.
             UnsupportedLoraShape: The LoRA shape cannot survive the fuse; nothing is launched.
+            BackendMismatch: ``resume`` carries a handle from another backend.
             SpendExceeded: The projected cost crosses the cap, or the run billed past it.
             ParityMismatch: The container's TRL stack, resolved LoRA shape, or baked base weights
                 drifted from the pins.
@@ -352,6 +404,7 @@ class ModalTrainBackend:
         import modal
 
         require_servable(spec.base, kind="Modal")
+        seed = modal_resume(resume)
         parity = service_spec(self.settings, spec.lora, spec.base)
         await ensure_write_auth()
         cap = spend_cap(spec, self.settings.spend_cap_usd)
@@ -364,6 +417,7 @@ class ModalTrainBackend:
             method=spec.method,
             lora=spec.lora,
             hyperparams=spec.hyperparams,
+            resume=seed,
         )
         dataset = await train_dataset(spec)
         app = modal.App(self.settings.app_name, image=train_image(self.settings, spec.base))
@@ -399,4 +453,5 @@ class ModalTrainBackend:
             adapter_dir=adapter_dir,
             train_cost_usd=actual,
             sampler_path=None,
+            state=ModalState(repo=result.repo, revision=result.revision),
         )

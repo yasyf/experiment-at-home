@@ -11,13 +11,16 @@ import pytest
 from athome.config import load
 from athome.train import sidecar
 from athome.train.sidecar import (
+    GENERATION_FENCE,
     PEFT_CONFIG,
     SIDECAR,
     convert_peft_to_mlx,
     fuse,
+    generate,
     mlx_lm_command,
     run_convert,
     sidecar_command,
+    strip_generation,
 )
 from athome.train.spec import BASE_MODELS, STD_MODULES, UnservableBase
 
@@ -247,3 +250,82 @@ def test_a_tensor_that_is_not_a_lora_matrix_raises_instead_of_being_dropped(arch
         run_convert(archive.peft_dir, archive.out_dir, num_layers=36)
 
     assert archive.saved == {}
+
+
+def furniture(text: str) -> str:
+    """A whole ``mlx_lm generate`` stdout: the completion fenced by ``==========`` and its stats."""
+    return (
+        f"{GENERATION_FENCE}\n{text}\n{GENERATION_FENCE}\n"
+        "Prompt: 12 tokens, 480.771 tokens-per-sec\n"
+        "Generation: 5 tokens, 39.501 tokens-per-sec\n"
+        "Peak memory: 4.321 GB\n"
+    )
+
+
+@pytest.fixture
+def generations(monkeypatch: pytest.MonkeyPatch) -> tuple[list[Sequence[str]], list[str]]:
+    """Records the argv ``generate`` ran and hands back the canned stdout the sidecar would print."""
+    seen: list[Sequence[str]] = []
+    canned: list[str] = []
+
+    async def run_output(command: Sequence[str]) -> str:
+        seen.append(command)
+        return canned[0]
+
+    monkeypatch.setattr(sidecar, "run_output", run_output)
+    return seen, canned
+
+
+async def test_generate_runs_mlx_lm_in_the_pinned_env_and_strips_the_fences(
+    generations: tuple[list[Sequence[str]], list[str]],
+) -> None:
+    seen, canned = generations
+    canned.append(furniture("the quick brown fox"))
+
+    out = await generate("mlx-community/Qwen3-8B-4bit", "continue:", max_tokens=32, temperature=0.7, seed=1729)
+
+    assert out == "the quick brown fox"
+    assert seen == [
+        (
+            "uvx",
+            "--from",
+            f"mlx-lm=={VERSION}",
+            "python",
+            "-m",
+            "mlx_lm",
+            "generate",
+            "--model",
+            "mlx-community/Qwen3-8B-4bit",
+            "--prompt",
+            "continue:",
+            "--max-tokens",
+            "32",
+            "--temp",
+            "0.7",
+            "--ignore-chat-template",
+            "--seed",
+            "1729",
+        )
+    ]
+
+
+async def test_generate_omits_the_seed_flag_when_unseeded(
+    generations: tuple[list[Sequence[str]], list[str]],
+) -> None:
+    seen, canned = generations
+    canned.append(furniture("x"))
+
+    await generate("m", "p", max_tokens=4, temperature=0.0)
+
+    assert "--seed" not in seen[0]
+    assert seen[0][-3:] == ("--temp", "0.0", "--ignore-chat-template")
+
+
+def test_strip_generation_recovers_multiline_text_between_the_fences() -> None:
+    assert strip_generation(furniture("line one\nline two")) == "line one\nline two"
+
+
+def test_strip_generation_returns_empty_when_nothing_was_generated() -> None:
+    stdout = f"{GENERATION_FENCE}\n\n{GENERATION_FENCE}\nNo text generated for this prompt\n"
+
+    assert strip_generation(stdout) == ""

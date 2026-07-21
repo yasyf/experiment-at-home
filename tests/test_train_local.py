@@ -18,6 +18,7 @@ from athome.train.spec import (
     TrainSpec,
     UnsupportedLoraShape,
 )
+from athome.train.state import BackendMismatch, LocalState, Resume, TinkerState
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -267,6 +268,44 @@ async def test_local_training_is_free(
     trained = await LocalBackend.from_settings().train(spec(corpus), sink=sink, work_dir=run_dir(tmp_path))
 
     assert trained.train_cost_usd == 0.0
+
+
+async def test_the_checkpoint_carries_a_local_state_at_weights_fidelity(
+    commands: list[Sequence[str]], corpus: LocalJsonlRef, sink: RunSink, tmp_path: Path
+) -> None:
+    checkpoint = await LocalBackend.from_settings().train(spec(corpus), sink=sink, work_dir=run_dir(tmp_path))
+
+    assert checkpoint.state == LocalState(adapter_dir=run_dir(tmp_path) / "adapter")
+    assert LocalBackend.state_fidelity == "weights"
+
+
+async def test_a_local_resume_reloads_the_prior_adapter(
+    commands: list[Sequence[str]], corpus: LocalJsonlRef, sink: RunSink, tmp_path: Path
+) -> None:
+    prior = tmp_path / "prior-adapter"
+
+    await LocalBackend.from_settings().train(
+        spec(corpus),
+        sink=sink,
+        work_dir=run_dir(tmp_path),
+        resume=Resume(handle=LocalState(adapter_dir=prior), from_step=0),
+    )
+
+    assert commands[0][-2:] == ("--resume-adapter-file", str(prior / "adapters.safetensors"))
+
+
+async def test_a_foreign_resume_handle_is_refused_before_the_sidecar_runs(
+    commands: list[Sequence[str]], corpus: LocalJsonlRef, sink: RunSink, tmp_path: Path
+) -> None:
+    with pytest.raises(BackendMismatch, match="local cannot resume from a TinkerState"):
+        await LocalBackend.from_settings().train(
+            spec(corpus),
+            sink=sink,
+            work_dir=run_dir(tmp_path),
+            resume=Resume(handle=TinkerState("tinker://run/state/x"), from_step=0),
+        )
+
+    assert commands == []
 
 
 async def test_train_journals_every_stage(

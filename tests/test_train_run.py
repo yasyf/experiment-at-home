@@ -14,6 +14,7 @@ from athome.progress import load_journal
 from athome.research.baseline import BaselineStore
 from athome.research.spec import Comparability
 from athome.train.spec import BASE_MODELS, Checkpoint, Hyperparams, LocalJsonlRef, TrainSettings, TrainSpec
+from athome.train.state import TinkerState
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -22,7 +23,9 @@ if TYPE_CHECKING:
 
     from athome.progress import RunSink
     from athome.registry import VersionInfo
+    from athome.train.runstate import RunStateStore
     from athome.train.spec import BackendName, Method
+    from athome.train.state import Resume
 
 FUSED = Path("/runs/watcher/fused")
 WEIGHTS = "model.safetensors"
@@ -99,6 +102,7 @@ def checkpoint(*, mlx_path: Path = FUSED, adapter_dir: Path = Path("/runs/watche
         adapter_dir=adapter_dir,
         train_cost_usd=1.25,
         sampler_path="tinker://run/watcher-sampler",
+        state=TinkerState("tinker://run/state/watcher-final"),
     )
 
 
@@ -134,6 +138,7 @@ class FakeBackend:
     sinks: list[RunSink] = field(default_factory=list)
     work_dirs: list[Path] = field(default_factory=list)
     checkpoints: list[Checkpoint] = field(default_factory=list)
+    resumes: list[Resume | None] = field(default_factory=list)
 
     @staticmethod
     def available() -> bool:
@@ -147,10 +152,19 @@ class FakeBackend:
     def from_settings(cls) -> FakeBackend:
         return cls()
 
-    async def train(self, spec: TrainSpec, *, sink: RunSink, work_dir: Path) -> Checkpoint:
+    async def train(
+        self,
+        spec: TrainSpec,
+        *,
+        sink: RunSink,
+        work_dir: Path,
+        resume: Resume | None = None,
+        store: RunStateStore | None = None,
+    ) -> Checkpoint:
         self.trained.append(spec)
         self.sinks.append(sink)
         self.work_dirs.append(work_dir)
+        self.resumes.append(resume)
         await sink.append({"event": "step", "step": 10})
         fused = fuse(work_dir, f"weights-{len(self.trained)}".encode())
         self.checkpoints.append(trained := checkpoint(mlx_path=fused, adapter_dir=work_dir / "adapter"))
@@ -184,6 +198,7 @@ def train_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Non
     monkeypatch.setenv("ATHOME_TRAIN_REGISTRY_ROOT", str(tmp_path / "registry"))
     monkeypatch.setenv("ATHOME_TRAIN_BASELINE_ROOT", str(tmp_path / "baselines.db"))
     monkeypatch.setenv("ATHOME_TRAIN_WORK_ROOT", str(tmp_path / "runs"))
+    monkeypatch.setenv("ATHOME_TRAIN_RUN_STATE_DB", str(tmp_path / "runstate.db"))
     monkeypatch.chdir(tmp_path)
     load.cache_clear()
     FakeServer.ensured.clear()
@@ -238,7 +253,9 @@ async def test_run_trains_evaluates_registers_and_promotes_the_winner(
     assert promoted.metadata["source_mlx_path"] == str(backend.checkpoints[0].mlx_path)
     assert promoted.metadata["backend"] == "tinker"
     assert promoted.metadata["sampler_path"] == "tinker://run/watcher-sampler"
+    assert promoted.metadata["state"] == {"backend": "tinker", "state_path": "tinker://run/state/watcher-final"}
     assert promoted.metadata["metric"] == 0.9
+    assert backend.resumes == [None]
     assert json.loads((result.version.path / train.CHECKPOINT_FILE).read_text())["source_mlx_path"] == str(
         backend.checkpoints[0].mlx_path
     )
@@ -291,9 +308,17 @@ async def test_run_preflights_with_loaded_settings_before_selecting_and_training
         events.append("select")
         return backend
 
-    async def train_backend(self: FakeBackend, spec: TrainSpec, *, sink: RunSink, work_dir: Path) -> Checkpoint:
+    async def train_backend(
+        self: FakeBackend,
+        spec: TrainSpec,
+        *,
+        sink: RunSink,
+        work_dir: Path,
+        resume: Resume | None = None,
+        store: RunStateStore | None = None,
+    ) -> Checkpoint:
         events.append("train")
-        return await original_train(self, spec, sink=sink, work_dir=work_dir)
+        return await original_train(self, spec, sink=sink, work_dir=work_dir, resume=resume, store=store)
 
     monkeypatch.setattr(train, "preflight", preflight)
     monkeypatch.setattr(train, "select", select)

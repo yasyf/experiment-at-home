@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-07-20
+
+### Added
+- **Engine-owned checkpoint/state subsystem** — every training run now persists full resumable state (weights **and** optimizer) automatically, not as an opt-in flag. The `StateHandle` tagged union (`TinkerState` / `LocalState` / `ModalState`, `athome.train.state`) makes the sampler/state confusion unrepresentable: a `sampler_path` is inference-only and cannot seed training by type. `SnapshotOp` fires the sampler save and `save_state_async` as one atomic pair (a sampler-only snapshot has no representation), and every `SavedCheckpoint`/`Adapter`/`Checkpoint` carries a required `state` field. A persisted `RunState` record (spec identity, step, state handle, reference anchor, cost so far) lives in the aiosqlite-backed `RunStateStore` (`athome.train.runstate`), written at every snapshot drain.
+- **Two restore modes on one primitive.** `Resume(handle, from_step)` unifies same-run crash recovery (a `running` prior for the run key is detected and continued at its last boundary, with `base_step` relabeling so resumed snapshot names never collide with already-saved ones) and explicit cross-run continuation (`TrainSpec.from_checkpoint` seeds iteration *i* from *i−1*'s weights **and optimizer momentum** instead of retraining from base). The Tinker side builds seeded clients via `create_training_client_from_state_with_optimizer_async`; the cost ledger carries across resume, so `max_usd` binds per run, never per attempt. DPO resume persists both the policy state handle and the frozen-reference anchor, and same-run recovery re-anchors the reference to the run-start artifact — never mid-run weights.
+- **Per-backend state honesty.** Each backend declares its `state_fidelity` — Tinker restores weights+optimizer; Local (mlx) and Modal declare honest weights-only — and a handle can only restore on its own backend (`BackendMismatch` otherwise). A LoRA shape drifting from the restored weights fails loud (the SDK derives shape from `weights_info` and ignores the caller's spec on from-state creation), and an expired or missing state handle raises a typed error naming the handle — never a silent fresh retrain.
+- **`athome.train.sidecar.generate(model, prompt, *, max_tokens, temperature, seed=None)`** — async text generation from a fused MLX checkpoint through the sidecar's pinned `mlx_lm` invocation, so downstream eval backends stop hand-rolling the command line and stdout parsing.
+
+### Changed
+- **Breaking: `SavedCheckpoint.path` is now `sampler_path`,** and `SavedCheckpoint`/`Adapter`/`Checkpoint` require the new `state` field; registry metadata records the serialized state handle. Consumers that read `.path` migrate to `.sampler_path` (inference) or `.state` (training continuation).
+- **Breaking: snapshot names are namespaced by run identity.** Every fit's snapshot and state-save names fold in a per-attempt run tag (`train`/`retrain` use their `work_dir` name; `observe` mints one per call), so a fresh re-run of a completed spec family can never collide with a prior run's immortal state under `overwrite=False` — previously the second run crashed at its final save after billing the whole schedule. Same-run resume keeps the `-r{base_step}` relabel on top.
+- `TinkerBackend.lora_client` is seed-aware: fresh runs build via `create_lora_training_client_async` as before; resumed and continued runs build from saved state. The `tinker_fakes` test service now enforces real `save_state_async` semantics (duplicate name under `overwrite=False` raises), so state-name collisions are caught by the suite instead of only by the live SDK.
+
 ## [0.10.0] - 2026-07-19
 
 ### Added
