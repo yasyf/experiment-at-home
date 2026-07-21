@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from functools import partial
 from time import perf_counter
 from typing import TYPE_CHECKING, ClassVar
+from uuid import uuid4
 
 import httpx
 from anyio import CancelScope, to_thread
@@ -77,6 +78,7 @@ if TYPE_CHECKING:
     from athome.train.state import Resume, StateFidelity, StateHandle
 
 BETA = 0.1
+RUN_TAG_CHARS = 8
 DOWNLOAD_TIMEOUT = httpx.Timeout(30.0, read=600.0)
 TORCH_HINT = (
     "tinker DPO needs torch locally (its custom loss backprops in-process): "
@@ -603,7 +605,7 @@ class TinkerBackend:
         eval_rows: Sequence[EvalRow] | None = None,
         resume: Resume | None = None,
         store: RunStateStore | None = None,
-        run_tag: str = "",
+        run_tag: str | None = None,
     ) -> TrainReport:
         """Train ``spec`` on Tinker, journaling each step and saving checkpoints at the cadence.
 
@@ -626,9 +628,11 @@ class TinkerBackend:
             store: The run-state store the fold persists this run's most progressed
                 :class:`RunState` to at each snapshot, or None to train without a resume ledger
                 (an eval-only fit through observe/retrain).
-            run_tag: This run's identity namespace, folded into every snapshot name so a fresh
-                re-run of the same spec never re-emits a prior run's immortal final state name;
-                empty for a standalone fit outside the managed :func:`~athome.train.run` lifecycle.
+            run_tag: This run's identity namespace, folded into every snapshot name so no two runs
+                of one spec ever share a state name. The managed lifecycle (:func:`~athome.train.run`
+                and :func:`~athome.train.retrain`) passes its per-run ``work_dir`` name; None mints a
+                fresh nonce for a standalone non-resumable fit (``observe``); a direct resume keeps
+                its deterministic ``-r{base_step}`` names.
 
         Returns:
             The report: per-step records, the saved checkpoints with their eval scores, the drop
@@ -642,6 +646,8 @@ class TinkerBackend:
             OverlongEvalRows: An eval row exceeds ``max_seq_len``.
             SpendExceeded: The projected run cost crosses the spend cap.
         """
+        if run_tag is None:
+            run_tag = uuid4().hex[:RUN_TAG_CHARS] if resume is None else ""
         model = tinker_model(spec.base)
         tinker_lora(spec.lora)
         if spec.method == "dpo":

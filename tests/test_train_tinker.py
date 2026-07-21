@@ -568,7 +568,12 @@ async def test_fit_snapshots_at_the_cadence_with_names_ttls_and_eval_scores(
     )
 
     report = await TinkerBackend.from_settings().fit(
-        request, sink=sink(tmp_path), budget=budget(), checkpoints=CheckpointPolicy(at=(0.5,)), eval_rows=rows
+        request,
+        sink=sink(tmp_path),
+        budget=budget(),
+        checkpoints=CheckpointPolicy(at=(0.5,)),
+        eval_rows=rows,
+        run_tag="",
     )
 
     assert service.clients[0].saves == [("watcher-step00002", 604_800), ("watcher-sft-4", None)]
@@ -929,13 +934,13 @@ async def test_a_shared_envelope_draws_fit_actuals_down_against_a_later_score(
     rows = (EvalRow(tokens=(1, 2, 3), weights=(0.0, 0.0, 1.0)),)
 
     probe = SpendGuard(max_usd=None)
-    report = await backend.fit(request, sink=sink(tmp_path), budget=probe, run_tag="e1")
+    report = await backend.fit(request, sink=sink(tmp_path), budget=probe)
     fit_spent = probe.spent
     score_projection = backend.cost(model=tinker_model(request.base), prefill=3, sample=1)
     assert fit_spent > 0.0
 
     shared = SpendGuard(max_usd=fit_spent + score_projection / 2)
-    await backend.fit(request, sink=sink(tmp_path), budget=shared, run_tag="e2")
+    await backend.fit(request, sink=sink(tmp_path), budget=shared)
     with pytest.raises(SpendExceeded):
         await backend.score(report.final.sampler_path, rows, base=request.base, budget=shared)
 
@@ -1302,7 +1307,7 @@ async def test_snapshot_saves_both_sampler_and_state_as_distinct_artifacts(
     )
 
     report = await TinkerBackend.from_settings().fit(
-        request, sink=sink(tmp_path), budget=budget(), checkpoints=CheckpointPolicy(at=(0.5,))
+        request, sink=sink(tmp_path), budget=budget(), checkpoints=CheckpointPolicy(at=(0.5,)), run_tag=""
     )
 
     assert service.clients[0].saves == [("watcher-step00002", 604_800), ("watcher-sft-4", None)]

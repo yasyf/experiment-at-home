@@ -144,7 +144,7 @@ async def test_one_envelope_spans_fit_and_score_so_fit_actuals_reduce_score_head
     rows = (EvalRow(tokens=(1, 2, 3), weights=(0.0, 0.0, 1.0)),)
 
     fit_probe = SpendGuard(max_usd=None)
-    await backend.fit(request, sink=sink(tmp_path), budget=fit_probe, run_tag="probe")
+    await backend.fit(request, sink=sink(tmp_path), budget=fit_probe)
     fit_spent = fit_probe.spent
     score_projection = backend.cost(model=tinker_model(request.base), prefill=3, sample=1)
     assert fit_spent > 0.0
