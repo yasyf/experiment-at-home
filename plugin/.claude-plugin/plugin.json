@@ -1,6 +1,6 @@
 {
   "name": "athome",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Skills for the athome SDK — caching, overnight runs, local serving, OCR profiles, LLM call policy, and autoresearch loops.",
   "author": {
     "name": "Yasyf Mohamedali",
