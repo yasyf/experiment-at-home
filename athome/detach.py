@@ -59,6 +59,13 @@ def running(name: str) -> int | None:
         return None
     pid = int(pid_path.read_text())
     try:
+        reaped, _ = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+    else:
+        if reaped == pid:
+            return None
+    try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return None

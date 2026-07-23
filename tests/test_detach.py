@@ -8,7 +8,7 @@ import anyio
 import pytest
 from click.testing import CliRunner
 
-from athome.detach import DetachedRun, DetachError, cli, launch, run_exitfile, run_log, running, wait
+from athome.detach import DetachedRun, DetachError, cli, launch, run_exitfile, run_log, run_pidfile, running, wait
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -77,6 +77,25 @@ async def test_running_is_none_for_unknown_name() -> None:
     assert running("never-launched") is None
 
 
+def test_running_reaps_exited_child() -> None:
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    try:
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+        pidfile = run_pidfile("zombie")
+        pidfile.parent.mkdir(parents=True)
+        pidfile.write_text(str(pid))
+        assert running("zombie") is None
+        with pytest.raises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
+    finally:
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+
+
 async def test_duplicate_live_name_raises_detach_error() -> None:
     run = await launch(["/bin/sh", "-c", "sleep 1"], name="dup")
     try:
@@ -114,7 +133,7 @@ def test_cli_launch_wait_log_round_trip(tmp_path: Path) -> None:
     assert "pid" in launched.output
     assert "log" in launched.output
 
-    waited = runner.invoke(cli, ["wait", "clijob", "--poll", "0.02", "--timeout", "30"])
+    waited = runner.invoke(cli, ["wait", "clijob", "--poll", "0.02", "--timeout", "5"])
     assert waited.exit_code == 0
     assert "exit: 6" in waited.output
 
@@ -126,7 +145,7 @@ def test_cli_launch_wait_log_round_trip(tmp_path: Path) -> None:
 def test_cli_wait_emits_json() -> None:
     runner = CliRunner()
     assert runner.invoke(cli, ["--detach", "--name", "cjson", "--", "/bin/sh", "-c", "exit 2"]).exit_code == 0
-    result = runner.invoke(cli, ["wait", "cjson", "--poll", "0.02", "--timeout", "30", "--json"])
+    result = runner.invoke(cli, ["wait", "cjson", "--poll", "0.02", "--timeout", "5", "--json"])
     assert result.exit_code == 0
     assert result.output.strip() == '{"name": "cjson", "exit": 2}'
 
